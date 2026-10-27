@@ -1,0 +1,34 @@
+{
+  "network": {
+    "httpServers": [
+      {
+        "name": "ai-api",
+        "enable": true,
+        "port": 3000,
+        "host": "127.0.0.1",
+        "enableCors": false,
+        "enableWebsocket": false,
+        "messagePostFormat": "array",
+        "token": "replace-with-the-same-token-as-.env",
+        "debug": false
+      }
+    ],
+    "httpClients": [
+      {
+        "name": "ai-webhook",
+        "enable": true,
+        "url": "http://127.0.0.1:8080/onebot",
+        "messagePostFormat": "array",
+        "reportSelfMessage": false,
+        "token": "replace-with-the-same-token-as-.env",
+        "debug": false
+      }
+    ],
+    "websocketServers": [],
+    "websocketClients": []
+  },
+  "musicSignUrl": "",
+  "enableLocalFile2Url": false,
+  "parseMultMsg": false
+}
+
