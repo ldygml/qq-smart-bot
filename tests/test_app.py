@@ -44,12 +44,16 @@ class FakeOneBotClient:
     def __init__(self) -> None:
         self.sent: list[tuple[ReplyTarget, str]] = []
         self.poked: list[ReplyTarget] = []
+        self.quoted_sender_id: int | None = 999
 
     async def send_text(self, target: ReplyTarget, text: str) -> None:
         self.sent.append((target, text))
 
     async def poke(self, target: ReplyTarget) -> None:
         self.poked.append(target)
+
+    async def get_msg_sender_id(self, message_id: int | str) -> int | None:
+        return self.quoted_sender_id
 
     async def close(self) -> None:
         return None
@@ -272,7 +276,48 @@ async def test_group_requires_mention_or_prefix(tmp_path) -> None:
         await _wait_for_condition(lambda: bool(sender.sent))
 
     assert sender.sent[0][0].group_id == 456
+    assert sender.sent[0][0].message_id == 2
     assert llm.calls[0][-1] == {"role": "user", "content": "你好"}
+
+
+@pytest.mark.asyncio
+async def test_quoting_bot_message_triggers_group_reply_without_mention(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path, enable_group=True),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 999,
+                "user_id": 123,
+                "group_id": 456,
+                "message_id": 2000,
+                "message": [
+                    {"type": "reply", "data": {"id": "42"}},
+                    {"type": "text", "data": {"text": "继续讲"}},
+                ],
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert sender.sent[0][0].message_id == 2000
+    assert sender.sent[0][1] == "测试回复"
 
 
 @pytest.mark.asyncio
@@ -593,7 +638,9 @@ async def test_poke_command_pokes_sender_without_ai_call(tmp_path) -> None:
         )
         await _wait_for_condition(lambda: bool(sender.poked))
 
-    assert sender.poked == [ReplyTarget("private", 123)]
+    assert len(sender.poked) == 1
+    assert sender.poked[0].message_type == "private"
+    assert sender.poked[0].user_id == 123
     assert llm.calls == []
 
 

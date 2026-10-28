@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     group_allowlist: str = ""
     group_require_mention: bool = True
     group_trigger_prefixes: str = "/ai,/问"
+    quote_replies: bool = True
+    group_quote_counts_as_mention: bool = True
 
     history_messages: int = 40
     max_history_rows_per_chat: int = 160

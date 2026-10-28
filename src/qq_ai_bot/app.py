@@ -6,6 +6,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
@@ -172,6 +173,8 @@ def create_app(
             "audio_model": config.audio_model,
             "group_enabled": config.enable_group,
             "group_require_mention": config.group_require_mention,
+            "quote_replies": config.quote_replies,
+            "group_quote_counts_as_mention": config.group_quote_counts_as_mention,
             "history_messages": config.history_messages,
             "max_history_rows_per_chat": config.max_history_rows_per_chat,
             **store.stats(),
@@ -261,14 +264,23 @@ def create_app(
             if config.private_user_ids and event.user_id not in config.private_user_ids:
                 logger.info("Ignored private message outside allowlist")
                 return
-            target = ReplyTarget("private", event.user_id)
+            target = ReplyTarget(
+                "private",
+                event.user_id,
+                message_id=event.message_id if config.quote_replies else None,
+            )
         elif event.message_type == "group":
             if not config.enable_group or event.group_id is None:
                 return
             if config.group_ids and event.group_id not in config.group_ids:
                 logger.info("Ignored group outside allowlist")
                 return
-            target = ReplyTarget("group", event.user_id, event.group_id)
+            target = ReplyTarget(
+                "group",
+                event.user_id,
+                event.group_id,
+                message_id=event.message_id if config.quote_replies else None,
+            )
         else:
             return
 
@@ -287,10 +299,21 @@ def create_app(
                 text.lower().startswith(prefix.lower())
                 for prefix in config.trigger_prefixes
             )
+            quoted_bot = False
+            if (
+                config.group_quote_counts_as_mention
+                and content.reply_id
+                and not content.mentioned
+            ):
+                quoted_bot = await _is_reply_to_bot(
+                    content.reply_id,
+                    event.self_id,
+                )
             if (
                 config.group_require_mention
                 and not content.mentioned
                 and not prefix_triggered
+                and not quoted_bot
             ):
                 return
             text = strip_trigger_prefix(text, config.trigger_prefixes)
@@ -579,11 +602,27 @@ def create_app(
 
     async def _send_long_reply(target: ReplyTarget, reply: str) -> None:
         chunks = split_reply(reply, QQ_TRANSPORT_CHUNK_CHARS)
-        for chunk in chunks:
-            if not await _safe_send(target, chunk):
+        current_target = target
+        for index, chunk in enumerate(chunks):
+            if not await _safe_send(current_target, chunk):
                 break
             if len(chunks) > 1:
                 await asyncio.sleep(0.25)
+            if index == 0:
+                current_target = replace(current_target, message_id=None)
+
+    async def _is_reply_to_bot(
+        message_id: str,
+        self_id: int | None,
+    ) -> bool:
+        if self_id is None:
+            return False
+        try:
+            sender_id = await sender.get_msg_sender_id(message_id)
+        except Exception:
+            logger.warning("Could not inspect quoted message", exc_info=True)
+            return False
+        return sender_id == self_id
 
     def _handle_command(
         event: OneBotEvent,
@@ -606,6 +645,7 @@ def create_app(
                 "提醒：/提醒 2026-10-28 09:00 内容；/提醒；/取消提醒 编号\n"
                 "学习工作：/计划、/总结、/出题、/翻译、/润色、/解释\n"
                 "互动：/戳，或者私聊直接说“戳一戳”\n"
+                "引用：机器人会引用你的原消息；引用机器人消息可以直接追问\n"
                 "/重置：忘记当前聊天上下文\n"
                 "/id：查看 QQ、群号和会话标识\n"
                 "/ping：检查机器人是否在线\n"

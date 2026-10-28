@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import json
+
+import httpx
+import pytest
+
 from qq_ai_bot.onebot import (
+    OneBotClient,
+    ReplyTarget,
     extract_message_content,
     extract_message_text,
     split_reply,
@@ -93,6 +100,48 @@ def test_extract_voice_source_from_array_message() -> None:
     assert content.text == "[语音]"
     assert content.audio_sources[0].file_id == "voice-context-id"
     assert content.audio_sources[0].source == "C:\\cache\\voice.amr"
+
+
+def test_extract_quoted_message_id() -> None:
+    content = extract_message_content(
+        [
+            {"type": "reply", "data": {"id": "12345"}},
+            {"type": "text", "data": {"text": "继续"}},
+        ],
+        self_id=10001,
+    )
+    assert content.reply_id == "12345"
+
+
+@pytest.mark.asyncio
+async def test_group_reply_includes_quote_segment() -> None:
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"status": "ok", "retcode": 0, "data": {"message_id": 1}},
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await client.send_text(
+            ReplyTarget("group", 123, 456, message_id=789),
+            "收到",
+        )
+    finally:
+        await client.close()
+
+    assert captured["message"][0] == {
+        "type": "reply",
+        "data": {"id": "789"},
+    }
+    assert captured["message"][1]["data"]["text"] == "收到"
 
 
 def test_at_another_user_is_not_bot_mention() -> None:

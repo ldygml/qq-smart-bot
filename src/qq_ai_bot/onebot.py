@@ -30,6 +30,7 @@ class ReplyTarget:
     message_type: str
     user_id: int
     group_id: int | None = None
+    message_id: int | str | None = None
 
     @property
     def conversation_id(self) -> str:
@@ -60,6 +61,7 @@ class MessageContent:
     image_sources: tuple[str, ...] = ()
     file_sources: tuple[FileSource, ...] = ()
     audio_sources: tuple[AudioSource, ...] = ()
+    reply_id: str = ""
 
 
 class OneBotError(RuntimeError):
@@ -95,7 +97,13 @@ class OneBotClient:
             action = "send_private_msg"
             payload = {"user_id": target.user_id}
 
-        payload["message"] = [{"type": "text", "data": {"text": text}}]
+        message: list[dict[str, Any]] = []
+        if target.message_id is not None:
+            message.append(
+                {"type": "reply", "data": {"id": str(target.message_id)}}
+            )
+        message.append({"type": "text", "data": {"text": text}})
+        payload["message"] = message
         response = await self._client.post(action, json=payload)
         try:
             data = response.json()
@@ -188,6 +196,30 @@ class OneBotClient:
             raise OneBotError("OneBot get_record returned no voice data")
         return record_data
 
+    async def get_msg_sender_id(self, message_id: int | str) -> int | None:
+        response = await self._client.post(
+            "get_msg",
+            json={"message_id": str(message_id)},
+            timeout=10.0,
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        if response.is_error or data.get("status") != "ok":
+            return None
+        message_data = data.get("data")
+        if not isinstance(message_data, dict):
+            return None
+        sender = message_data.get("sender")
+        if not isinstance(sender, dict):
+            return None
+        user_id = sender.get("user_id")
+        try:
+            return int(user_id)
+        except (TypeError, ValueError):
+            return None
+
     async def close(self) -> None:
         await self._client.aclose()
 
@@ -196,6 +228,7 @@ _CQ_AT_PATTERN = re.compile(r"\[CQ:at,qq=([^,\]]+)(?:,[^\]]*)?\]")
 _CQ_IMAGE_PATTERN = re.compile(r"\[CQ:image,([^\]]+)\]")
 _CQ_FILE_PATTERN = re.compile(r"\[CQ:file,([^\]]+)\]")
 _CQ_RECORD_PATTERN = re.compile(r"\[CQ:record,([^\]]+)\]")
+_CQ_REPLY_PATTERN = re.compile(r"\[CQ:reply,id=([^,\]]+)(?:,[^\]]*)?\]")
 _CQ_OTHER_PATTERN = re.compile(r"\[CQ:[^\]]+\]")
 _UNSUPPORTED_SEGMENTS = {
     "image": "[图片]",
@@ -235,6 +268,7 @@ def extract_message_content(
         image_sources: list[str] = []
         file_sources: list[FileSource] = []
         audio_sources: list[AudioSource] = []
+        reply_id = ""
         mentioned = False
         for segment in message:
             if not isinstance(segment, dict):
@@ -295,6 +329,8 @@ def extract_message_content(
                         size=size,
                     )
                 )
+            elif segment_type == "reply":
+                reply_id = str(data.get("id") or "")
             elif segment_type in _UNSUPPORTED_SEGMENTS:
                 parts.append(_UNSUPPORTED_SEGMENTS[segment_type])
         return MessageContent(
@@ -303,6 +339,7 @@ def extract_message_content(
             image_sources=tuple(image_sources),
             file_sources=tuple(file_sources),
             audio_sources=tuple(audio_sources),
+            reply_id=reply_id,
         )
 
     if isinstance(message, str):
@@ -349,6 +386,10 @@ def extract_message_content(
         return "[语音]"
 
     source = _CQ_RECORD_PATTERN.sub(replace_record, source)
+
+    reply_match = _CQ_REPLY_PATTERN.search(source)
+    reply_id = reply_match.group(1) if reply_match else ""
+    source = _CQ_REPLY_PATTERN.sub("", source)
     if self_id is not None:
         mention_code = f"[CQ:at,qq={self_id}]"
         mentioned = mention_code in source
@@ -367,6 +408,7 @@ def extract_message_content(
         image_sources=tuple(image_sources),
         file_sources=tuple(file_sources),
         audio_sources=tuple(audio_sources),
+        reply_id=reply_id,
     )
 
 
