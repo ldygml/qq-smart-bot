@@ -162,6 +162,7 @@ def create_app(
             "max_image_bytes": config.max_image_bytes,
             "max_files_per_message": config.max_files_per_message,
             "group_enabled": config.enable_group,
+            "group_require_mention": config.group_require_mention,
             "history_messages": config.history_messages,
             "max_history_rows_per_chat": config.max_history_rows_per_chat,
             **store.stats(),

@@ -259,6 +259,47 @@ async def test_group_requires_mention_or_prefix(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_group_can_reply_without_mention(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=False,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 999,
+                "user_id": 123,
+                "group_id": 456,
+                "message_id": 1800,
+                "message": "普通群消息",
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert sender.sent[0][0].group_id == 456
+    assert sender.sent[0][1] == "测试回复"
+
+
+@pytest.mark.asyncio
 async def test_image_message_uses_vision_model(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()
