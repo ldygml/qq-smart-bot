@@ -138,7 +138,7 @@ async def test_private_message_gets_ai_reply(tmp_path) -> None:
     assert sender.sent[0][1] == "测试回复"
     assert sender.sent[0][0].user_id == 123
     assert llm.calls[0][-1] == {"role": "user", "content": "你好"}
-    assert "普通闲聊" in llm.calls[0][0]["content"]
+    assert "和熟人聊天" in llm.calls[0][0]["content"]
 
 
 @pytest.mark.asyncio

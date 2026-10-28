@@ -155,6 +155,7 @@ def create_app(
         return {
             "ok": True,
             "model": config.llm_model,
+            "casual_model": config.casual_model,
             "vision_enabled": config.vision_enabled,
             "vision_model": config.vision_model,
             "max_image_bytes": config.max_image_bytes,
@@ -366,7 +367,15 @@ def create_app(
             try:
                 reply = await llm.chat(
                     messages,
-                    model=config.vision_model if loaded_images else None,
+                    model=(
+                        config.vision_model
+                        if loaded_images
+                        else (
+                            config.llm_model
+                            if is_task_request
+                            else config.casual_model
+                        )
+                    ),
                 )
             except LLMError as exc:
                 await _safe_send(target, str(exc))
@@ -388,7 +397,7 @@ def create_app(
                 try:
                     rewritten = await _rewrite_casual_reply(
                         llm,
-                        model=config.llm_model,
+                        model=config.casual_model,
                         draft=reply,
                     )
                     if rewritten.strip():
@@ -703,8 +712,11 @@ async def _rewrite_casual_reply(
                 "role": "system",
                 "content": (
                     "你负责把一段过度完整的回复改成 QQ 熟人闲聊口吻。"
-                    "只保留核心意思，写成一句或两句，最多三句。"
-                    "不要列点、标题、加粗、菜单、鸡汤、额外建议或继续追问。"
+                    "像普通朋友随口回消息，克制、直接，只保留核心意思。"
+                    "写成一句或两句，通常不超过四十个字。"
+                    "不要列点、标题、加粗、菜单、鸡汤、额外建议或继续追问；"
+                    "不要用“太懂了”“我陪你”“你值得”“真朋友都懂”这类话，"
+                    "也不要堆 emoji、波浪号和感叹号。"
                     "不要解释你改了什么，只输出最终回复。"
                 ),
             },
