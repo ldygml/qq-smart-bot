@@ -18,6 +18,20 @@ _ITALIC_PATTERN = re.compile(
 )
 _LINK_PATTERN = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
 _HORIZONTAL_RULE_PATTERN = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"
+    "\u2600-\u27BF"
+    "\u2B00-\u2BFF"
+    "\uFE0F"
+    "\u200D"
+    "]"
+)
+_KEYCAP_EMOJI_PATTERN = re.compile(r"[0-9#*]\uFE0F?\u20E3")
+_KAOMOJI_PATTERN = re.compile(
+    r"[（(][^()（）\n]{0,16}[´`ω・∀≧≦°皿益∇︿｡ﾟ♡]"
+    r"[^()（）\n]{0,16}[）)]"
+)
 
 
 def format_qq_text(text: str) -> str:
@@ -70,6 +84,13 @@ def format_qq_text(text: str) -> str:
     value = _BOLD_PATTERN.sub(r"\1", value)
     value = _UNDERSCORE_BOLD_PATTERN.sub(r"\1", value)
     value = _ITALIC_PATTERN.sub(r"\1", value)
+    value = _KEYCAP_EMOJI_PATTERN.sub("", value)
+    value = _EMOJI_PATTERN.sub("", value)
+    value = _KAOMOJI_PATTERN.sub("", value)
+    value = "\n".join(
+        re.sub(r"[ \t]+", " ", line).strip() for line in value.split("\n")
+    )
+    value = re.sub(r"[ \t]+([，。！？；：])", r"\1", value)
 
     # Keep at most one blank line and remove formatting-only lines.
     value = re.sub(r"\n{3,}", "\n\n", value).strip()

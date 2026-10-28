@@ -22,7 +22,7 @@ def test_markdown_is_converted_to_plain_qq_text() -> None:
     assert "答案：96" in result
     assert "**" not in result
     assert "• 第一步：展开" in result
-    assert "项目  |  结果" in result
+    assert "项目 | 结果" in result
     assert "| --- |" not in result
     assert "资料（https://example.com）" in result
 
@@ -33,3 +33,14 @@ def test_multiplication_and_code_are_preserved() -> None:
     assert "12 * 8 = 96" in result
     assert "result = 2 * 8" in result
     assert "```" not in result
+
+
+def test_emoji_and_kaomoji_markers_are_removed() -> None:
+    source = "答案是对的 ✅ 很好 😊\n下一步继续 👌\n1️⃣ 第一项\n(｡•́︿•̀｡)"
+    result = format_qq_text(source)
+    assert "✅" not in result
+    assert "😊" not in result
+    assert "👌" not in result
+    assert "1️⃣" not in result
+    assert "(｡•́︿•̀｡)" not in result
+    assert "答案是对的 很好" in result
