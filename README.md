@@ -183,6 +183,20 @@ MAX_FILES_PER_MESSAGE=3
 `.xls` 建议先另存为新版格式。文件内容会发送给千问用于总结；机器人本地只保存
 总结和文件名占位，不长期保存原始文件内容。
 
+### 语音识别
+
+直接发送 QQ 语音，机器人会通过 NapCat 转为 WAV，再交给
+`qwen3.8-omni-flash` 识别。默认只输出转写结果，也可以附加要求：
+
+```text
+[发送语音] 请完整转写
+[发送语音] 总结这段录音
+[发送语音] 回答语音里提出的问题
+```
+
+也支持 `/转写`、`/听写`、`/总结` 和 `/回答` 命令。语音识别只返回文字，不会合成
+语音回复。
+
 ### 学习与工作工具
 
 日常内容保存在同一个本地数据库中，私聊使用最方便：
@@ -231,6 +245,7 @@ REMINDER_POLL_SECONDS=15
 | `HISTORY_MESSAGES` | 40 | 每次带给模型的最近消息数 |
 | `VISION_MODEL` | qwen3-vl-plus | 图片理解与题目识别模型 |
 | `MAX_FILES_PER_MESSAGE` | 3 | 单条消息最多处理的文件数 |
+| `AUDIO_MODEL` | qwen3.8-omni-flash | 语音转写与理解模型 |
 | `TIMEZONE` | Asia/Shanghai | 提醒使用的时区 |
 | `REMINDER_POLL_SECONDS` | 15 | 检查到期提醒的间隔 |
 | `RATE_LIMIT_PER_MINUTE` | 8 | 每个 QQ 用户的 AI 请求上限 |

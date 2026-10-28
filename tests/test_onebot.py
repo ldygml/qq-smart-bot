@@ -75,6 +75,26 @@ def test_extract_file_source_from_array_message() -> None:
     assert content.file_sources[0].size == 2048
 
 
+def test_extract_voice_source_from_array_message() -> None:
+    content = extract_message_content(
+        [
+            {
+                "type": "record",
+                "data": {
+                    "file": "voice.amr",
+                    "file_id": "voice-context-id",
+                    "path": "C:\\cache\\voice.amr",
+                    "file_size": "4096",
+                },
+            }
+        ],
+        self_id=10001,
+    )
+    assert content.text == "[语音]"
+    assert content.audio_sources[0].file_id == "voice-context-id"
+    assert content.audio_sources[0].source == "C:\\cache\\voice.amr"
+
+
 def test_at_another_user_is_not_bot_mention() -> None:
     _, mentioned = extract_message_text(
         [{"type": "at", "data": {"qq": "20002"}}],

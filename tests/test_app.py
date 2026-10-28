@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from qq_ai_bot.app import create_app
+from qq_ai_bot.audio import LoadedAudio
 from qq_ai_bot.config import Settings
 from qq_ai_bot.files import ParsedDocument
 from qq_ai_bot.memory import ChatMemory
@@ -20,6 +21,7 @@ class FakeChatClient:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, str]]] = []
         self.models: list[str | None] = []
+        self.extra_payloads: list[object] = []
         self.reply = "测试回复"
 
     async def chat(
@@ -27,9 +29,11 @@ class FakeChatClient:
         messages: Sequence[dict[str, str]],
         *,
         model: str | None = None,
+        extra_payload=None,
     ) -> str:
         self.calls.append(list(messages))
         self.models.append(model)
+        self.extra_payloads.append(extra_payload)
         return self.reply
 
     async def close(self) -> None:
@@ -76,12 +80,25 @@ class FakeDocumentLoader:
         return None
 
 
+class FakeAudioLoader:
+    def __init__(self) -> None:
+        self.sources = []
+
+    async def load(self, source, resolver) -> LoadedAudio:
+        self.sources.append(source)
+        return LoadedAudio("data:audio/wav;base64,AAAA", "wav")
+
+    async def close(self) -> None:
+        return None
+
+
 class VerboseThenConciseChatClient(FakeChatClient):
     async def chat(
         self,
         messages: Sequence[dict[str, str]],
         *,
         model: str | None = None,
+        extra_payload=None,
     ) -> str:
         self.calls.append(list(messages))
         self.models.append(model)
@@ -578,6 +595,58 @@ async def test_poke_command_pokes_sender_without_ai_call(tmp_path) -> None:
 
     assert sender.poked == [ReplyTarget("private", 123)]
     assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_voice_message_uses_audio_model(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    audio_loader = FakeAudioLoader()
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        audio_loader=audio_loader,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 1900,
+                "message": [
+                    {
+                        "type": "record",
+                        "data": {
+                            "file": "voice.amr",
+                            "file_id": "voice-id",
+                        },
+                    },
+                    {"type": "text", "data": {"text": "/转写"}},
+                ],
+            },
+        )
+        await _wait_for_condition(lambda: len(sender.sent) == 2)
+
+    assert len(audio_loader.sources) == 1
+    assert llm.models == ["qwen3.8-omni-flash"]
+    assert llm.extra_payloads[0]["modalities"] == ["text"]
+    user_content = llm.calls[0][-1]["content"]
+    assert isinstance(user_content, list)
+    assert user_content[1]["type"] == "input_audio"
+    assert sender.sent[1][1] == "测试回复"
 
 
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:

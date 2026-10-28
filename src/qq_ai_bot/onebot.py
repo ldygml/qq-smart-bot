@@ -47,11 +47,19 @@ class FileSource:
 
 
 @dataclass(frozen=True)
+class AudioSource:
+    source: str = ""
+    file_id: str = ""
+    size: int | None = None
+
+
+@dataclass(frozen=True)
 class MessageContent:
     text: str
     mentioned: bool
     image_sources: tuple[str, ...] = ()
     file_sources: tuple[FileSource, ...] = ()
+    audio_sources: tuple[AudioSource, ...] = ()
 
 
 class OneBotError(RuntimeError):
@@ -154,6 +162,32 @@ class OneBotClient:
             raise OneBotError("OneBot get_file returned no file data")
         return file_data
 
+    async def get_record(self, *, source: AudioSource) -> dict[str, Any]:
+        payload: dict[str, Any] = {"out_format": "wav"}
+        if source.file_id:
+            payload["file_id"] = source.file_id
+        elif source.source:
+            payload["file"] = source.source
+        else:
+            raise OneBotError("Voice message has neither a source nor a file_id")
+
+        response = await self._client.post("get_record", json=payload, timeout=120.0)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                f"OneBot returned a non-JSON response (HTTP {response.status_code})"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            retcode = data.get("retcode")
+            raise OneBotError(
+                f"OneBot get_record failed (HTTP {response.status_code}, retcode={retcode})"
+            )
+        record_data = data.get("data")
+        if not isinstance(record_data, dict):
+            raise OneBotError("OneBot get_record returned no voice data")
+        return record_data
+
     async def close(self) -> None:
         await self._client.aclose()
 
@@ -161,6 +195,7 @@ class OneBotClient:
 _CQ_AT_PATTERN = re.compile(r"\[CQ:at,qq=([^,\]]+)(?:,[^\]]*)?\]")
 _CQ_IMAGE_PATTERN = re.compile(r"\[CQ:image,([^\]]+)\]")
 _CQ_FILE_PATTERN = re.compile(r"\[CQ:file,([^\]]+)\]")
+_CQ_RECORD_PATTERN = re.compile(r"\[CQ:record,([^\]]+)\]")
 _CQ_OTHER_PATTERN = re.compile(r"\[CQ:[^\]]+\]")
 _UNSUPPORTED_SEGMENTS = {
     "image": "[图片]",
@@ -199,6 +234,7 @@ def extract_message_content(
         parts: list[str] = []
         image_sources: list[str] = []
         file_sources: list[FileSource] = []
+        audio_sources: list[AudioSource] = []
         mentioned = False
         for segment in message:
             if not isinstance(segment, dict):
@@ -245,6 +281,20 @@ def extract_message_content(
                     )
                 )
                 parts.append(f"[文件: {name}]")
+            elif segment_type == "record":
+                parts.append("[语音]")
+                size_value = data.get("file_size")
+                try:
+                    size = int(size_value) if size_value is not None else None
+                except (TypeError, ValueError):
+                    size = None
+                audio_sources.append(
+                    AudioSource(
+                        source=str(data.get("path") or data.get("file") or ""),
+                        file_id=str(data.get("file_id") or ""),
+                        size=size,
+                    )
+                )
             elif segment_type in _UNSUPPORTED_SEGMENTS:
                 parts.append(_UNSUPPORTED_SEGMENTS[segment_type])
         return MessageContent(
@@ -252,6 +302,7 @@ def extract_message_content(
             mentioned=mentioned,
             image_sources=tuple(image_sources),
             file_sources=tuple(file_sources),
+            audio_sources=tuple(audio_sources),
         )
 
     if isinstance(message, str):
@@ -262,6 +313,7 @@ def extract_message_content(
     mentioned = False
     image_sources: list[str] = []
     file_sources: list[FileSource] = []
+    audio_sources: list[AudioSource] = []
 
     def replace_image(match: re.Match[str]) -> str:
         source = _cq_image_source(match.group(1))
@@ -285,6 +337,18 @@ def extract_message_content(
         return f"[文件: {file_name}]"
 
     source = _CQ_FILE_PATTERN.sub(replace_file, source)
+
+    def replace_record(match: re.Match[str]) -> str:
+        parameters = _cq_parameters(match.group(1))
+        audio_sources.append(
+            AudioSource(
+                source=parameters.get("path") or parameters.get("file", ""),
+                file_id=parameters.get("file_id", ""),
+            )
+        )
+        return "[语音]"
+
+    source = _CQ_RECORD_PATTERN.sub(replace_record, source)
     if self_id is not None:
         mention_code = f"[CQ:at,qq={self_id}]"
         mentioned = mention_code in source
@@ -302,6 +366,7 @@ def extract_message_content(
         mentioned=mentioned,
         image_sources=tuple(image_sources),
         file_sources=tuple(file_sources),
+        audio_sources=tuple(audio_sources),
     )
 
 

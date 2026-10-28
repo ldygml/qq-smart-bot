@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from .audio import AudioLoader, AudioLoaderProtocol, AudioLoadError
 from .config import Settings
 from .files import (
     DocumentLoader,
@@ -27,6 +28,7 @@ from .onebot import (
     OneBotClient,
     OneBotError,
     OneBotEvent,
+    AudioSource,
     FileSource,
     ReplyTarget,
     extract_message_content,
@@ -86,6 +88,7 @@ def create_app(
     image_loader: ImageLoaderProtocol | None = None,
     productivity_store: ProductivityStore | None = None,
     document_loader: FileParserProtocol | None = None,
+    audio_loader: AudioLoaderProtocol | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -113,6 +116,9 @@ def create_app(
     documents = document_loader or DocumentLoader(
         timeout_seconds=config.document_timeout_seconds
     )
+    audio = audio_loader or AudioLoader(
+        timeout_seconds=config.audio_timeout_seconds
+    )
 
     limiter = SlidingWindowRateLimiter(config.rate_limit_per_minute, 60.0)
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
@@ -135,6 +141,7 @@ def create_app(
             await llm.close()
             await images.close()
             await documents.close()
+            await audio.close()
 
     app = FastAPI(
         title="QQ Smart Bot",
@@ -161,6 +168,8 @@ def create_app(
             "vision_model": config.vision_model,
             "max_image_bytes": config.max_image_bytes,
             "max_files_per_message": config.max_files_per_message,
+            "audio_enabled": config.audio_enabled,
+            "audio_model": config.audio_model,
             "group_enabled": config.enable_group,
             "group_require_mention": config.group_require_mention,
             "history_messages": config.history_messages,
@@ -269,9 +278,10 @@ def create_app(
             raw_message=event.raw_message,
         )
         text = re.sub(r"\[文件:[^\]]+\]", "", content.text)
-        text = text.replace("[图片]", "").strip()
+        text = text.replace("[图片]", "").replace("[语音]", "").strip()
         image_sources = content.image_sources[: max(0, config.max_images_per_message)]
         file_sources = content.file_sources[: max(0, config.max_files_per_message)]
+        audio_sources = content.audio_sources[:1]
         if target.message_type == "group":
             prefix_triggered = any(
                 text.lower().startswith(prefix.lower())
@@ -285,7 +295,7 @@ def create_app(
                 return
             text = strip_trigger_prefix(text, config.trigger_prefixes)
 
-        if not text and not image_sources and not file_sources:
+        if not text and not image_sources and not file_sources and not audio_sources:
             text = "你好"
         if not text and image_sources:
             text = "请分析这张图片。如果是题目，请给出解题步骤和最终答案。"
@@ -298,6 +308,17 @@ def create_app(
         command_reply = _handle_command(event, target, text)
         if command_reply is not None:
             await _safe_send(target, command_reply)
+            return
+
+        if audio_sources:
+            if not limiter.allow(str(event.user_id)):
+                logger.info("Rate limited one voice request")
+                return
+            await _process_audio_request(
+                target=target,
+                text=text,
+                audio_source=audio_sources[0],
+            )
             return
 
         if file_sources:
@@ -479,6 +500,83 @@ def create_app(
             )
         await _send_long_reply(target, reply)
 
+    async def _process_audio_request(
+        *,
+        target: ReplyTarget,
+        text: str,
+        audio_source: AudioSource,
+    ) -> None:
+        if not config.audio_enabled:
+            await _safe_send(target, "语音识别功能目前没有开启。")
+            return
+
+        conversation_id = target.conversation_id
+        lock = get_conversation_lock(conversation_id)
+        async with semaphore, lock:
+            await _safe_send(target, "收到语音，正在识别…")
+            try:
+                loaded = await audio.load(audio_source, sender)
+            except AudioLoadError as exc:
+                await _safe_send(target, str(exc))
+                return
+            except Exception:
+                logger.exception("Unexpected voice-loading failure")
+                await _safe_send(target, "语音下载时出现意外错误，请重新发送。")
+                return
+
+            instruction = _audio_instruction(text)
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是语音识别与理解助手。忠实转写，不要编造听不清的内容；"
+                        "如果用户要求回答语音里的问题，先理解问题再回答。"
+                        "输出纯文本，不使用 Markdown、emoji 或颜文字。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": instruction},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": loaded.data,
+                                "format": loaded.format,
+                            },
+                        },
+                    ],
+                },
+            ]
+            try:
+                reply = await llm.chat(
+                    messages,
+                    model=config.audio_model,
+                    extra_payload={
+                        "modalities": ["text"],
+                        "reasoning_effort": "none",
+                    },
+                )
+            except LLMError as exc:
+                await _safe_send(target, str(exc))
+                return
+            except Exception:
+                logger.exception("Unexpected voice-understanding failure")
+                await _safe_send(target, "语音识别时出现问题，请稍后再试。")
+                return
+
+            reply = format_qq_text(reply.strip())
+            if not reply:
+                await _safe_send(target, "没有识别出可用内容，请重新发送语音。")
+                return
+            store.append_exchange(
+                conversation_id,
+                f"[语音] {instruction}",
+                reply,
+                max_rows=config.max_history_rows_per_chat,
+            )
+        await _send_long_reply(target, reply)
+
     async def _send_long_reply(target: ReplyTarget, reply: str) -> None:
         chunks = split_reply(reply, QQ_TRANSPORT_CHUNK_CHARS)
         for chunk in chunks:
@@ -502,6 +600,7 @@ def create_app(
             return (
                 f"{group_hint}\n"
                 "图片：直接发送题目截图，可附带你的要求\n"
+                "语音：直接发送语音，默认转写；也可以附上总结或回答要求\n"
                 "笔记：/记 标题 | 内容；/笔记；/查 关键词；/删笔记 编号\n"
                 "待办：/待办 内容；/待办；/完成 编号\n"
                 "提醒：/提醒 2026-10-28 09:00 内容；/提醒；/取消提醒 编号\n"
@@ -704,6 +803,24 @@ def _file_instruction(text: str) -> str:
     if prompt:
         return f"{prompt}\n{argument}".strip()
     return value
+
+
+def _audio_instruction(text: str) -> str:
+    value = text.strip()
+    if not value:
+        return "请把这段语音完整转写成简体中文，保留原意，不要补充没听到的内容。"
+    command, _, argument = value.partition(" ")
+    argument = argument.strip()
+    if command in {"/转写", "/听写"}:
+        return argument or "请把这段语音完整转写成简体中文。"
+    if command == "/总结":
+        return "请先准确理解语音，再用简短要点总结主要内容。"
+    if command in {"/回答", "/问"}:
+        return f"请先听懂语音中的问题，再直接回答。{argument}"
+    return (
+        "请根据下面的要求处理这段语音；如果要求不明确，就先完整转写。"
+        f"\n要求：{value}"
+    )
 
 
 def _looks_like_task_request(text: str) -> bool:

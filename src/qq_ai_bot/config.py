@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     image_timeout_seconds: float = 30.0
     max_files_per_message: int = 3
     document_timeout_seconds: float = 120.0
+    audio_enabled: bool = True
+    audio_model: str = "qwen3.8-omni-flash"
+    audio_timeout_seconds: float = 120.0
 
     bot_name: str = "小号助手"
     bot_persona: str = (

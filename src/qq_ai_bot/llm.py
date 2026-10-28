@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 import httpx
 
@@ -15,6 +15,7 @@ class ChatClient(Protocol):
         messages: Sequence[dict[str, Any]],
         *,
         model: str | None = None,
+        extra_payload: Mapping[str, Any] | None = None,
     ) -> str: ...
 
     async def close(self) -> None: ...
@@ -54,6 +55,7 @@ class CompatibleChatClient:
         messages: Sequence[dict[str, Any]],
         *,
         model: str | None = None,
+        extra_payload: Mapping[str, Any] | None = None,
     ) -> str:
         payload: dict[str, Any] = {
             "model": model or self.model,
@@ -63,6 +65,8 @@ class CompatibleChatClient:
         }
         if self.max_tokens is not None:
             payload["max_tokens"] = self.max_tokens
+        if extra_payload:
+            payload.update(extra_payload)
         try:
             response = await self._client.post(self._endpoint, json=payload)
         except httpx.TimeoutException as exc:
