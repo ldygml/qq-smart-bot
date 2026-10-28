@@ -288,6 +288,11 @@ def create_app(
         if not text and image_sources:
             text = "请分析这张图片。如果是题目，请给出解题步骤和最终答案。"
 
+        if text.strip().lower() in {"/戳", "/戳一戳", "戳一戳", "戳我"}:
+            if not await _safe_poke(target):
+                await _safe_send(target, "戳不动，NapCat 可能没有启用这个互动接口。")
+            return
+
         command_reply = _handle_command(event, target, text)
         if command_reply is not None:
             await _safe_send(target, command_reply)
@@ -497,6 +502,7 @@ def create_app(
                 "待办：/待办 内容；/待办；/完成 编号\n"
                 "提醒：/提醒 2026-10-28 09:00 内容；/提醒；/取消提醒 编号\n"
                 "学习工作：/计划、/总结、/出题、/翻译、/润色、/解释\n"
+                "互动：/戳，或者私聊直接说“戳一戳”\n"
                 "/重置：忘记当前聊天上下文\n"
                 "/id：查看 QQ、群号和会话标识\n"
                 "/ping：检查机器人是否在线\n"
@@ -645,6 +651,17 @@ def create_app(
             return False
         except Exception:
             logger.exception("Unexpected message-send failure")
+            return False
+
+    async def _safe_poke(target: ReplyTarget) -> bool:
+        try:
+            await sender.poke(target)
+            return True
+        except OneBotError as exc:
+            logger.warning("Failed to poke a QQ user: %s", exc)
+            return False
+        except Exception:
+            logger.exception("Unexpected poke failure")
             return False
 
     return app

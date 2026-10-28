@@ -39,9 +39,13 @@ class FakeChatClient:
 class FakeOneBotClient:
     def __init__(self) -> None:
         self.sent: list[tuple[ReplyTarget, str]] = []
+        self.poked: list[ReplyTarget] = []
 
     async def send_text(self, target: ReplyTarget, text: str) -> None:
         self.sent.append((target, text))
+
+    async def poke(self, target: ReplyTarget) -> None:
+        self.poked.append(target)
 
     async def close(self) -> None:
         return None
@@ -497,6 +501,42 @@ async def test_verbose_casual_reply_is_rewritten(tmp_path) -> None:
     assert len(llm.calls) == 2
     assert sender.sent[0][1] == "确实挺烦的，先挑一项写，别硬扛。"
     assert "过度完整" in llm.calls[1][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_poke_command_pokes_sender_without_ai_call(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 1700,
+                "message": "/戳",
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.poked))
+
+    assert sender.poked == [ReplyTarget("private", 123)]
+    assert llm.calls == []
 
 
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:

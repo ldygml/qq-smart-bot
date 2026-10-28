@@ -102,6 +102,32 @@ class OneBotClient:
                 f"OneBot {action} failed (HTTP {response.status_code}, retcode={retcode})"
             )
 
+    async def poke(self, target: ReplyTarget) -> None:
+        if target.message_type == "group":
+            if target.group_id is None:
+                raise OneBotError("Group poke target has no group_id")
+            action = "group_poke"
+            payload = {
+                "group_id": target.group_id,
+                "user_id": target.user_id,
+            }
+        else:
+            action = "friend_poke"
+            payload = {"user_id": target.user_id}
+
+        response = await self._client.post(action, json=payload)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                f"OneBot returned a non-JSON response (HTTP {response.status_code})"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            retcode = data.get("retcode")
+            raise OneBotError(
+                f"OneBot {action} failed (HTTP {response.status_code}, retcode={retcode})"
+            )
+
     async def get_file(self, *, source: FileSource) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if source.file_id:
