@@ -220,6 +220,8 @@ async def summarize_documents(
         "4. 行动项（如原文有）\n"
         "5. 风险、疑问或信息缺口（如原文有）\n"
         "严格依据材料，不要补造内容。\n\n"
+        "使用 QQ 可读的纯文本，不要使用星号加粗、井号标题、"
+        "代码围栏或 Markdown 表格。\n\n"
         f"{content}"
     )
     return await chat_client.chat(
@@ -229,6 +231,7 @@ async def summarize_documents(
                 "content": (
                     "你是严谨的学习与工作文档分析助手。"
                     "总结要结构清楚、保留关键数字和限定条件。"
+                    "输出纯文本，不使用 Markdown 标记。"
                 ),
             },
             {"role": "user", "content": final_prompt},

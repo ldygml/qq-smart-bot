@@ -40,6 +40,7 @@ from .productivity import (
     parse_reminder_time,
     split_reminder_argument,
 )
+from .qq_format import format_qq_text
 from .ratelimit import SlidingWindowRateLimiter
 from .security import request_is_authorized
 
@@ -409,6 +410,7 @@ def create_app(
                         reply = rewritten.strip()
                 except LLMError:
                     logger.warning("Casual reply rewrite failed; using original reply.")
+            reply = format_qq_text(reply)
             store.append_exchange(
                 conversation_id,
                 history_text,
@@ -466,6 +468,7 @@ def create_app(
             if not reply:
                 await _safe_send(target, "模型没有生成可用的文档总结。")
                 return
+            reply = format_qq_text(reply)
             file_names = "、".join(document.name for document in parsed_documents)
             store.append_exchange(
                 conversation_id,
