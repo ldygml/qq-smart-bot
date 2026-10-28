@@ -276,7 +276,7 @@ async def test_group_requires_mention_or_prefix(tmp_path) -> None:
         await _wait_for_condition(lambda: bool(sender.sent))
 
     assert sender.sent[0][0].group_id == 456
-    assert sender.sent[0][0].message_id == 2
+    assert sender.sent[0][0].message_id is None
     assert llm.calls[0][-1] == {"role": "user", "content": "你好"}
 
 
@@ -402,6 +402,7 @@ async def test_image_message_uses_vision_model(tmp_path) -> None:
 
     assert image_loader.sources == ["https://example.com/question.png"]
     assert llm.models == ["qwen3-vl-plus"]
+    assert sender.sent[0][0].message_id == 900
     current_content = llm.calls[0][-1]["content"]
     assert isinstance(current_content, list)
     assert current_content[0] == {"type": "text", "text": "请解这道题"}

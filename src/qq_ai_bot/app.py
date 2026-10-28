@@ -267,7 +267,6 @@ def create_app(
             target = ReplyTarget(
                 "private",
                 event.user_id,
-                message_id=event.message_id if config.quote_replies else None,
             )
         elif event.message_type == "group":
             if not config.enable_group or event.group_id is None:
@@ -279,7 +278,6 @@ def create_app(
                 "group",
                 event.user_id,
                 event.group_id,
-                message_id=event.message_id if config.quote_replies else None,
             )
         else:
             return
@@ -294,6 +292,17 @@ def create_app(
         image_sources = content.image_sources[: max(0, config.max_images_per_message)]
         file_sources = content.file_sources[: max(0, config.max_files_per_message)]
         audio_sources = content.audio_sources[:1]
+        should_quote = (
+            config.quote_replies
+            and (
+                bool(content.reply_id)
+                or bool(image_sources)
+                or bool(file_sources)
+                or bool(audio_sources)
+            )
+        )
+        if should_quote:
+            target = replace(target, message_id=event.message_id)
         if target.message_type == "group":
             prefix_triggered = any(
                 text.lower().startswith(prefix.lower())
