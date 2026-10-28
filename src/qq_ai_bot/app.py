@@ -54,6 +54,26 @@ AI_COMMAND_PROMPTS = {
     "/润色": "请在不改变事实和含义的前提下润色下面的文字，使其清晰、专业、自然：",
     "/解释": "请用容易理解的方式解释下面的概念，给出例子，并指出常见误区：",
 }
+TASK_HINTS = (
+    "总结",
+    "计划",
+    "步骤",
+    "翻译",
+    "润色",
+    "解释",
+    "分析",
+    "代码",
+    "报错",
+    "怎么",
+    "如何",
+    "为什么",
+    "区别",
+    "证明",
+    "计算",
+    "列出",
+    "写一篇",
+    "方案",
+)
 
 
 def create_app(
@@ -284,6 +304,7 @@ def create_app(
             )
             return
 
+        is_task_request = _looks_like_task_request(text)
         text, command_error = _expand_ai_command(text)
         if command_error is not None:
             await _safe_send(target, command_error)
@@ -331,7 +352,14 @@ def create_app(
             else:
                 current_content = text
             messages = [
-                {"role": "system", "content": config.effective_system_prompt},
+                {
+                    "role": "system",
+                    "content": (
+                        config.effective_system_prompt
+                        if is_task_request or loaded_images
+                        else config.casual_system_prompt
+                    ),
+                },
                 *history,
                 {"role": "user", "content": current_content},
             ]
@@ -352,6 +380,21 @@ def create_app(
             if not reply:
                 await _safe_send(target, "模型这次没有生成可用回复，请换个问法试试。")
                 return
+            if (
+                not is_task_request
+                and not loaded_images
+                and _needs_casual_rewrite(text, reply)
+            ):
+                try:
+                    rewritten = await _rewrite_casual_reply(
+                        llm,
+                        model=config.llm_model,
+                        draft=reply,
+                    )
+                    if rewritten.strip():
+                        reply = rewritten.strip()
+                except LLMError:
+                    logger.warning("Casual reply rewrite failed; using original reply.")
             store.append_exchange(
                 conversation_id,
                 history_text,
@@ -631,4 +674,42 @@ def _file_instruction(text: str) -> str:
     if prompt:
         return f"{prompt}\n{argument}".strip()
     return value
+
+
+def _looks_like_task_request(text: str) -> bool:
+    value = text.strip()
+    if value.startswith("/"):
+        return True
+    return any(hint in value for hint in TASK_HINTS)
+
+
+def _needs_casual_rewrite(user_text: str, reply: str) -> bool:
+    lowered = user_text.lower()
+    if "ai" in lowered or "机器人" in user_text:
+        return False
+    markers = ("\n", "**", "```", "# ", "🔹", "✅", "1.", "2.", "- ")
+    return len(reply) > 100 or any(marker in reply for marker in markers)
+
+
+async def _rewrite_casual_reply(
+    chat_client: ChatClient,
+    *,
+    model: str,
+    draft: str,
+) -> str:
+    return await chat_client.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你负责把一段过度完整的回复改成 QQ 熟人闲聊口吻。"
+                    "只保留核心意思，写成一句或两句，最多三句。"
+                    "不要列点、标题、加粗、菜单、鸡汤、额外建议或继续追问。"
+                    "不要解释你改了什么，只输出最终回复。"
+                ),
+            },
+            {"role": "user", "content": draft},
+        ],
+        model=model,
+    )
 

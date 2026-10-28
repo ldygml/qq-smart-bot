@@ -72,6 +72,25 @@ class FakeDocumentLoader:
         return None
 
 
+class VerboseThenConciseChatClient(FakeChatClient):
+    async def chat(
+        self,
+        messages: Sequence[dict[str, str]],
+        *,
+        model: str | None = None,
+    ) -> str:
+        self.calls.append(list(messages))
+        self.models.append(model)
+        if len(self.calls) == 1:
+            return (
+                "**首先，我想说你辛苦了。**\n"
+                "- 你可以先休息一下\n"
+                "- 然后再完成作业\n"
+                "需要我继续帮你列计划吗？"
+            )
+        return "确实挺烦的，先挑一项写，别硬扛。"
+
+
 def make_settings(tmp_path, **overrides) -> Settings:
     values = {
         "onebot_token": SecretStr("test-secret"),
@@ -119,6 +138,7 @@ async def test_private_message_gets_ai_reply(tmp_path) -> None:
     assert sender.sent[0][1] == "测试回复"
     assert sender.sent[0][0].user_id == 123
     assert llm.calls[0][-1] == {"role": "user", "content": "你好"}
+    assert "普通闲聊" in llm.calls[0][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -440,6 +460,43 @@ async def test_file_message_is_summarized(tmp_path) -> None:
     assert "正在解析" in sender.sent[0][1]
     assert sender.sent[1][1] == "测试回复"
     assert llm.models == ["fake-model"]
+
+
+@pytest.mark.asyncio
+async def test_verbose_casual_reply_is_rewritten(tmp_path) -> None:
+    llm = VerboseThenConciseChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 1600,
+                "message": "作业好多，烦死了",
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert len(llm.calls) == 2
+    assert sender.sent[0][1] == "确实挺烦的，先挑一项写，别硬扛。"
+    assert "过度完整" in llm.calls[1][0]["content"]
 
 
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:
