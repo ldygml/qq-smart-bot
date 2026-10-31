@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     shared_memory_enabled: bool = False
     memory_model: str = "qwen3.8-flash"
     memory_context_limit: int = 14
+    reflection_enabled: bool = False
+    reflection_model: str = "qwen-plus"
+    reflection_interval_seconds: float = 1800.0
+    reflection_min_new_memories: int = 5
 
     bot_name: str = "小号助手"
     bot_persona: str = (

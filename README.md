@@ -156,6 +156,24 @@ MEMORY_MODEL=qwen3.8-flash
 MEMORY_CONTEXT_LIMIT=14
 ```
 
+### 反思与成长
+
+开启 `REFLECTION_ENABLED` 后，机器人会在后台定期检查新记忆，寻找人物、主题、计划和
+事件之间的关联。它只保存整理后的观察和成长笔记，不保存或展示隐藏思维过程。
+
+默认情况下，每 30 分钟检查一次；积累至少 5 条新记忆后才进行反思。反思结果带有
+置信度，并遵守共享/私密边界：由私密材料推导出的内容不会用于回答其他联系人。
+
+```dotenv
+REFLECTION_ENABLED=true
+REFLECTION_MODEL=qwen-plus
+REFLECTION_INTERVAL_SECONDS=1800
+REFLECTION_MIN_NEW_MEMORIES=5
+```
+
+可以使用 `/成长` 查看机器人整理出的可共享成长笔记。这是对连续记忆和关系理解的
+模拟，不代表机器人具有意识；价值观、隐私边界和基本人格不会被自动改写。
+
 需要临时关闭“必须 @”限制时，双击 [`群聊免艾特.cmd`](群聊免艾特.cmd)。脚本会自动
 修改配置并重启 Python 机器人，不会关闭 NapCat 或主 QQ。开启后机器人会对所有群消息
 进行回复，Token 消耗和刷屏风险会明显增加。
@@ -283,6 +301,8 @@ REMINDER_POLL_SECONDS=15
 | `SHARED_MEMORY_ENABLED` | true | 启用跨会话长期记忆 |
 | `MEMORY_MODEL` | qwen3.8-flash | 提取长期记忆使用的模型 |
 | `MEMORY_CONTEXT_LIMIT` | 14 | 每次最多加入多少条共享记忆 |
+| `REFLECTION_MODEL` | qwen-plus | 后台关联与反思使用的模型 |
+| `REFLECTION_INTERVAL_SECONDS` | 1800 | 后台反思间隔 |
 | `TIMEZONE` | Asia/Shanghai | 提醒使用的时区 |
 | `REMINDER_POLL_SECONDS` | 15 | 检查到期提醒的间隔 |
 | `RATE_LIMIT_PER_MINUTE` | 8 | 每个 QQ 用户的 AI 请求上限 |

@@ -49,6 +49,7 @@ from .security import request_is_authorized
 from .shared_memory import (
     SharedMemoryStore,
     extract_memory_candidates,
+    reflect_on_memories,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,15 +134,18 @@ def create_app(
     conversation_locks: dict[str, asyncio.Lock] = {}
     background_tasks: set[asyncio.Task[Any]] = set()
     seen_message_ids: OrderedDict[str, None] = OrderedDict()
+    reflection_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         reminder_task = asyncio.create_task(_reminder_loop())
+        reflection_task = asyncio.create_task(_reflection_loop())
         try:
             yield
         finally:
             reminder_task.cancel()
-            pending = [*background_tasks, reminder_task]
+            reflection_task.cancel()
+            pending = [*background_tasks, reminder_task, reflection_task]
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
@@ -180,6 +184,8 @@ def create_app(
             "audio_model": config.audio_model,
             "shared_memory_enabled": config.shared_memory_enabled,
             "memory_model": config.memory_model,
+            "reflection_enabled": config.reflection_enabled,
+            "reflection_model": config.reflection_model,
             "group_enabled": config.enable_group,
             "group_require_mention": config.group_require_mention,
             "quote_replies": config.quote_replies,
@@ -266,6 +272,60 @@ def create_app(
             except Exception:
                 logger.exception("Reminder delivery loop failed")
             await asyncio.sleep(max(1.0, config.reminder_poll_seconds))
+
+    async def _reflection_loop() -> None:
+        if not (
+            config.shared_memory_enabled
+            and config.reflection_enabled
+        ):
+            return
+        await asyncio.sleep(10)
+        while True:
+            try:
+                async with reflection_lock:
+                    last_id_text = shared_memory.get_state(
+                        "last_reflected_memory_id",
+                        "0",
+                    )
+                    try:
+                        last_id = int(last_id_text)
+                    except ValueError:
+                        last_id = 0
+                    memories = shared_memory.memories_since(last_id, limit=60)
+                    if len(memories) >= config.reflection_min_new_memories:
+                        result = await reflect_on_memories(
+                            llm,
+                            model=config.reflection_model,
+                            memories=memories,
+                            existing_growth=shared_memory.growth_summary(limit=20),
+                        )
+                        for reflection in result.reflections:
+                            shared_memory.add_reflection(
+                                content=reflection.content,
+                                visibility=reflection.visibility,
+                                confidence=reflection.confidence,
+                            )
+                        for item in result.growth:
+                            shared_memory.add_growth(
+                                aspect=item.aspect,
+                                content=item.content,
+                                visibility=item.visibility,
+                            )
+                        shared_memory.set_state(
+                            "last_reflected_memory_id",
+                            str(max(int(memory["id"]) for memory in memories)),
+                        )
+                        logger.info(
+                            "Reflected on %s new memories (%s insights, %s growth notes)",
+                            len(memories),
+                            len(result.reflections),
+                            len(result.growth),
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Periodic memory reflection failed", exc_info=True)
+            await asyncio.sleep(max(60.0, config.reflection_interval_seconds))
 
     async def _process_event(event: OneBotEvent) -> None:
         assert event.user_id is not None
@@ -719,6 +779,7 @@ def create_app(
                 "语音：直接发送语音，默认转写；也可以附上总结或回答要求\n"
                 "笔记：/记 标题 | 内容；/笔记；/查 关键词；/删笔记 编号\n"
                 "长期记忆：/记忆；/删记忆 编号；/忘记我\n"
+                "成长：/成长，查看机器人整理出的长期观察\n"
                 "待办：/待办 内容；/待办；/完成 编号\n"
                 "提醒：/提醒 2026-10-28 09:00 内容；/提醒；/取消提醒 编号\n"
                 "学习工作：/计划、/总结、/出题、/翻译、/润色、/解释\n"
@@ -810,6 +871,13 @@ def create_app(
         if command == "/忘记我":
             removed = shared_memory.forget_user(event.user_id or 0)
             return f"已删除关于你的 {removed} 条长期记忆。"
+        if command == "/成长":
+            growth = shared_memory.growth_summary(limit=12)
+            if not growth:
+                return "我还没有形成可共享的成长笔记。"
+            lines = ["我目前整理出的成长笔记："]
+            lines.extend(f"- {item['content']}" for item in growth)
+            return "\n".join(lines)
         if command == "/待办":
             todo_text = text.partition(" ")[2].strip()
             if todo_text:
