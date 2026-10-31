@@ -128,6 +128,34 @@ GROUP_REQUIRE_MENTION=true
 群里必须 @机器人，或以 `/ai`、`/问` 开头才会回复。群聊上下文按“群 + 用户”隔离，
 不同人的对话不会混在一起。
 
+### 跨会话共享记忆
+
+机器人还会从对话中提取长期记忆，让不同联系人之间保留“共同认识的人”这一层关系。
+例如 B 告诉机器人自己下周三去杭州，之后 C 问“小明最近要去哪”，机器人可以自然提到
+这件事。
+
+记忆分为两类：
+
+- `shareable`：偏好、公开计划、普通关系等可与其他联系人使用的信息
+- `private`：健康、财务、秘密、私人冲突等敏感信息，只允许当事人自己查询
+
+机器人不会把 B 的私密记忆或原始聊天记录直接告诉 C。可以自行管理记忆：
+
+```text
+/记忆
+/删记忆 编号
+/忘记我
+```
+
+共享记忆保存在本机 SQLite，默认最多取 14 条相关记忆加入提示词。它不同于每个会话
+最近 40 条短期上下文：短期上下文用于连续聊天，长期记忆用于跨联系人和跨会话回忆。
+
+```dotenv
+SHARED_MEMORY_ENABLED=true
+MEMORY_MODEL=qwen3.8-flash
+MEMORY_CONTEXT_LIMIT=14
+```
+
 需要临时关闭“必须 @”限制时，双击 [`群聊免艾特.cmd`](群聊免艾特.cmd)。脚本会自动
 修改配置并重启 Python 机器人，不会关闭 NapCat 或主 QQ。开启后机器人会对所有群消息
 进行回复，Token 消耗和刷屏风险会明显增加。
@@ -251,6 +279,9 @@ REMINDER_POLL_SECONDS=15
 | `VISION_MODEL` | qwen3-vl-plus | 图片理解与题目识别模型 |
 | `MAX_FILES_PER_MESSAGE` | 3 | 单条消息最多处理的文件数 |
 | `AUDIO_MODEL` | qwen3.8-omni-flash | 语音转写与理解模型 |
+| `SHARED_MEMORY_ENABLED` | true | 启用跨会话长期记忆 |
+| `MEMORY_MODEL` | qwen3.8-flash | 提取长期记忆使用的模型 |
+| `MEMORY_CONTEXT_LIMIT` | 14 | 每次最多加入多少条共享记忆 |
 | `TIMEZONE` | Asia/Shanghai | 提醒使用的时区 |
 | `REMINDER_POLL_SECONDS` | 15 | 检查到期提醒的间隔 |
 | `RATE_LIMIT_PER_MINUTE` | 8 | 每个 QQ 用户的 AI 请求上限 |

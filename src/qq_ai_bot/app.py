@@ -46,6 +46,10 @@ from .productivity import (
 from .qq_format import format_qq_text
 from .ratelimit import SlidingWindowRateLimiter
 from .security import request_is_authorized
+from .shared_memory import (
+    SharedMemoryStore,
+    extract_memory_candidates,
+)
 
 logger = logging.getLogger(__name__)
 MAX_WEBHOOK_BYTES = 1_048_576
@@ -90,6 +94,7 @@ def create_app(
     productivity_store: ProductivityStore | None = None,
     document_loader: FileParserProtocol | None = None,
     audio_loader: AudioLoaderProtocol | None = None,
+    shared_memory_store: SharedMemoryStore | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -120,6 +125,7 @@ def create_app(
     audio = audio_loader or AudioLoader(
         timeout_seconds=config.audio_timeout_seconds
     )
+    shared_memory = shared_memory_store or SharedMemoryStore(config.database_path)
 
     limiter = SlidingWindowRateLimiter(config.rate_limit_per_minute, 60.0)
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
@@ -171,6 +177,8 @@ def create_app(
             "max_files_per_message": config.max_files_per_message,
             "audio_enabled": config.audio_enabled,
             "audio_model": config.audio_model,
+            "shared_memory_enabled": config.shared_memory_enabled,
+            "memory_model": config.memory_model,
             "group_enabled": config.enable_group,
             "group_require_mention": config.group_require_mention,
             "quote_replies": config.quote_replies,
@@ -260,6 +268,15 @@ def create_app(
 
     async def _process_event(event: OneBotEvent) -> None:
         assert event.user_id is not None
+        sender_info = event.sender or {}
+        display_name = str(
+            sender_info.get("card")
+            or sender_info.get("nickname")
+            or event.user_id
+        ).strip()
+        if config.shared_memory_enabled:
+            shared_memory.record_person(event.user_id, display_name)
+
         if event.message_type == "private":
             if config.private_user_ids and event.user_id not in config.private_user_ids:
                 logger.info("Ignored private message outside allowlist")
@@ -394,6 +411,14 @@ def create_app(
                     return
 
             history = store.history(conversation_id, config.history_messages)
+            memory_context = ""
+            if config.shared_memory_enabled:
+                memory_context = shared_memory.context_for(
+                    current_user_id=event.user_id,
+                    current_user_name=display_name,
+                    query=text,
+                    limit=config.memory_context_limit,
+                )
             history_text = (
                 f"[用户发送了 {len(loaded_images)} 张图片] {text}"
                 if loaded_images
@@ -412,14 +437,22 @@ def create_app(
                 ]
             else:
                 current_content = text
+            system_prompt = (
+                config.effective_system_prompt
+                if is_task_request or loaded_images
+                else config.casual_system_prompt
+            )
+            if memory_context:
+                system_prompt += (
+                    "\n\n你可以像熟人一样记得不同联系人过去分享过的信息。"
+                    "仅在话题相关时自然使用；不要把 private 记忆告诉别人，"
+                    "也不要机械复述共享记忆。\n"
+                    f"{memory_context}"
+                )
             messages = [
                 {
                     "role": "system",
-                    "content": (
-                        config.effective_system_prompt
-                        if is_task_request or loaded_images
-                        else config.casual_system_prompt
-                    ),
+                    "content": system_prompt,
                 },
                 *history,
                 {"role": "user", "content": current_content},
@@ -473,6 +506,12 @@ def create_app(
             )
 
         await _send_long_reply(target, reply)
+        await _remember_exchange(
+            event=event,
+            target=target,
+            display_name=display_name,
+            user_text=text,
+        )
 
     async def _process_file_request(
         *,
@@ -633,6 +672,34 @@ def create_app(
             return False
         return sender_id == self_id
 
+    async def _remember_exchange(
+        *,
+        event: OneBotEvent,
+        target: ReplyTarget,
+        display_name: str,
+        user_text: str,
+    ) -> None:
+        if not config.shared_memory_enabled or event.user_id is None:
+            return
+        try:
+            candidates = await extract_memory_candidates(
+                llm,
+                model=config.memory_model,
+                speaker_name=display_name,
+                speaker_id=event.user_id,
+                user_message=user_text,
+            )
+            for memory in candidates:
+                shared_memory.add_memory(
+                    subject_user_id=event.user_id,
+                    subject_name=display_name,
+                    content=memory.content,
+                    visibility=memory.visibility,
+                    source_conversation=target.conversation_id,
+                )
+        except Exception:
+            logger.warning("Long-term memory extraction failed", exc_info=True)
+
     def _handle_command(
         event: OneBotEvent,
         target: ReplyTarget,
@@ -650,6 +717,7 @@ def create_app(
                 "图片：直接发送题目截图，可附带你的要求\n"
                 "语音：直接发送语音，默认转写；也可以附上总结或回答要求\n"
                 "笔记：/记 标题 | 内容；/笔记；/查 关键词；/删笔记 编号\n"
+                "长期记忆：/记忆；/删记忆 编号；/忘记我\n"
                 "待办：/待办 内容；/待办；/完成 编号\n"
                 "提醒：/提醒 2026-10-28 09:00 内容；/提醒；/取消提醒 编号\n"
                 "学习工作：/计划、/总结、/出题、/翻译、/润色、/解释\n"
@@ -718,6 +786,29 @@ def create_app(
             if productivity.delete_note(event.user_id or 0, note_id):
                 return f"已删除笔记 #{note_id}。"
             return f"没有找到你的笔记 #{note_id}。"
+        if command == "/记忆":
+            if not config.shared_memory_enabled:
+                return "长期共享记忆目前没有开启。"
+            memories = shared_memory.list_memories(event.user_id or 0)
+            if not memories:
+                return "我还没有保存关于你的长期记忆。"
+            lines = ["我记得这些关于你的信息："]
+            for memory in memories:
+                visibility = "仅自己" if memory["visibility"] == "private" else "可共享"
+                lines.append(
+                    f"#{memory['id']} [{visibility}] {memory['content']}"
+                )
+            return "\n".join(lines)
+        if command == "/删记忆":
+            memory_id = _parse_id(text.partition(" ")[2])
+            if memory_id is None:
+                return "用法：/删记忆 编号"
+            if shared_memory.delete_memory(event.user_id or 0, memory_id):
+                return f"已删除关于你的记忆 #{memory_id}。"
+            return f"没有找到关于你的记忆 #{memory_id}。"
+        if command == "/忘记我":
+            removed = shared_memory.forget_user(event.user_id or 0)
+            return f"已删除关于你的 {removed} 条长期记忆。"
         if command == "/待办":
             todo_text = text.partition(" ")[2].strip()
             if todo_text:

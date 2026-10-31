@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     audio_enabled: bool = True
     audio_model: str = "qwen3.8-omni-flash"
     audio_timeout_seconds: float = 120.0
+    shared_memory_enabled: bool = False
+    memory_model: str = "qwen3.8-flash"
+    memory_context_limit: int = 14
 
     bot_name: str = "小号助手"
     bot_persona: str = (

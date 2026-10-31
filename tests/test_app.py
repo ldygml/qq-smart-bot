@@ -15,6 +15,7 @@ from qq_ai_bot.files import ParsedDocument
 from qq_ai_bot.memory import ChatMemory
 from qq_ai_bot.onebot import ReplyTarget
 from qq_ai_bot.productivity import ProductivityStore
+from qq_ai_bot.shared_memory import SharedMemoryStore
 
 
 class FakeChatClient:
@@ -695,6 +696,61 @@ async def test_voice_message_uses_audio_model(tmp_path) -> None:
     assert isinstance(user_content, list)
     assert user_content[1]["type"] == "input_audio"
     assert sender.sent[1][1] == "测试回复"
+
+
+@pytest.mark.asyncio
+async def test_other_contact_can_use_shareable_memory(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    shared = SharedMemoryStore(tmp_path / "shared.db")
+    shared.record_person(222, "小明")
+    shared.add_memory(
+        subject_user_id=222,
+        subject_name="小明",
+        content="下周三要去杭州出差",
+        visibility="shareable",
+        source_conversation="private:222",
+    )
+    shared.add_memory(
+        subject_user_id=222,
+        subject_name="小明",
+        content="最近睡眠不好",
+        visibility="private",
+        source_conversation="private:222",
+    )
+    app = create_app(
+        settings=make_settings(tmp_path, shared_memory_enabled=True),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        shared_memory_store=shared,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 333,
+                "message_id": 2100,
+                "message": "小明最近要去哪",
+                "sender": {"nickname": "小李"},
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    system_prompt = llm.calls[0][0]["content"]
+    assert "杭州出差" in system_prompt
+    assert "睡眠不好" not in system_prompt
 
 
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:
