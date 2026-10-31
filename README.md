@@ -294,8 +294,8 @@ REMINDER_POLL_SECONDS=15
 
 | 配置 | 默认值 | 作用 |
 |---|---|---|
-| `BOT_NAME` | 小号助手 | 机器人身份名 |
-| `BOT_PERSONA` | 友好、自然、简洁 | 说话风格 |
+| `BOT_NAME` | 给她爱 | 机器人身份名 |
+| `BOT_PERSONA` | 足球迷、嘴毒但不脏 | 身份、偏好和说话风格 |
 | `CASUAL_MODEL` | qwen3.8-flash | 普通闲聊使用的轻量模型 |
 | `LLM_TRUST_ENV` | false | 是否让模型请求使用系统代理 |
 | `HISTORY_MESSAGES` | 40 | 每次带给模型的最近消息数 |
