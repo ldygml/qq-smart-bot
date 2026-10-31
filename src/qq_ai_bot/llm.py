@@ -35,6 +35,7 @@ class CompatibleChatClient:
         temperature: float = 0.7,
         max_tokens: int | None = None,
         timeout_seconds: float = 60.0,
+        trust_env: bool = False,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.model = model
@@ -48,6 +49,7 @@ class CompatibleChatClient:
             headers=headers,
             timeout=httpx.Timeout(timeout_seconds),
             transport=transport,
+            trust_env=trust_env,
         )
 
     async def chat(

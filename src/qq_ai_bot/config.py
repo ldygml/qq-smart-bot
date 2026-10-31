@@ -29,7 +29,8 @@ class Settings(BaseSettings):
     deepseek_api_key: SecretStr = SecretStr("")
     openai_api_key: SecretStr = SecretStr("")
     llm_temperature: float = 0.8
-    llm_timeout_seconds: float = 60.0
+    llm_timeout_seconds: float = 90.0
+    llm_trust_env: bool = False
     vision_enabled: bool = True
     vision_model: str = "qwen3-vl-plus"
     max_image_bytes: int = 0

@@ -108,6 +108,7 @@ def create_app(
         api_key=config.effective_llm_api_key,
         temperature=config.llm_temperature,
         timeout_seconds=config.llm_timeout_seconds,
+        trust_env=config.llm_trust_env,
     )
     sender = onebot_client or OneBotClient(
         base_url=config.onebot_api_base,
