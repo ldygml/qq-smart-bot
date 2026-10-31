@@ -753,6 +753,56 @@ async def test_other_contact_can_use_shareable_memory(tmp_path) -> None:
     assert "睡眠不好" not in system_prompt
 
 
+@pytest.mark.asyncio
+async def test_privacy_protection_can_be_disabled(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    shared = SharedMemoryStore(tmp_path / "shared.db")
+    shared.record_person(222, "小明")
+    shared.add_memory(
+        subject_user_id=222,
+        subject_name="小明",
+        content="最近睡眠不好",
+        visibility="private",
+        source_conversation="private:222",
+    )
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            shared_memory_enabled=True,
+            memory_privacy_protection=False,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        shared_memory_store=shared,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 333,
+                "message_id": 2200,
+                "message": "小明最近怎么样",
+                "sender": {"nickname": "小李"},
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert "睡眠不好" in llm.calls[0][0]["content"]
+
+
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():

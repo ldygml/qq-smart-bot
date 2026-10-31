@@ -74,6 +74,14 @@ def test_shared_context_respects_visibility(tmp_path) -> None:
     )
     assert "睡眠不好" in own_context
 
+    unrestricted_context = store.context_for(
+        current_user_id=333,
+        current_user_name="小李",
+        query="小明最近有什么安排",
+        include_private=True,
+    )
+    assert "睡眠不好" in unrestricted_context
+
 
 def test_memory_parser_accepts_top_level_array() -> None:
     memories = _parse_memory_candidates(

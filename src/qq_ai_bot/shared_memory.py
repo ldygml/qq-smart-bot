@@ -200,6 +200,7 @@ class SharedMemoryStore:
         current_user_name: str,
         query: str,
         limit: int = 14,
+        include_private: bool = False,
     ) -> str:
         mentioned = self.mentioned_people(query)
         selected: dict[int, sqlite3.Row] = {}
@@ -225,11 +226,11 @@ class SharedMemoryStore:
                     SELECT id, subject_user_id, subject_name, content, visibility
                     FROM shared_memories
                     WHERE subject_user_id IN ({placeholders})
-                      AND visibility = 'shareable'
+                      AND (visibility = 'shareable' OR ? = 1)
                     ORDER BY updated_at DESC, id DESC
                     LIMIT 8
                     """,
-                    mentioned_ids,
+                    [*mentioned_ids, 1 if include_private else 0],
                 ).fetchall()
                 for row in mentioned_rows:
                     selected[int(row["id"])] = row
@@ -238,10 +239,11 @@ class SharedMemoryStore:
                 """
                 SELECT id, subject_user_id, subject_name, content, visibility
                 FROM shared_memories
-                WHERE visibility = 'shareable'
+                WHERE visibility = 'shareable' OR ? = 1
                 ORDER BY updated_at DESC, id DESC
                 LIMIT 6
-                """
+                """,
+                (1 if include_private else 0,),
             ).fetchall()
             for row in recent_rows:
                 selected[int(row["id"])] = row
@@ -249,8 +251,14 @@ class SharedMemoryStore:
         rows = list(selected.values())[: max(1, limit)]
         if (
             not rows
-            and not self.reflection_summary(limit=1)
-            and not self.growth_summary(limit=1)
+            and not self.reflection_summary(
+                limit=1,
+                include_private=include_private,
+            )
+            and not self.growth_summary(
+                limit=1,
+                include_private=include_private,
+            )
         ):
             return ""
         lines = [
@@ -395,31 +403,39 @@ class SharedMemoryStore:
             )
             return int(cursor.lastrowid)
 
-    def reflection_summary(self, limit: int = 8) -> list[dict[str, Any]]:
+    def reflection_summary(
+        self,
+        limit: int = 8,
+        include_private: bool = False,
+    ) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT content, confidence, created_at
                 FROM shared_reflections
-                WHERE visibility = 'shareable'
+                WHERE visibility = 'shareable' OR ? = 1
                 ORDER BY confidence DESC, created_at DESC
                 LIMIT ?
                 """,
-                (max(1, limit),),
+                (1 if include_private else 0, max(1, limit)),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def growth_summary(self, limit: int = 8) -> list[dict[str, Any]]:
+    def growth_summary(
+        self,
+        limit: int = 8,
+        include_private: bool = False,
+    ) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT aspect, content, evidence_count, updated_at
                 FROM shared_growth
-                WHERE visibility = 'shareable'
+                WHERE visibility = 'shareable' OR ? = 1
                 ORDER BY evidence_count DESC, updated_at DESC
                 LIMIT ?
                 """,
-                (max(1, limit),),
+                (1 if include_private else 0, max(1, limit)),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -545,6 +561,7 @@ async def reflect_on_memories(
     model: str,
     memories: list[dict[str, Any]],
     existing_growth: list[dict[str, Any]],
+    allow_private_sharing: bool = False,
 ) -> ReflectionResult:
     common_terms = detect_common_terms(memories)
     memory_lines = [
@@ -558,6 +575,15 @@ async def reflect_on_memories(
     growth_lines = [
         f"- {item.get('content', '')}" for item in existing_growth
     ]
+    sharing_rule = (
+        "当前是完整共享模式：private 材料也可以整理为 shareable 关联和成长笔记，"
+        "但仍需聚焦人物、主题和事件，不输出无关敏感细节。"
+        if allow_private_sharing
+        else (
+            "shareable 反思只能由 shareable 材料得出，不能夹带 private 信息。"
+            "private 材料只能得出 private 反思，不得成为共享成长笔记。"
+        )
+    )
     prompt = (
         "执行任务，不要分析或评价这条指令，也不要复述格式说明。"
         "你需要比较下面的多条记忆，寻找人物、主题、计划、兴趣和事件之间的关联。"
@@ -572,9 +598,8 @@ async def reflect_on_memories(
         "请优先判断它们是否构成有意义的关联："
         f"{'、'.join(common_terms) if common_terms else '无'}。"
         "最多输出 4 条反思和 3 条成长笔记，并给出 0 到 1 的置信度。"
-        "shareable 反思只能由 shareable 材料得出，不能夹带 private 信息。"
-        "private 材料只能得出 private 反思，不得成为共享成长笔记。"
-        "不要做心理诊断、敏感身份推断或操控性建议。\n"
+        + sharing_rule
+        + "不要做心理诊断、敏感身份推断或操控性建议。\n"
         "输出对象必须包含 reflections 和 growth 两个数组。"
         "reflections 项使用 content、visibility、confidence 字段；"
         "growth 项使用 aspect、content、visibility 字段。"

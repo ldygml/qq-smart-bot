@@ -184,6 +184,7 @@ def create_app(
             "audio_model": config.audio_model,
             "shared_memory_enabled": config.shared_memory_enabled,
             "memory_model": config.memory_model,
+            "memory_privacy_protection": config.memory_privacy_protection,
             "reflection_enabled": config.reflection_enabled,
             "reflection_model": config.reflection_model,
             "group_enabled": config.enable_group,
@@ -297,7 +298,11 @@ def create_app(
                             llm,
                             model=config.reflection_model,
                             memories=memories,
-                            existing_growth=shared_memory.growth_summary(limit=20),
+                            existing_growth=shared_memory.growth_summary(
+                                limit=20,
+                                include_private=not config.memory_privacy_protection,
+                            ),
+                            allow_private_sharing=not config.memory_privacy_protection,
                         )
                         for reflection in result.reflections:
                             shared_memory.add_reflection(
@@ -479,6 +484,7 @@ def create_app(
                     current_user_name=display_name,
                     query=text,
                     limit=config.memory_context_limit,
+                    include_private=not config.memory_privacy_protection,
                 )
             history_text = (
                 f"[用户发送了 {len(loaded_images)} 张图片] {text}"
@@ -872,7 +878,10 @@ def create_app(
             removed = shared_memory.forget_user(event.user_id or 0)
             return f"已删除关于你的 {removed} 条长期记忆。"
         if command == "/成长":
-            growth = shared_memory.growth_summary(limit=12)
+            growth = shared_memory.growth_summary(
+                limit=12,
+                include_private=not config.memory_privacy_protection,
+            )
             if not growth:
                 return "我还没有形成可共享的成长笔记。"
             lines = ["我目前整理出的成长笔记："]

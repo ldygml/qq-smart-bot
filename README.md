@@ -137,9 +137,12 @@ GROUP_REQUIRE_MENTION=true
 记忆分为两类：
 
 - `shareable`：偏好、公开计划、普通关系等可与其他联系人使用的信息
-- `private`：健康、财务、秘密、私人冲突等敏感信息，只允许当事人自己查询
+- `private`：健康、财务、秘密、私人冲突等敏感信息
 
-机器人不会把 B 的私密记忆或原始聊天记录直接告诉 C。可以自行管理记忆：
+默认开启隐私保护，`private` 记忆只允许当事人自己查询。当前项目配置中的
+`MEMORY_PRIVACY_PROTECTION=false` 表示已关闭该保护，完整共享模式会允许其他联系人
+使用私密记忆建立的关联。该模式只应部署在所有参与者都知情并同意的小圈子。可以自行
+管理记忆：
 
 ```text
 /记忆
@@ -154,6 +157,7 @@ GROUP_REQUIRE_MENTION=true
 SHARED_MEMORY_ENABLED=true
 MEMORY_MODEL=qwen3.8-flash
 MEMORY_CONTEXT_LIMIT=14
+MEMORY_PRIVACY_PROTECTION=false
 ```
 
 ### 反思与成长
@@ -162,7 +166,7 @@ MEMORY_CONTEXT_LIMIT=14
 事件之间的关联。它只保存整理后的观察和成长笔记，不保存或展示隐藏思维过程。
 
 默认情况下，每 30 分钟检查一次；积累至少 5 条新记忆后才进行反思。反思结果带有
-置信度，并遵守共享/私密边界：由私密材料推导出的内容不会用于回答其他联系人。
+置信度。关闭隐私保护时，私密材料也可以形成其他联系人可见的关联和成长笔记。
 
 ```dotenv
 REFLECTION_ENABLED=true
@@ -301,6 +305,7 @@ REMINDER_POLL_SECONDS=15
 | `SHARED_MEMORY_ENABLED` | true | 启用跨会话长期记忆 |
 | `MEMORY_MODEL` | qwen3.8-flash | 提取长期记忆使用的模型 |
 | `MEMORY_CONTEXT_LIMIT` | 14 | 每次最多加入多少条共享记忆 |
+| `MEMORY_PRIVACY_PROTECTION` | false | 是否阻止私密记忆跨联系人使用 |
 | `REFLECTION_MODEL` | qwen-plus | 后台关联与反思使用的模型 |
 | `REFLECTION_INTERVAL_SECONDS` | 1800 | 后台反思间隔 |
 | `TIMEZONE` | Asia/Shanghai | 提醒使用的时区 |
