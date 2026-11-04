@@ -113,6 +113,31 @@
 
     <section id="operations" class="tab">
       <article class="panel">
+        <div class="detail-head">
+          <div><p class="eyebrow">GROUP SETTINGS</p><h2>群聊发言设置</h2></div>
+          <button id="save-group-settings" class="primary">保存设置</button>
+        </div>
+        <p class="muted">这里的修改只作用于当前机器人实例，并会写入数据库，重启后继续生效。</p>
+        <div class="settings-grid">
+          <label class="check"><input id="group-enabled" type="checkbox"> 启用群聊</label>
+          <label class="check"><input id="group-require-mention" type="checkbox"> 群聊必须 @</label>
+          <label class="check"><input id="group-smart" type="checkbox"> 免 @ 时智能参与</label>
+          <label class="check"><input id="group-learning" type="checkbox"> 根据群氛围学习沉默倾向</label>
+          <label class="check"><input id="quote-replies" type="checkbox"> 按语境引用消息</label>
+          <label class="check"><input id="group-quote-mention" type="checkbox"> 引用机器人消息视为 @</label>
+        </div>
+        <div class="field-row settings-row">
+          <label>最低回复置信度<input id="group-confidence" type="number" min="0" max="1" step="0.01"></label>
+          <label>回复冷却（秒）<input id="group-cooldown" type="number" min="0" max="3600" step="1"></label>
+          <label>群聊参与模型<input id="group-model" placeholder="qwen3.8-flash"></label>
+        </div>
+        <div class="field-row settings-row">
+          <label>群白名单<input id="group-allowlist" placeholder="留空表示允许所有群；多个群号用逗号分隔"></label>
+          <label>触发前缀<input id="group-prefixes" placeholder="/ai,/问"></label>
+        </div>
+        <p id="group-settings-status" class="muted"></p>
+      </article>
+      <article class="panel">
         <h2>模型费用与延迟</h2>
         <div id="usage-cards" class="cards compact"></div>
         <div class="field-row pricing-row">

@@ -119,6 +119,11 @@ input, select {
 .field-row input:nth-child(2) { flex: 2 1 240px; }
 .pricing-row { margin: 16px 0; align-items: end; }
 .pricing-row label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+.settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 18px; padding: 15px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+.settings-grid .check { padding: 5px 0; }
+.settings-row { margin-top: 14px; align-items: end; }
+.settings-row label { display: grid; gap: 6px; flex: 1 1 220px; color: var(--muted); font-size: 12px; }
+.settings-row input { width: 100%; }
 .field-row button, .toolbar button, .source-row button, .item-actions button {
   border: 1px solid var(--line);
   border-radius: 9px;

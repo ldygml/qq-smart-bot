@@ -450,10 +450,12 @@ async function loadKnowledge() {
 }
 
 async function loadOperations() {
-  const [usage, groups] = await Promise.all([
+  const [usage, groups, settingsData] = await Promise.all([
     api("/api/admin/usage"),
     api("/api/admin/group-behavior"),
+    api("/api/admin/group-settings"),
   ]);
+  renderGroupSettings(settingsData.settings);
   const totals = usage.totals;
   $("#input-price").value = usage.pricing?.input || 0;
   $("#output-price").value = usage.pricing?.output || 0;
@@ -487,6 +489,50 @@ async function loadOperations() {
     };
   });
 }
+
+function renderGroupSettings(settings) {
+  $("#group-enabled").checked = Boolean(settings.enable_group);
+  $("#group-require-mention").checked = Boolean(settings.group_require_mention);
+  $("#group-smart").checked = Boolean(settings.group_smart_participation);
+  $("#group-learning").checked = Boolean(settings.group_behavior_learning);
+  $("#quote-replies").checked = Boolean(settings.quote_replies);
+  $("#group-quote-mention").checked = Boolean(settings.group_quote_counts_as_mention);
+  $("#group-confidence").value = settings.group_min_reply_confidence;
+  $("#group-cooldown").value = settings.group_reply_cooldown_seconds;
+  $("#group-model").value = settings.group_participation_model || "";
+  $("#group-allowlist").value = settings.group_allowlist || "";
+  $("#group-prefixes").value = settings.group_trigger_prefixes || "";
+}
+
+$("#save-group-settings").addEventListener("click", async () => {
+  const button = $("#save-group-settings");
+  const status = $("#group-settings-status");
+  status.textContent = "";
+  button.disabled = true;
+  button.textContent = "保存中…";
+  try {
+    const data = await jsonRequest("/api/admin/group-settings", "PATCH", {
+      enable_group: $("#group-enabled").checked,
+      group_require_mention: $("#group-require-mention").checked,
+      group_smart_participation: $("#group-smart").checked,
+      group_behavior_learning: $("#group-learning").checked,
+      quote_replies: $("#quote-replies").checked,
+      group_quote_counts_as_mention: $("#group-quote-mention").checked,
+      group_min_reply_confidence: Number($("#group-confidence").value),
+      group_reply_cooldown_seconds: Number($("#group-cooldown").value),
+      group_participation_model: $("#group-model").value.trim(),
+      group_allowlist: $("#group-allowlist").value.trim(),
+      group_trigger_prefixes: $("#group-prefixes").value.trim(),
+    });
+    renderGroupSettings(data.settings);
+    status.textContent = "设置已保存并立即生效。";
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = "保存设置";
+  }
+});
 
 $("#refresh-groups").addEventListener("click", () => loadOperations().catch((error) => alert(error.message)));
 $("#save-pricing").addEventListener("click", async () => {

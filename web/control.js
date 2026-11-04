@@ -58,7 +58,7 @@ async function loadInstances() {
       <div class="item-head"><b>${esc(item.name)}</b><span class="status ${item.status === "online" ? "online" : ""}"><i></i>${esc(item.status)}</span></div>
       <div class="item-meta">127.0.0.1:${item.port} · ${esc(item.provider_name || "未知供应商")}<br>${esc(item.onebot_api_base)}</div>
       <div class="item-actions">
-        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><a href="${esc(item.dashboard_url)}" target="_blank">打开实例后台</a>` : `<button data-start="${item.id}">启动</button>`}
+        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-group-settings="${item.id}">群聊设置</button><a href="${esc(item.dashboard_url)}" target="_blank">打开实例后台</a>` : `<button data-start="${item.id}">启动</button>`}
         <button data-edit-instance="${item.id}">编辑</button><button data-delete-instance="${item.id}">删除</button>
       </div>
     </article>`).join("") : `<div class="empty">还没有机器人实例</div>`;
@@ -70,6 +70,7 @@ function bindInstanceActions() {
   document.querySelectorAll("[data-stop]").forEach((b) => b.onclick = () => instanceAction(b.dataset.stop, "stop"));
   document.querySelectorAll("[data-restart]").forEach((b) => b.onclick = () => instanceAction(b.dataset.restart, "restart"));
   document.querySelectorAll("[data-memory]").forEach((b) => b.onclick = () => openMemory(Number(b.dataset.memory)));
+  document.querySelectorAll("[data-group-settings]").forEach((b) => b.onclick = () => openGroupSettings(Number(b.dataset.groupSettings)));
   document.querySelectorAll("[data-edit-instance]").forEach((b) => b.onclick = () => editInstance(Number(b.dataset.editInstance)));
   document.querySelectorAll("[data-delete-instance]").forEach((b) => b.onclick = () => deleteInstance(Number(b.dataset.deleteInstance)));
 }
@@ -249,6 +250,85 @@ document.querySelector("#memory-instance").addEventListener("change", async (eve
 document.querySelector("#memory-person").addEventListener("change", async (event) => {
   const instanceId = Number(document.querySelector("#memory-instance").value);
   if (instanceId && event.target.value) await loadMemoryPerson(instanceId, Number(event.target.value));
+});
+
+async function openGroupSettings(instanceId) {
+  const select = document.querySelector("#settings-instance");
+  select.innerHTML = instances
+    .filter((item) => item.status === "online")
+    .map((item) => `<option value="${item.id}">${esc(item.name)} · :${item.port}</option>`)
+    .join("");
+  select.value = String(instanceId);
+  document.querySelector("#settings-error").textContent = "";
+  document.querySelector("#settings-result").textContent = "";
+  openPanel("group-settings-panel");
+  await loadGroupSettings(instanceId);
+}
+
+async function loadGroupSettings(instanceId) {
+  const error = document.querySelector("#settings-error");
+  error.textContent = "";
+  try {
+    const data = await api(`/api/instances/${instanceId}/group-settings`);
+    const settings = data.settings;
+    document.querySelector("#settings-group-enabled").checked = Boolean(settings.enable_group);
+    document.querySelector("#settings-require-mention").checked = Boolean(settings.group_require_mention);
+    document.querySelector("#settings-smart").checked = Boolean(settings.group_smart_participation);
+    document.querySelector("#settings-learning").checked = Boolean(settings.group_behavior_learning);
+    document.querySelector("#settings-quote").checked = Boolean(settings.quote_replies);
+    document.querySelector("#settings-quote-mention").checked = Boolean(settings.group_quote_counts_as_mention);
+    document.querySelector("#settings-confidence").value = settings.group_min_reply_confidence;
+    document.querySelector("#settings-cooldown").value = settings.group_reply_cooldown_seconds;
+    document.querySelector("#settings-model").value = settings.group_participation_model || "";
+    document.querySelector("#settings-allowlist").value = settings.group_allowlist || "";
+    document.querySelector("#settings-prefixes").value = settings.group_trigger_prefixes || "";
+  } catch (err) {
+    error.textContent = err.message;
+  }
+}
+
+document.querySelector("#settings-instance").addEventListener("change", async (event) => {
+  if (event.target.value) await loadGroupSettings(Number(event.target.value));
+});
+
+document.querySelector("#save-settings").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const button = document.querySelector("#save-settings");
+  const error = document.querySelector("#settings-error");
+  const result = document.querySelector("#settings-result");
+  error.textContent = "";
+  result.textContent = "";
+  if (!instanceId) {
+    error.textContent = "请先选择一个在线实例。";
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "保存中…";
+  try {
+    const data = await api(`/api/instances/${instanceId}/group-settings`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        enable_group:document.querySelector("#settings-group-enabled").checked,
+        group_require_mention:document.querySelector("#settings-require-mention").checked,
+        group_smart_participation:document.querySelector("#settings-smart").checked,
+        group_behavior_learning:document.querySelector("#settings-learning").checked,
+        quote_replies:document.querySelector("#settings-quote").checked,
+        group_quote_counts_as_mention:document.querySelector("#settings-quote-mention").checked,
+        group_min_reply_confidence:Number(document.querySelector("#settings-confidence").value),
+        group_reply_cooldown_seconds:Number(document.querySelector("#settings-cooldown").value),
+        group_participation_model:document.querySelector("#settings-model").value.trim(),
+        group_allowlist:document.querySelector("#settings-allowlist").value.trim(),
+        group_trigger_prefixes:document.querySelector("#settings-prefixes").value.trim(),
+      }),
+    });
+    result.textContent = "设置已保存并立即生效，重启实例后仍保留。";
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = "保存群聊设置";
+  }
 });
 
 document.querySelector("#create-backup").addEventListener("click", async () => {

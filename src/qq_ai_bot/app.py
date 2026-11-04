@@ -128,6 +128,28 @@ TASK_HINTS = (
     "文档",
     "资料",
 )
+GROUP_SETTING_SPECS = {
+    "enable_group": ("enable_group", "bool"),
+    "group_allowlist": ("group_allowlist", "string"),
+    "group_require_mention": ("group_require_mention", "bool"),
+    "group_smart_participation": ("group_smart_participation", "bool"),
+    "group_behavior_learning": ("group_behavior_learning", "bool"),
+    "group_trigger_prefixes": ("group_trigger_prefixes", "string"),
+    "group_participation_model": ("group_participation_model", "string"),
+    "group_min_reply_confidence": (
+        "group_min_reply_confidence",
+        "confidence",
+    ),
+    "group_reply_cooldown_seconds": (
+        "group_reply_cooldown_seconds",
+        "cooldown",
+    ),
+    "quote_replies": ("quote_replies", "bool"),
+    "group_quote_counts_as_mention": (
+        "group_quote_counts_as_mention",
+        "bool",
+    ),
+}
 
 
 def create_app(
@@ -186,6 +208,7 @@ def create_app(
         timeout_seconds=config.audio_timeout_seconds
     )
     shared_memory = shared_memory_store or SharedMemoryStore(config.database_path)
+    _apply_saved_group_settings(config, shared_memory)
     embeddings = embedding_client or (
         EmbeddingClient(
             base_url=config.llm_base_url,
@@ -327,12 +350,16 @@ def create_app(
             "reflection_interval_seconds": config.reflection_interval_seconds,
             "reflection_min_new_memories": config.reflection_min_new_memories,
             "group_enabled": config.enable_group,
+            "group_allowlist": sorted(config.group_ids),
             "group_require_mention": config.group_require_mention,
             "group_smart_participation": config.group_smart_participation,
             "group_behavior_learning": config.group_behavior_learning,
             "group_reply_cooldown_seconds": (
                 config.group_reply_cooldown_seconds
             ),
+            "group_participation_model": config.group_participation_model,
+            "group_min_reply_confidence": config.group_min_reply_confidence,
+            "group_trigger_prefixes": list(config.trigger_prefixes),
             "quote_replies": config.quote_replies,
             "group_quote_counts_as_mention": config.group_quote_counts_as_mention,
             "history_messages": config.history_messages,
@@ -695,6 +722,61 @@ def create_app(
     @app.get("/api/admin/group-behavior")
     async def admin_group_behavior() -> dict[str, Any]:
         return {"groups": group_behavior.list_policies()}
+
+    @app.get("/api/admin/group-settings")
+    async def admin_group_settings() -> dict[str, Any]:
+        return {"settings": _group_settings_snapshot(config)}
+
+    @app.patch("/api/admin/group-settings")
+    async def admin_update_group_settings(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        unknown = sorted(
+            set(payload) - set(GROUP_SETTING_SPECS)
+        )
+        if unknown:
+            return JSONResponse(
+                {"detail": f"不支持的群聊设置：{', '.join(unknown)}"},
+                status_code=400,
+            )
+        updates: dict[str, Any] = {}
+        try:
+            for key, value in payload.items():
+                updates[key] = _coerce_group_setting(key, value)
+        except ValueError as exc:
+            return JSONResponse(
+                {"detail": str(exc)},
+                status_code=400,
+            )
+        for key, value in updates.items():
+            attribute = GROUP_SETTING_SPECS[key][0]
+            setattr(config, attribute, value)
+            stored = (
+                "true"
+                if value is True
+                else "false"
+                if value is False
+                else str(value)
+            )
+            shared_memory.set_state(f"group_setting:{key}", stored)
+        if "group_participation_model" in updates and hasattr(
+            group_decider,
+            "model",
+        ):
+            group_decider.model = updates["group_participation_model"]
+        if "group_min_reply_confidence" in updates and hasattr(
+            group_decider,
+            "min_confidence",
+        ):
+            group_decider.min_confidence = updates[
+                "group_min_reply_confidence"
+            ]
+        return JSONResponse(
+            {
+                "ok": True,
+                "settings": _group_settings_snapshot(config),
+            }
+        )
 
     @app.delete("/api/admin/group-behavior/{group_id}")
     async def admin_reset_group_behavior(group_id: int) -> dict[str, Any]:
@@ -2594,6 +2676,79 @@ def _safe_price(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return min(10_000.0, max(0.0, parsed))
+
+
+def _group_settings_snapshot(config: Settings) -> dict[str, Any]:
+    return {
+        key: getattr(config, attribute)
+        for key, (attribute, _) in GROUP_SETTING_SPECS.items()
+    } | {
+        "group_ids": sorted(config.group_ids),
+        "trigger_prefix_values": list(config.trigger_prefixes),
+    }
+
+
+def _coerce_group_setting(key: str, value: Any) -> Any:
+    spec = GROUP_SETTING_SPECS.get(key)
+    if spec is None:
+        raise ValueError(f"不支持的群聊设置：{key}")
+    _, kind = spec
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "1", "yes", "on", "开启", "是"}:
+            return True
+        if normalized in {"false", "0", "no", "off", "关闭", "否"}:
+            return False
+        raise ValueError(f"{key} 必须是布尔值")
+    if kind == "confidence":
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("最低回复置信度必须是数字") from exc
+        if not 0.0 <= parsed <= 1.0:
+            raise ValueError("最低回复置信度必须在 0 到 1 之间")
+        return parsed
+    if kind == "cooldown":
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("回复冷却时间必须是数字") from exc
+        if not 0.0 <= parsed <= 3600.0:
+            raise ValueError("回复冷却时间必须在 0 到 3600 秒之间")
+        return parsed
+    normalized = str(value or "").strip()
+    if len(normalized) > 1000:
+        raise ValueError(f"{key} 内容过长")
+    if key == "group_participation_model" and not normalized:
+        raise ValueError("群聊参与模型不能为空")
+    if key == "group_allowlist":
+        for item in re.split(r"[,，]", normalized):
+            item = item.strip()
+            if item and _optional_int(item) is None:
+                raise ValueError("群白名单只能填写逗号分隔的 QQ 群号")
+    return normalized
+
+
+def _apply_saved_group_settings(
+    config: Settings,
+    shared_memory: SharedMemoryStore,
+) -> None:
+    for key, (attribute, _) in GROUP_SETTING_SPECS.items():
+        missing = "__GROUP_SETTING_UNSET__"
+        raw = shared_memory.get_state(
+            f"group_setting:{key}",
+            missing,
+        )
+        if raw == missing:
+            continue
+        try:
+            parsed = _coerce_group_setting(key, raw)
+        except ValueError:
+            logger.warning("Ignored invalid saved group setting %s", key)
+            continue
+        setattr(config, attribute, parsed)
 
 
 def _expand_ai_command(text: str) -> tuple[str, str | None]:

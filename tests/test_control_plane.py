@@ -138,3 +138,48 @@ def test_import_current_config_encrypts_local_secrets(tmp_path, monkeypatch) -> 
         ).fetchone()[0]
     assert "local-secret-api-key" not in provider_key
     assert "local-onebot-token" not in onebot_token
+
+
+@pytest.mark.asyncio
+async def test_control_plane_proxies_group_settings(tmp_path, monkeypatch) -> None:
+    store = ControlStore(tmp_path / "control.db")
+    monkeypatch.setattr(control_plane, "store", store)
+    monkeypatch.setattr(control_plane, "secrets_box", SecretBox())
+    calls = []
+
+    async def fake_instance_admin_json(
+        instance_id,
+        user_id,
+        path,
+        *,
+        method="GET",
+        json_body=None,
+    ):
+        calls.append((instance_id, user_id, path, method, json_body))
+        return {"ok": True, "settings": {"group_require_mention": False}}
+
+    monkeypatch.setattr(
+        control_plane,
+        "_instance_admin_json",
+        fake_instance_admin_json,
+    )
+    transport = httpx.ASGITransport(app=control_plane.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1:8090",
+    ) as client:
+        setup = await client.post(
+            "/api/auth/setup",
+            json={"username": "owner", "password": "secure-password"},
+        )
+        csrf = setup.json()["csrf_token"]
+        response = await client.post(
+            "/api/instances/9/group-settings",
+            headers={"X-CSRF-Token": csrf},
+            json={"group_require_mention": False},
+        )
+    assert response.status_code == 200
+    assert calls[0][0] == 9
+    assert calls[0][2] == "/api/admin/group-settings"
+    assert calls[0][3] == "PATCH"
+    assert calls[0][4] == {"group_require_mention": False}

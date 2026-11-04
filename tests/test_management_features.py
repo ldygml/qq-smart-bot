@@ -3,9 +3,12 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import httpx
 import pytest
+from pydantic import SecretStr
 
-from qq_ai_bot.app import _detect_natural_generation
+from qq_ai_bot.app import create_app, _detect_natural_generation
+from qq_ai_bot.config import Settings
 from qq_ai_bot.content_tools import (
     generate_chart,
     generate_document,
@@ -49,6 +52,14 @@ class FeatureChat:
         return None
 
 
+class NoopSender:
+    async def send_text(self, target, text) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
 @pytest.mark.parametrize(
     ("text", "command"),
     [
@@ -69,6 +80,71 @@ def test_natural_language_generation_intents(
 
 def test_question_about_charts_does_not_trigger_generation() -> None:
     assert _detect_natural_generation("这个图表怎么做才好看") is None
+
+
+@pytest.mark.asyncio
+async def test_group_settings_api_is_persistent_and_reloadable(tmp_path) -> None:
+    database = tmp_path / "bot.db"
+
+    def settings() -> Settings:
+        return Settings(
+            _env_file=None,
+            onebot_token=SecretStr("test"),
+            database_path=database,
+            enable_group=True,
+            group_require_mention=True,
+            vector_memory_enabled=False,
+        )
+
+    app = create_app(
+        settings=settings(),
+        chat_client=FeatureChat(),
+        onebot_client=NoopSender(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        current = await client.get("/api/admin/group-settings")
+        assert current.status_code == 200
+        assert current.json()["settings"]["group_require_mention"] is True
+
+        updated = await client.patch(
+            "/api/admin/group-settings",
+            json={
+                "group_require_mention": False,
+                "group_smart_participation": True,
+                "group_behavior_learning": True,
+                "group_reply_cooldown_seconds": 45,
+                "group_min_reply_confidence": 0.72,
+                "group_allowlist": "100,200",
+                "group_trigger_prefixes": "",
+                "quote_replies": False,
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["settings"]["group_allowlist"] == "100,200"
+
+        invalid = await client.patch(
+            "/api/admin/group-settings",
+            json={"group_allowlist": "not-a-group"},
+        )
+        assert invalid.status_code == 400
+
+    reloaded = create_app(
+        settings=settings(),
+        chat_client=FeatureChat(),
+        onebot_client=NoopSender(),
+    )
+    loaded = reloaded.state.settings
+    assert loaded.group_require_mention is False
+    assert loaded.group_allowlist == "100,200"
+    assert loaded.group_ids == {100, 200}
+    assert loaded.group_reply_cooldown_seconds == 45
+    assert loaded.group_min_reply_confidence == 0.72
+    assert loaded.quote_replies is False
+    assert loaded.trigger_prefixes == ()
 
 
 @pytest.mark.asyncio

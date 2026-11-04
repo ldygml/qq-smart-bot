@@ -1211,6 +1211,7 @@ async def _instance_admin_json(
     path: str,
     *,
     method: str = "GET",
+    json_body: Any = None,
 ) -> Any:
     instance = store.instance(instance_id, user_id)
     if not instance:
@@ -1218,7 +1219,7 @@ async def _instance_admin_json(
     url = f"http://127.0.0.1:{instance['port']}{path}"
     try:
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
-            response = await client.request(method, url)
+            response = await client.request(method, url, json=json_body)
     except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=503,
@@ -1276,6 +1277,54 @@ async def instance_delete_memory(
         instance_id,
         int(user["id"]),
         f"/api/admin/people/{user_id}/memories/{memory_id}",
+        method="DELETE",
+    )
+
+
+@app.get("/api/instances/{instance_id}/group-settings")
+async def instance_group_settings(
+    instance_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/group-settings",
+    )
+
+
+@app.post("/api/instances/{instance_id}/group-settings")
+async def instance_update_group_settings(
+    instance_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/group-settings",
+        method="PATCH",
+        json_body=payload,
+    )
+
+
+@app.delete(
+    "/api/instances/{instance_id}/group-behavior/{group_id}"
+)
+async def instance_reset_group_behavior(
+    instance_id: int,
+    group_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/group-behavior/{group_id}",
         method="DELETE",
     )
 
