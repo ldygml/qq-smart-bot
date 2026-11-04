@@ -803,6 +803,88 @@ async def test_privacy_protection_can_be_disabled(tmp_path) -> None:
     assert "睡眠不好" in llm.calls[0][0]["content"]
 
 
+@pytest.mark.asyncio
+async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2300,
+                "message": [
+                    {
+                        "type": "mface",
+                        "data": {
+                            "summary": "奶龙",
+                            "emoji_id": "abc",
+                        },
+                    }
+                ],
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert llm.models == ["qwen3.8-flash"]
+    assert "表情包" in llm.calls[0][-1]["content"]
+    assert sender.sent[0][0].message_id is None
+
+
+@pytest.mark.asyncio
+async def test_current_news_request_enables_web_search(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path, web_search_enabled=True),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2400,
+                "message": "最近有什么足球新闻，帮我查一下",
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert llm.extra_payloads[0]["enable_search"] is True
+    assert llm.extra_payloads[0]["search_options"]["forced_search"] is True
+    assert "当前时间" in llm.calls[0][0]["content"]
+
+
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():

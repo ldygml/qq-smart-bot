@@ -62,6 +62,7 @@ class MessageContent:
     file_sources: tuple[FileSource, ...] = ()
     audio_sources: tuple[AudioSource, ...] = ()
     reply_id: str = ""
+    sticker_summaries: tuple[str, ...] = ()
 
 
 class OneBotError(RuntimeError):
@@ -229,6 +230,7 @@ _CQ_IMAGE_PATTERN = re.compile(r"\[CQ:image,([^\]]+)\]")
 _CQ_FILE_PATTERN = re.compile(r"\[CQ:file,([^\]]+)\]")
 _CQ_RECORD_PATTERN = re.compile(r"\[CQ:record,([^\]]+)\]")
 _CQ_REPLY_PATTERN = re.compile(r"\[CQ:reply,id=([^,\]]+)(?:,[^\]]*)?\]")
+_CQ_MFACE_PATTERN = re.compile(r"\[CQ:mface,([^\]]+)\]")
 _CQ_OTHER_PATTERN = re.compile(r"\[CQ:[^\]]+\]")
 _UNSUPPORTED_SEGMENTS = {
     "image": "[图片]",
@@ -269,6 +271,7 @@ def extract_message_content(
         file_sources: list[FileSource] = []
         audio_sources: list[AudioSource] = []
         reply_id = ""
+        sticker_summaries: list[str] = []
         mentioned = False
         for segment in message:
             if not isinstance(segment, dict):
@@ -285,10 +288,23 @@ def extract_message_content(
                 if self_id is not None and qq == str(self_id):
                     mentioned = True
             elif segment_type == "image":
-                parts.append("[图片]")
-                source = data.get("url") or data.get("file")
-                if isinstance(source, str) and source.strip():
-                    image_sources.append(source.strip())
+                is_sticker = any(
+                    data.get(key)
+                    for key in ("emoji_id", "emoji_package_id", "key")
+                ) or str(data.get("sub_type", "")) == "1"
+                if is_sticker:
+                    summary = str(data.get("summary") or "表情包")
+                    sticker_summaries.append(summary)
+                    parts.append("[表情包]")
+                else:
+                    parts.append("[图片]")
+                    source = data.get("url") or data.get("file")
+                    if isinstance(source, str) and source.strip():
+                        image_sources.append(source.strip())
+            elif segment_type == "mface":
+                summary = str(data.get("summary") or "表情包")
+                sticker_summaries.append(summary)
+                parts.append("[表情包]")
             elif segment_type == "file":
                 name = str(data.get("name") or data.get("file") or "文件")
                 file_value = str(data.get("file") or "")
@@ -340,6 +356,7 @@ def extract_message_content(
             file_sources=tuple(file_sources),
             audio_sources=tuple(audio_sources),
             reply_id=reply_id,
+            sticker_summaries=tuple(sticker_summaries),
         )
 
     if isinstance(message, str):
@@ -351,14 +368,30 @@ def extract_message_content(
     image_sources: list[str] = []
     file_sources: list[FileSource] = []
     audio_sources: list[AudioSource] = []
+    sticker_summaries: list[str] = []
 
     def replace_image(match: re.Match[str]) -> str:
-        source = _cq_image_source(match.group(1))
+        parameters = _cq_parameters(match.group(1))
+        is_sticker = any(
+            parameters.get(key)
+            for key in ("emoji_id", "emoji_package_id", "key")
+        ) or parameters.get("sub_type") == "1"
+        if is_sticker:
+            sticker_summaries.append(parameters.get("summary") or "表情包")
+            return "[表情包]"
+        source = parameters.get("url") or parameters.get("file")
         if source:
             image_sources.append(source)
         return "[图片]"
 
     source = _CQ_IMAGE_PATTERN.sub(replace_image, source)
+
+    def replace_mface(match: re.Match[str]) -> str:
+        parameters = _cq_parameters(match.group(1))
+        sticker_summaries.append(parameters.get("summary") or "表情包")
+        return "[表情包]"
+
+    source = _CQ_MFACE_PATTERN.sub(replace_mface, source)
 
     def replace_file(match: re.Match[str]) -> str:
         parameters = _cq_parameters(match.group(1))
@@ -409,6 +442,7 @@ def extract_message_content(
         file_sources=tuple(file_sources),
         audio_sources=tuple(audio_sources),
         reply_id=reply_id,
+        sticker_summaries=tuple(sticker_summaries),
     )
 
 
@@ -450,11 +484,6 @@ def split_reply(text: str, max_chars: int) -> list[str]:
 def _normalize_text(value: str) -> str:
     lines = [line.rstrip() for line in value.replace("\r\n", "\n").split("\n")]
     return "\n".join(lines).strip()
-
-
-def _cq_image_source(raw_parameters: str) -> str:
-    parameters = _cq_parameters(raw_parameters)
-    return parameters.get("url") or parameters.get("file") or ""
 
 
 def _cq_parameters(raw_parameters: str) -> dict[str, str]:

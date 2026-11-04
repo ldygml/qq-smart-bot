@@ -113,6 +113,43 @@ def test_extract_quoted_message_id() -> None:
     assert content.reply_id == "12345"
 
 
+def test_store_face_is_not_treated_as_question_image() -> None:
+    content = extract_message_content(
+        [
+            {
+                "type": "mface",
+                "data": {
+                    "summary": "奶龙",
+                    "emoji_id": "abc",
+                    "emoji_package_id": "123",
+                },
+            }
+        ],
+        self_id=10001,
+    )
+    assert content.image_sources == ()
+    assert content.sticker_summaries == ("奶龙",)
+
+
+def test_image_with_sticker_metadata_is_not_treated_as_question_image() -> None:
+    content = extract_message_content(
+        [
+            {
+                "type": "image",
+                "data": {
+                    "summary": "doge",
+                    "emoji_id": "abc",
+                    "key": "sticker-key",
+                    "url": "https://example.com/sticker.gif",
+                },
+            }
+        ],
+        self_id=10001,
+    )
+    assert content.image_sources == ()
+    assert content.sticker_summaries == ("doge",)
+
+
 @pytest.mark.asyncio
 async def test_group_reply_includes_quote_segment() -> None:
     captured = {}
