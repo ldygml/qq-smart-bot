@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import zipfile
 from pathlib import Path
 
 import httpx
@@ -11,6 +12,7 @@ from qq_ai_bot.app import create_app, _detect_natural_generation
 from qq_ai_bot.config import Settings
 from qq_ai_bot.content_tools import (
     generate_chart,
+    generate_code,
     generate_document,
     generate_file,
 )
@@ -44,6 +46,11 @@ class FeatureChat:
                 '{"title":"学习计划","subtitle":"本周",'
                 '"sections":[{"heading":"目标","paragraphs":["完成复盘。"]}]}'
             )
+        if '"files"' in prompt:
+            return (
+                '{"project_name":"grade_tool","summary":"成绩统计脚本",'
+                '"files":[{"path":"main.py","content":"print(42)\\n"}]}'
+            )
         if "format" in prompt:
             return '{"title":"打卡记录","format":"csv","content":"日期,时长"}'
         return "完成"
@@ -60,6 +67,17 @@ class NoopSender:
         return None
 
 
+class MultiCodeChat(FeatureChat):
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        return (
+            '{"project_name":"todo_web","summary":"待办网页",'
+            '"files":['
+            '{"path":"index.html","content":"<h1>Todo</h1>"},'
+            '{"path":"src/app.js","content":"console.log(1);\\n"}'
+            "]}"
+        )
+
+
 @pytest.mark.parametrize(
     ("text", "command"),
     [
@@ -67,6 +85,8 @@ class NoopSender:
         ("整理本周学习资料，做成一份Word发我", "/生成文档"),
         ("把这些数据做成柱状图发给我", "/生成图表"),
         ("把打卡记录导出为CSV给我", "/生成文件"),
+        ("写个 Python 脚本发给我", "/生成代码"),
+        ("实现一个待办网页并生成代码文件", "/生成代码"),
     ],
 )
 def test_natural_language_generation_intents(
@@ -80,6 +100,7 @@ def test_natural_language_generation_intents(
 
 def test_question_about_charts_does_not_trigger_generation() -> None:
     assert _detect_natural_generation("这个图表怎么做才好看") is None
+    assert _detect_natural_generation("这段 Python 代码怎么写") is None
 
 
 @pytest.mark.asyncio
@@ -168,10 +189,35 @@ async def test_content_generation_creates_real_artifacts(tmp_path) -> None:
         prompt="生成打卡 CSV",
         output_dir=tmp_path,
     )
+    code_file = await generate_code(
+        client,
+        model="test",
+        prompt="写一个 Python 成绩统计脚本",
+        output_dir=tmp_path,
+    )
     assert chart.path.read_bytes().startswith(b"\x89PNG")
     assert document.path.suffix == ".docx"
     assert document.path.stat().st_size > 1000
     assert data_file.path.read_text(encoding="utf-8") == "日期,时长"
+    assert code_file.name == "main.py"
+    assert code_file.path.read_text(encoding="utf-8") == "print(42)\n"
+
+
+@pytest.mark.asyncio
+async def test_multi_file_code_generation_is_packaged_as_zip(tmp_path) -> None:
+    artifact = await generate_code(
+        MultiCodeChat(),
+        model="test",
+        prompt="实现一个待办网页",
+        output_dir=tmp_path,
+    )
+    assert artifact.kind == "archive"
+    assert artifact.path.suffix == ".zip"
+    with zipfile.ZipFile(artifact.path) as archive:
+        assert sorted(archive.namelist()) == [
+            "todo_web/index.html",
+            "todo_web/src/app.js",
+        ]
 
 
 def test_sticker_management_and_disabled_filter(tmp_path) -> None:

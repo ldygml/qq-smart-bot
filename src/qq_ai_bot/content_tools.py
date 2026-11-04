@@ -4,6 +4,8 @@ import io
 import json
 import math
 import re
+import secrets
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -201,6 +203,95 @@ async def generate_file(
     )
 
 
+async def generate_code(
+    chat_client: ChatClient,
+    *,
+    model: str,
+    prompt: str,
+    output_dir: Path,
+) -> GeneratedArtifact:
+    reply = await chat_client.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是代码文件生成器。严格输出 JSON，不要 Markdown，不要解释。"
+                    "生成可直接保存和审阅的完整源代码文件，不要执行代码，"
+                    "不要输出省略号占位符。所有文件路径必须是安全相对路径。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    '返回 {"project_name":"项目名","summary":"一句话说明",'
+                    '"files":[{"path":"main.py","content":"完整代码"}]}。'
+                    "最多 12 个文件，单文件不超过 120000 字符。"
+                    "根据需求选择正确扩展名。多文件项目一并提供运行说明、"
+                    "依赖文件或 README；单文件需求只返回一个文件。\n"
+                    f"代码需求：{prompt}"
+                ),
+            },
+        ],
+        model=model,
+        extra_payload={
+            "reasoning_effort": "none",
+            "response_format": {"type": "json_object"},
+        },
+    )
+    spec = _parse_json(reply)
+    raw_files = spec.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ContentGenerationError("模型没有生成代码文件。")
+    files = _valid_code_files(raw_files)
+    if not files:
+        raise ContentGenerationError("模型返回的文件路径或代码内容无效。")
+    project_name = _safe_name(
+        str(spec.get("project_name") or "generated_code")
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    if len(files) == 1:
+        relative_path, content = files[0]
+        original_name = Path(relative_path).name
+        suffix = Path(original_name).suffix
+        stem = _safe_name(Path(original_name).stem)
+        path = output_dir / f"{stem}_{stamp}{suffix}"
+        path.write_text(content, encoding="utf-8")
+        return GeneratedArtifact(
+            path=path,
+            name=original_name,
+            kind="code",
+            summary=str(
+                spec.get("summary") or "代码文件已生成"
+            ).strip()[:300],
+        )
+    run_dir = output_dir / f"code_{stamp}_{secrets.token_hex(3)}"
+    for relative_path, content in files:
+        target = (run_dir / relative_path).resolve()
+        if target.parent != run_dir.resolve() and not target.is_relative_to(
+            run_dir.resolve()
+        ):
+            raise ContentGenerationError("生成的文件路径不安全。")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    summary = str(spec.get("summary") or "代码文件已生成").strip()[:300]
+    archive_path = output_dir / f"{project_name}_{stamp}.zip"
+    with zipfile.ZipFile(
+        archive_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        for relative_path, _ in files:
+            source = (run_dir / relative_path).resolve()
+            archive.write(source, f"{project_name}/{relative_path}")
+    return GeneratedArtifact(
+        path=archive_path,
+        name=archive_path.name,
+        kind="archive",
+        summary=f"{summary}（{len(files)} 个文件，已打包 ZIP）",
+    )
+
+
 def _parse_json(reply: str) -> dict[str, Any]:
     value = re.sub(r"^```(?:json)?\s*", "", reply.strip(), flags=re.I)
     value = re.sub(r"\s*```$", "", value)
@@ -219,6 +310,91 @@ def _parse_json(reply: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ContentGenerationError("模型返回的生成结构格式不正确。")
     return data
+
+
+_CODE_EXTENSIONS = {
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".html",
+    ".htm",
+    ".css",
+    ".scss",
+    ".java",
+    ".c",
+    ".h",
+    ".cpp",
+    ".cc",
+    ".hpp",
+    ".cs",
+    ".go",
+    ".rs",
+    ".php",
+    ".rb",
+    ".swift",
+    ".kt",
+    ".kts",
+    ".sql",
+    ".sh",
+    ".ps1",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".xml",
+    ".md",
+    ".txt",
+    ".vue",
+    ".svelte",
+    ".gradle",
+}
+
+
+def _valid_code_files(value: list[Any]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    total_size = 0
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("path") or "").strip().replace("\\", "/")
+        content = item.get("content")
+        if not raw_path or not isinstance(content, str):
+            continue
+        path = (
+            raw_path[2:]
+            if raw_path.startswith("./")
+            else raw_path
+        )
+        parts = [part for part in path.split("/") if part]
+        if not parts or any(part in {".", ".."} for part in parts):
+            continue
+        if any(
+            re.search(r'[<>:"|?*\x00-\x1f]', part)
+            for part in parts
+        ):
+            continue
+        if path.startswith("/") or re.match(r"^[A-Za-z]:", path):
+            continue
+        if len(content) > 120_000 or not content.strip():
+            continue
+        normalized = "/".join(parts)
+        suffix = Path(normalized).suffix.lower()
+        filename = parts[-1]
+        if suffix not in _CODE_EXTENSIONS and filename not in {
+            "Dockerfile",
+            "Makefile",
+            ".gitignore",
+        }:
+            continue
+        total_size += len(content)
+        if total_size > 300_000 or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append((normalized, content))
+    return result
 
 
 def _valid_series(value: Any) -> list[tuple[str, float]]:

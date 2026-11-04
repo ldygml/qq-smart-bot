@@ -22,6 +22,7 @@ from .config import Settings
 from .content_tools import (
     ContentGenerationError,
     generate_chart,
+    generate_code,
     generate_document,
     generate_file,
 )
@@ -818,9 +819,20 @@ def create_app(
                     prompt=prompt,
                     output_dir=_generated_media_dir(),
                 )
+            elif kind == "code":
+                artifact = await generate_code(
+                    llm,
+                    model=config.llm_model,
+                    prompt=prompt,
+                    output_dir=_generated_media_dir(),
+                )
             else:
                 return JSONResponse(
-                    {"detail": "kind must be chart, document, or file"},
+                    {
+                        "detail": (
+                            "kind must be chart, document, file, or code"
+                        )
+                    },
                     status_code=400,
                 )
         except (ContentGenerationError, LLMError) as exc:
@@ -2083,6 +2095,7 @@ def create_app(
             "/生成图表",
             "/生成文档",
             "/生成文件",
+            "/生成代码",
         ):
             if value == prefix or value.startswith(prefix + " "):
                 command = prefix
@@ -2188,6 +2201,36 @@ def create_app(
             except Exception:
                 logger.exception("Unexpected generated-file failure")
                 await _safe_send(target, "文件生成失败，请稍后再试。")
+            return True
+
+        if command == "/生成代码":
+            if not argument:
+                await _safe_send(
+                    target,
+                    "用法：/生成代码 用 Python 写一个读取 CSV 并统计成绩的脚本",
+                )
+                return True
+            if not limiter.allow(str(event.user_id)):
+                await _safe_send(target, "生成请求太频繁，等一分钟再试。")
+                return True
+            await _safe_send(target, "正在编写代码文件…")
+            try:
+                artifact = await generate_code(
+                    llm,
+                    model=config.llm_model,
+                    prompt=argument,
+                    output_dir=_generated_media_dir(),
+                )
+                await sender.upload_file(
+                    target,
+                    path=str(artifact.path),
+                    name=artifact.name,
+                )
+            except (ContentGenerationError, LLMError, OneBotError) as exc:
+                await _safe_send(target, f"代码文件生成失败：{exc}")
+            except Exception:
+                logger.exception("Unexpected code generation failure")
+                await _safe_send(target, "代码文件生成失败，请稍后再试。")
             return True
 
         if command == "/发语音":
@@ -2422,8 +2465,8 @@ def create_app(
                 "网页收藏：/收藏网页 URL，会写入知识库来源并参与后续检索\n"
                 "互动：/戳，或者私聊直接说“戳一戳”\n"
                 "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情；/表情库\n"
-                "生成：/生成图表 数据；/生成文档 要求；/生成文件 要求\n"
-                "自然语言：整理资料发Word给我；把这些数据做成图表发我；导出CSV给我\n"
+                "生成：/生成图表 数据；/生成文档 要求；/生成文件 要求；/生成代码 需求\n"
+                "自然语言：写个Python脚本发我；整理资料发Word；做图表发我；导出CSV\n"
                 "反思：/反思，管理员可立即整理长期记忆\n"
                 "引用：机器人会引用你的原消息；引用机器人消息可以直接追问\n"
                 "/重置：忘记当前聊天上下文\n"
@@ -2810,6 +2853,9 @@ def _detect_natural_generation(
         "收集",
         "汇总",
         "写",
+        "编写",
+        "实现",
+        "开发",
         "导出",
         "保存",
         "发我",
@@ -2824,11 +2870,79 @@ def _detect_natural_generation(
     )
     if not (any(action in lowered for action in strong_actions) or weak_action):
         return None
+    asks_question = any(
+        marker in lowered
+        for marker in ("怎么", "如何", "为什么", "报错", "错误", "区别", "吗", "？", "?")
+    )
+    asks_for_artifact = any(
+        marker in lowered
+        for marker in (
+            "发我",
+            "发给我",
+            "给我",
+            "文件",
+            "生成",
+            "制作",
+            "导出",
+            "保存",
+            "写个",
+            "编写个",
+            "实现一个",
+            "开发一个",
+            "弄一份",
+            "来一份",
+            "要一份",
+        )
+    )
+    if asks_question and not asks_for_artifact:
+        return None
     if any(
         marker in lowered
         for marker in ("图表", "柱状图", "折线图", "饼图", "可视化")
     ):
         return "/生成图表", value
+    explicit_code_markers = (
+        "代码文件",
+        "源代码文件",
+        "源码文件",
+        ".py",
+        ".js",
+        ".ts",
+        ".html",
+        ".css",
+        ".java",
+        ".cpp",
+        ".go",
+        ".rs",
+        ".sql",
+    )
+    code_terms = (
+        "代码",
+        "脚本",
+        "程序",
+        "函数",
+        "模块",
+        "爬虫",
+        "前端页面",
+        "网页应用",
+        "接口",
+        "小程序",
+        "python",
+        "javascript",
+        "typescript",
+        "golang",
+        "rust",
+        "sql",
+    )
+    has_document_delivery = any(
+        marker in lowered
+        for marker in ("docx", "doxc", "word", "文档", "文稿")
+    )
+    if any(marker in lowered for marker in explicit_code_markers) or (
+        any(marker in lowered for marker in code_terms)
+        and not has_document_delivery
+    ):
+        return "/生成代码", value
     if any(
         marker in lowered
         for marker in ("docx", "doxc", "word", "文档", "文稿")
