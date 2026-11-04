@@ -348,6 +348,9 @@ REMINDER_POLL_SECONDS=15
 
 ## 验证
 
+端到端 QQ 测试目标固定为群“测试”和好友“aloha”，具体规则见
+[`TESTING.md`](TESTING.md)。不要使用其他群或联系人做实时测试。
+
 ```powershell
 uv sync --dev
 uv run pytest
