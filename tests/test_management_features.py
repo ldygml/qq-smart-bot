@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import zipfile
 from pathlib import Path
 
 import httpx
 import pytest
+from docx import Document as WordDocument
 from pydantic import SecretStr
 
 from qq_ai_bot.app import create_app, _detect_natural_generation
@@ -76,6 +78,53 @@ class MultiCodeChat(FeatureChat):
             '{"path":"index.html","content":"<h1>Todo</h1>"},'
             '{"path":"src/app.js","content":"console.log(1);\\n"}'
             "]}"
+        )
+
+
+class QualityDocumentChat:
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        prompt = str(messages[-1].get("content", ""))
+        if extra_payload and extra_payload.get("enable_search"):
+            return (
+                '{"facts":[{"claim":"歌曲发行信息已核对",'
+                '"source_url":"https://example.com/song",'
+                '"quote":"发行信息"}],"uncertain":[]}'
+            )
+        assert "检索核对材料" in prompt or "待审校 JSON" in prompt
+        return (
+            '{"title":"晴天.docx","subtitle":"歌曲资料",'
+            '"sections":['
+            '{"heading":"歌词正文（完整版）","paragraphs":['
+            '"故事的小黄花","从出生那年就飘着","童年的荡秋千",'
+            '"随记忆一直晃到现在","吹着前奏望着天空","想起花瓣试着掉落",'
+            '"为你翘课的那一天","花落的那一天"]},'
+            '{"heading":"主题分析","paragraphs":['
+            '"歌曲围绕青春记忆与遗憾展开，这是分析文字。",'
+            '"资料中的发行信息需要以可核验来源为准。"]}'
+            '],"sources":["https://example.com/song",'
+            '"https://invented.example/fake"]}'
+        )
+
+
+class NamedFileChat(FeatureChat):
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        return (
+            '{"title":"打卡记录.csv","format":"csv",'
+            '"content":"日期,时长"}'
+        )
+
+
+class RepairCodeChat(FeatureChat):
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        prompt = str(messages[-1].get("content", ""))
+        content = "def broken(:\n    pass\n" if "检测到的错误" not in prompt else "def ok():\n    return 1\n"
+        return json.dumps(
+            {
+                "project_name": "repair_demo",
+                "summary": "修复后的脚本",
+                "files": [{"path": "main.py", "content": content}],
+            },
+            ensure_ascii=False,
         )
 
 
@@ -262,6 +311,46 @@ async def test_multi_file_code_generation_is_packaged_as_zip(tmp_path) -> None:
             "todo_web/index.html",
             "todo_web/src/app.js",
         ]
+
+
+@pytest.mark.asyncio
+async def test_file_generation_does_not_duplicate_suffix(tmp_path) -> None:
+    artifact = await generate_file(
+        NamedFileChat(),
+        model="test",
+        prompt="生成打卡记录",
+        output_dir=tmp_path,
+    )
+    assert artifact.name == "打卡记录.csv"
+    assert artifact.path.suffix == ".csv"
+
+
+@pytest.mark.asyncio
+async def test_document_quality_filters_lyrics_and_unverified_sources(tmp_path) -> None:
+    artifact = await generate_document(
+        QualityDocumentChat(),
+        model="test",
+        prompt="整理歌曲资料和歌词",
+        output_dir=tmp_path,
+    )
+    assert artifact.name == "晴天.docx"
+    document = WordDocument(artifact.path)
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    assert "故事的小黄花" not in text
+    assert "主题分析" in text
+    assert "https://example.com/song" in text
+    assert "invented.example" not in text
+
+
+@pytest.mark.asyncio
+async def test_code_generation_repairs_python_syntax_error(tmp_path) -> None:
+    artifact = await generate_code(
+        RepairCodeChat(),
+        model="test",
+        prompt="写一个 Python 函数",
+        output_dir=tmp_path,
+    )
+    assert "def ok()" in artifact.path.read_text(encoding="utf-8")
 
 
 def test_sticker_management_and_disabled_filter(tmp_path) -> None:
