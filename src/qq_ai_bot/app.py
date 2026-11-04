@@ -1199,12 +1199,17 @@ def create_app(
                     event.self_id,
                 )
             addressed_by_name = config.bot_name in text
+            natural_generation = _detect_natural_generation(text) is not None
             directly_addressed = (
                 content.mentioned
                 or quoted_bot
                 or prefix_triggered
                 or addressed_by_name
                 or text.startswith("/")
+                or (
+                    natural_generation
+                    and not config.group_require_mention
+                )
             )
             if (
                 config.group_require_mention
@@ -2005,6 +2010,10 @@ def create_app(
             command = "/发语音"
             argument = value[len("用语音说") :].lstrip("：:，, ")
         if not command:
+            detected = _detect_natural_generation(value)
+            if detected is not None:
+                command, argument = detected
+        if not command:
             for phrase, target_command in (
                 ("生成图表", "/生成图表"),
                 ("做个图表", "/生成图表"),
@@ -2332,6 +2341,7 @@ def create_app(
                 "互动：/戳，或者私聊直接说“戳一戳”\n"
                 "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情；/表情库\n"
                 "生成：/生成图表 数据；/生成文档 要求；/生成文件 要求\n"
+                "自然语言：整理资料发Word给我；把这些数据做成图表发我；导出CSV给我\n"
                 "反思：/反思，管理员可立即整理长期记忆\n"
                 "引用：机器人会引用你的原消息；引用机器人消息可以直接追问\n"
                 "/重置：忘记当前聊天上下文\n"
@@ -2629,6 +2639,63 @@ def _audio_instruction(text: str) -> str:
         "请根据下面的要求处理这段语音；如果要求不明确，就先完整转写。"
         f"\n要求：{value}"
     )
+
+
+def _detect_natural_generation(
+    text: str,
+) -> tuple[str, str] | None:
+    value = text.strip()
+    if not value or value.startswith("/"):
+        return None
+    lowered = value.lower()
+    strong_actions = (
+        "生成",
+        "制作",
+        "整理",
+        "收集",
+        "汇总",
+        "写",
+        "导出",
+        "保存",
+        "发我",
+        "发给我",
+        "给我",
+        "要一份",
+        "弄一份",
+        "来一份",
+    )
+    weak_action = "做" in lowered and any(
+        marker in lowered for marker in ("一份", "给我", "发我", "发给我")
+    )
+    if not (any(action in lowered for action in strong_actions) or weak_action):
+        return None
+    if any(
+        marker in lowered
+        for marker in ("图表", "柱状图", "折线图", "饼图", "可视化")
+    ):
+        return "/生成图表", value
+    if any(
+        marker in lowered
+        for marker in ("docx", "doxc", "word", "文档", "文稿")
+    ):
+        return "/生成文档", value
+    if any(
+        marker in lowered
+        for marker in (
+            ".csv",
+            " csv",
+            "csv",
+            "csv文件",
+            ".md",
+            "md文件",
+            "markdown",
+            ".txt",
+            "txt",
+            "txt文件",
+        )
+    ):
+        return "/生成文件", value
+    return None
 
 
 def _looks_like_task_request(text: str) -> bool:

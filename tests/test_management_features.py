@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from qq_ai_bot.app import _detect_natural_generation
 from qq_ai_bot.content_tools import (
     generate_chart,
     generate_document,
@@ -46,6 +47,28 @@ class FeatureChat:
 
     async def close(self) -> None:
         return None
+
+
+@pytest.mark.parametrize(
+    ("text", "command"),
+    [
+        ("收集晴天歌词，然后发doxc给我", "/生成文档"),
+        ("整理本周学习资料，做成一份Word发我", "/生成文档"),
+        ("把这些数据做成柱状图发给我", "/生成图表"),
+        ("把打卡记录导出为CSV给我", "/生成文件"),
+    ],
+)
+def test_natural_language_generation_intents(
+    text: str,
+    command: str,
+) -> None:
+    detected = _detect_natural_generation(text)
+    assert detected is not None
+    assert detected[0] == command
+
+
+def test_question_about_charts_does_not_trigger_generation() -> None:
+    assert _detect_natural_generation("这个图表怎么做才好看") is None
 
 
 @pytest.mark.asyncio
