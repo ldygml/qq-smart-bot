@@ -154,6 +154,22 @@ class FakeEmbeddingClient:
         return None
 
 
+class FakeGroupDecider:
+    def __init__(self, result: bool) -> None:
+        self.result = result
+        self.calls = 0
+
+    async def should_reply(
+        self,
+        *,
+        history,
+        current_sender: str,
+        current_text: str,
+    ) -> bool:
+        self.calls += 1
+        return self.result
+
+
 class VerboseThenConciseChatClient(FakeChatClient):
     async def chat(
         self,
@@ -351,6 +367,7 @@ async def test_quoting_bot_message_triggers_group_reply_without_mention(tmp_path
         image_loader=FakeImageLoader(),
         document_loader=FakeDocumentLoader(),
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        group_reply_decider=FakeGroupDecider(True),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -395,6 +412,7 @@ async def test_group_can_reply_without_mention(tmp_path) -> None:
         image_loader=FakeImageLoader(),
         document_loader=FakeDocumentLoader(),
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        group_reply_decider=FakeGroupDecider(True),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -785,6 +803,7 @@ async def test_other_contact_can_use_shareable_memory(tmp_path) -> None:
         document_loader=FakeDocumentLoader(),
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
         shared_memory_store=shared,
+        group_reply_decider=FakeGroupDecider(True),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -837,6 +856,7 @@ async def test_privacy_protection_can_be_disabled(tmp_path) -> None:
         document_loader=FakeDocumentLoader(),
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
         shared_memory_store=shared,
+        group_reply_decider=FakeGroupDecider(True),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -963,6 +983,7 @@ async def test_group_can_remember_what_was_said_in_another_group(tmp_path) -> No
         document_loader=FakeDocumentLoader(),
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
         shared_memory_store=shared,
+        group_reply_decider=FakeGroupDecider(True),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -1218,6 +1239,54 @@ async def test_admin_page_and_api(tmp_path) -> None:
     assert "给她爱控制台" in page.text
     assert people.json()["people"][0]["display_name"] == "test-user"
     assert detail.json()["person"]["style_profile"] == "直接、简短"
+
+
+@pytest.mark.asyncio
+async def test_smart_group_mode_can_stay_silent(tmp_path) -> None:
+    sender = FakeOneBotClient()
+    decider = FakeGroupDecider(False)
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=False,
+            group_smart_participation=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        group_reply_decider=decider,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        for message_id, message in (
+            (2900, "你们觉得这个方案怎么样"),
+            (2901, "谢谢"),
+        ):
+            await client.post(
+                "/onebot",
+                headers={"Authorization": "Bearer test-secret"},
+                json={
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 999,
+                    "user_id": 123,
+                    "group_id": 456,
+                    "message_id": message_id,
+                    "message": message,
+                    "sender": {"nickname": "测试用户"},
+                },
+            )
+        await asyncio.sleep(0.1)
+
+    assert sender.sent == []
+    assert decider.calls == 1
 
 
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:

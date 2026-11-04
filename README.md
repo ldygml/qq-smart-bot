@@ -17,6 +17,7 @@
 ### 1. 真人化聊天人格
 
 - 机器人人格名为“给她爱”，是一个有足球偏好、有脾气和判断的普通聊天对象。
+- 足球只在对方聊体育、询问爱好或自我介绍时出现，不会把无关话题硬扯到足球。
 - 普通闲聊短句、口语化，不默认写总结、列清单或输出客服模板。
 - 会根据联系人、历史聊天和当前情绪调整语气。
 - 可以冷嘲、拆台和直接指出问题，但不使用脏话、威胁、歧视或身份羞辱。
@@ -183,7 +184,9 @@ PROFILE_UPDATE_AFTER_MESSAGES=5
 ```
 
 - 私聊也可以直接发“戳一戳”或“戳我”。
-- 群聊可配置为“必须 @”或“无需 @”。
+- 群聊可配置为“必须 @”或“智能参与”。免 @ 模式也不代表每条都回复。
+- 智能参与会判断消息是否明确需要机器人，寒暄、道谢、群友互相聊天和短确认会被跳过。
+- 机器人会参考最近群聊与自己的上一条消息，避免抢话或每次都成为最后一个发言者。
 - 回复默认不引用；用户主动引用、发送媒体时才会引用原消息。
 - 在“必须 @”模式下，直接引用机器人的回复可以继续追问，不必再次 @。
 - 机器人会过滤 Markdown 星号、标题、表格和 emoji，输出适合 QQ 的纯文本。
@@ -275,10 +278,18 @@ NapCat + QQNT
 
 ### 群聊 @ 模式切换
 
-- [群聊免艾特.cmd](群聊免艾特.cmd)：所有群消息都会回复。
+- [群聊免艾特.cmd](群聊免艾特.cmd)：不强制 @，但由智能判断决定是否加入对话。
 - [群聊必须艾特.cmd](群聊必须艾特.cmd)：只有 @ 机器人或引用机器人回复时才响应。
 
 两个脚本都会直接修改 `.env` 并重启 Python 机器人，不会重启 NapCat。
+
+智能参与参数：
+
+```dotenv
+GROUP_SMART_PARTICIPATION=true
+GROUP_PARTICIPATION_MODEL=qwen3.8-flash
+GROUP_MIN_REPLY_CONFIDENCE=0.65
+```
 
 ## 安装
 
@@ -346,6 +357,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 | `REFLECTION_INTERVAL_SECONDS` | 1800 | 反思间隔 |
 | `ENABLE_GROUP` | false | 是否启用群聊 |
 | `GROUP_REQUIRE_MENTION` | true | 群聊是否必须 @ |
+| `GROUP_SMART_PARTICIPATION` | true | 免 @ 时智能判断是否插话 |
 | `GROUP_ALLOWLIST` | 空 | 允许响应的群号 |
 | `PRIVATE_ALLOWLIST` | 空 | 允许私聊的 QQ 号 |
 | `QUOTE_REPLIES` | true | 是否按需引用原消息 |

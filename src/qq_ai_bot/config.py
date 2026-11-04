@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     group_allowlist: str = ""
     group_require_mention: bool = True
     group_trigger_prefixes: str = "/ai,/问"
+    group_smart_participation: bool = True
+    group_participation_model: str = "qwen3.8-flash"
+    group_min_reply_confidence: float = 0.65
     quote_replies: bool = True
     group_quote_counts_as_mention: bool = True
 

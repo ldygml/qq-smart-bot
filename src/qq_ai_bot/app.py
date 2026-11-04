@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
@@ -26,6 +26,12 @@ from .files import (
     ParsedDocument,
     split_document_text,
     summarize_documents,
+)
+from .group_policy import (
+    GroupMessage,
+    GroupReplyDecider,
+    LLMGroupReplyDecider,
+    obvious_ignore,
 )
 from .images import ImageLoader, ImageLoaderProtocol, ImageLoadError
 from .llm import ChatClient, CompatibleChatClient, LLMError
@@ -130,6 +136,7 @@ def create_app(
     web_reader: WebArticleReader | None = None,
     embedding_client: EmbeddingClient | None = None,
     vector_store: VectorMemoryStore | None = None,
+    group_reply_decider: GroupReplyDecider | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -194,6 +201,11 @@ def create_app(
         timeout_seconds=config.web_reader_timeout_seconds,
         trust_env=config.llm_trust_env,
     )
+    group_decider = group_reply_decider or LLMGroupReplyDecider(
+        llm,
+        model=config.group_participation_model,
+        min_confidence=config.group_min_reply_confidence,
+    )
 
     limiter = SlidingWindowRateLimiter(config.rate_limit_per_minute, 60.0)
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
@@ -201,6 +213,7 @@ def create_app(
     background_tasks: set[asyncio.Task[Any]] = set()
     seen_message_ids: OrderedDict[str, None] = OrderedDict()
     reflection_lock = asyncio.Lock()
+    group_histories: dict[int, deque[GroupMessage]] = {}
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -269,6 +282,7 @@ def create_app(
             "reflection_model": config.reflection_model,
             "group_enabled": config.enable_group,
             "group_require_mention": config.group_require_mention,
+            "group_smart_participation": config.group_smart_participation,
             "quote_replies": config.quote_replies,
             "group_quote_counts_as_mention": config.group_quote_counts_as_mention,
             "history_messages": config.history_messages,
@@ -576,6 +590,19 @@ def create_app(
         if should_quote:
             target = replace(target, message_id=event.message_id)
         if target.message_type == "group":
+            group_id = target.group_id
+            assert group_id is not None
+            group_history = group_histories.setdefault(
+                group_id,
+                deque(maxlen=24),
+            )
+            group_history.append(
+                GroupMessage(
+                    role="user",
+                    sender=display_name,
+                    content=text,
+                )
+            )
             prefix_triggered = any(
                 text.lower().startswith(prefix.lower())
                 for prefix in config.trigger_prefixes
@@ -590,13 +617,33 @@ def create_app(
                     content.reply_id,
                     event.self_id,
                 )
+            addressed_by_name = config.bot_name in text
+            directly_addressed = (
+                content.mentioned
+                or quoted_bot
+                or prefix_triggered
+                or addressed_by_name
+                or text.startswith("/")
+            )
             if (
                 config.group_require_mention
-                and not content.mentioned
-                and not prefix_triggered
-                and not quoted_bot
+                and not directly_addressed
             ):
                 return
+            if (
+                not config.group_require_mention
+                and config.group_smart_participation
+                and not directly_addressed
+            ):
+                if obvious_ignore(text):
+                    return
+                should_join = await group_decider.should_reply(
+                    history=list(group_history)[:-1],
+                    current_sender=display_name,
+                    current_text=text,
+                )
+                if not should_join:
+                    return
             text = strip_trigger_prefix(text, config.trigger_prefixes)
 
         if not text and not image_sources and not file_sources and not audio_sources:
@@ -1579,6 +1626,17 @@ def create_app(
     async def _safe_send(target: ReplyTarget, text: str) -> bool:
         try:
             await sender.send_text(target, text)
+            if target.message_type == "group" and target.group_id is not None:
+                group_histories.setdefault(
+                    target.group_id,
+                    deque(maxlen=24),
+                ).append(
+                    GroupMessage(
+                        role="assistant",
+                        sender=config.bot_name,
+                        content=text,
+                    )
+                )
             return True
         except OneBotError as exc:
             logger.warning("Failed to send a QQ message: %s", exc)
