@@ -65,8 +65,8 @@ class Settings(BaseSettings):
     profile_update_after_messages: int = 5
     reflection_enabled: bool = False
     reflection_model: str = "qwen-plus"
-    reflection_interval_seconds: float = 1800.0
-    reflection_min_new_memories: int = 5
+    reflection_interval_seconds: float = 1200.0
+    reflection_min_new_memories: int = 1
 
     bot_name: str = "给她爱"
     persona_prompt_path: Path = Path("prompts/gexiai.md")

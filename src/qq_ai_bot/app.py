@@ -288,6 +288,8 @@ def create_app(
             "profile_learning_enabled": config.profile_learning_enabled,
             "reflection_enabled": config.reflection_enabled,
             "reflection_model": config.reflection_model,
+            "reflection_interval_seconds": config.reflection_interval_seconds,
+            "reflection_min_new_memories": config.reflection_min_new_memories,
             "group_enabled": config.enable_group,
             "group_require_mention": config.group_require_mention,
             "group_smart_participation": config.group_smart_participation,
