@@ -58,7 +58,7 @@ async function loadInstances() {
       <div class="item-head"><b>${esc(item.name)}</b><span class="status ${item.status === "online" ? "online" : ""}"><i></i>${esc(item.status)}</span></div>
       <div class="item-meta">127.0.0.1:${item.port} · ${esc(item.provider_name || "未知供应商")}<br>${esc(item.onebot_api_base)}</div>
       <div class="item-actions">
-        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><a href="${esc(item.dashboard_url)}" target="_blank">打开实例后台</a>` : `<button data-start="${item.id}">启动</button>`}
+        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><a href="${esc(item.dashboard_url)}" target="_blank">打开实例后台</a>` : `<button data-start="${item.id}">启动</button>`}
         <button data-edit-instance="${item.id}">编辑</button><button data-delete-instance="${item.id}">删除</button>
       </div>
     </article>`).join("") : `<div class="empty">还没有机器人实例</div>`;
@@ -69,6 +69,7 @@ function bindInstanceActions() {
   document.querySelectorAll("[data-start]").forEach((b) => b.onclick = () => instanceAction(b.dataset.start, "start"));
   document.querySelectorAll("[data-stop]").forEach((b) => b.onclick = () => instanceAction(b.dataset.stop, "stop"));
   document.querySelectorAll("[data-restart]").forEach((b) => b.onclick = () => instanceAction(b.dataset.restart, "restart"));
+  document.querySelectorAll("[data-memory]").forEach((b) => b.onclick = () => openMemory(Number(b.dataset.memory)));
   document.querySelectorAll("[data-edit-instance]").forEach((b) => b.onclick = () => editInstance(Number(b.dataset.editInstance)));
   document.querySelectorAll("[data-delete-instance]").forEach((b) => b.onclick = () => deleteInstance(Number(b.dataset.deleteInstance)));
 }
@@ -174,6 +175,80 @@ document.querySelector("#import-current").addEventListener("click", async () => 
     await api("/api/import-current", {method:"POST"});
     await Promise.all([loadProviders(), loadInstances()]);
   } catch (error) { alert(error.message); }
+});
+
+async function openMemory(instanceId) {
+  const select = document.querySelector("#memory-instance");
+  select.innerHTML = instances.map((item) => `<option value="${item.id}">${esc(item.name)} · :${item.port}</option>`).join("");
+  select.value = String(instanceId);
+  document.querySelector("#memory-person").innerHTML = `<option>加载中…</option>`;
+  document.querySelector("#memory-list").innerHTML = "";
+  document.querySelector("#memory-error").textContent = "";
+  openPanel("memory-panel");
+  await loadMemoryPeople(instanceId);
+}
+
+async function loadMemoryPeople(instanceId) {
+  const personSelect = document.querySelector("#memory-person");
+  const error = document.querySelector("#memory-error");
+  error.textContent = "";
+  try {
+    const data = await api(`/api/instances/${instanceId}/people`);
+    if (!data.people.length) {
+      personSelect.innerHTML = `<option value="">暂无联系人</option>`;
+      document.querySelector("#memory-list").innerHTML = `<div class="empty">这个实例还没有联系人记忆。</div>`;
+      return;
+    }
+    personSelect.innerHTML = data.people.map((item) => `<option value="${item.user_id}">${esc(item.display_name)} · QQ ${item.user_id}</option>`).join("");
+    await loadMemoryPerson(instanceId, Number(data.people[0].user_id));
+  } catch (err) {
+    error.textContent = err.message;
+  }
+}
+
+async function loadMemoryPerson(instanceId, personId) {
+  const list = document.querySelector("#memory-list");
+  const error = document.querySelector("#memory-error");
+  error.textContent = "";
+  try {
+    const data = await api(`/api/instances/${instanceId}/people/${personId}`);
+    if (!data.memories.length) {
+      list.innerHTML = `<div class="empty">这个联系人没有长期记忆。</div>`;
+      return;
+    }
+    list.innerHTML = data.memories.map((item) => `
+      <article class="memory-row">
+        <div><span class="tag">${esc(item.visibility)}</span><p>${esc(item.content)}</p></div>
+        <button data-delete-memory="${item.id}" data-person="${personId}" data-instance="${instanceId}">删除</button>
+      </article>`).join("");
+    document.querySelectorAll("[data-delete-memory]").forEach((button) => {
+      button.onclick = () => deleteMemory(
+        Number(button.dataset.instance),
+        Number(button.dataset.person),
+        Number(button.dataset.deleteMemory)
+      );
+    });
+  } catch (err) {
+    error.textContent = err.message;
+  }
+}
+
+async function deleteMemory(instanceId, personId, memoryId) {
+  if (!confirm("删除这条长期记忆？删除后模型不会再使用它。")) return;
+  try {
+    await api(`/api/instances/${instanceId}/people/${personId}/memories/${memoryId}`, {method:"DELETE"});
+    await loadMemoryPerson(instanceId, personId);
+  } catch (error) {
+    document.querySelector("#memory-error").textContent = error.message;
+  }
+}
+
+document.querySelector("#memory-instance").addEventListener("change", async (event) => {
+  if (event.target.value) await loadMemoryPeople(Number(event.target.value));
+});
+document.querySelector("#memory-person").addEventListener("change", async (event) => {
+  const instanceId = Number(document.querySelector("#memory-instance").value);
+  if (instanceId && event.target.value) await loadMemoryPerson(instanceId, Number(event.target.value));
 });
 
 async function init() {

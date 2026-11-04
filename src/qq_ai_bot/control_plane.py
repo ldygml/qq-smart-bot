@@ -909,6 +909,81 @@ async def import_current(request: Request) -> dict[str, Any]:
     return {"ok": True, "instance": instance}
 
 
+async def _instance_admin_json(
+    instance_id: int,
+    user_id: int,
+    path: str,
+    *,
+    method: str = "GET",
+) -> Any:
+    instance = store.instance(instance_id, user_id)
+    if not instance:
+        raise HTTPException(status_code=404, detail="instance not found")
+    url = f"http://127.0.0.1:{instance['port']}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+            response = await client.request(method, url)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Instance service is not reachable",
+        ) from exc
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Instance service returned invalid JSON",
+        ) from exc
+    if response.is_error:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=data.get("detail") if isinstance(data, dict) else data,
+        )
+    return data
+
+
+@app.get("/api/instances/{instance_id}/people")
+async def instance_people(instance_id: int, request: Request) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/people",
+    )
+
+
+@app.get("/api/instances/{instance_id}/people/{user_id}")
+async def instance_person(
+    instance_id: int,
+    user_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/people/{user_id}",
+    )
+
+
+@app.delete("/api/instances/{instance_id}/people/{user_id}/memories/{memory_id}")
+async def instance_delete_memory(
+    instance_id: int,
+    user_id: int,
+    memory_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/people/{user_id}/memories/{memory_id}",
+        method="DELETE",
+    )
+
+
 @app.post("/api/instances")
 async def save_instance(
     payload: InstancePayload,

@@ -58,6 +58,14 @@
       </form>
     </section>
 
+    <section id="memory-panel" class="form-panel" hidden>
+      <div class="panel-head"><div><p class="eyebrow">MEMORY CONTROL</p><h2>记忆维护</h2></div><button class="close" data-close="memory-panel">×</button></div>
+      <label>机器人实例<select id="memory-instance"></select></label>
+      <label>联系人<select id="memory-person"></select></label>
+      <div id="memory-list" class="memory-list"></div>
+      <p id="memory-error" class="error"></p>
+    </section>
+
     <section class="notice"><b>QQ 绑定方式</b><span>实例启动后进入对应 NapCat WebUI 扫码登录。本站不提供 QQ 密码输入框，也不会处理你的 QQ 密码。</span></section>
   </main>
   <script src="/portal/control.js"></script>

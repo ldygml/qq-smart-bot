@@ -376,6 +376,17 @@ def create_app(
             }
         )
 
+    @app.delete("/api/admin/people/{user_id}/memories/{memory_id}")
+    async def admin_delete_memory(
+        user_id: int,
+        memory_id: int,
+    ) -> JSONResponse:
+        removed = shared_memory.delete_memory(user_id, memory_id)
+        return JSONResponse(
+            {"ok": removed},
+            status_code=200 if removed else 404,
+        )
+
     @app.get("/api/admin/growth")
     async def admin_growth() -> dict[str, Any]:
         return {

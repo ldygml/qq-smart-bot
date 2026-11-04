@@ -1217,6 +1217,13 @@ async def test_admin_page_and_api(tmp_path) -> None:
         style_profile="直接、简短",
         relationship_note="测试朋友",
     )
+    memory_id = shared.add_memory(
+        subject_user_id=123,
+        subject_name="test-user",
+        content="这条记忆应该可以删除",
+        visibility="shareable",
+        source_conversation="private:123",
+    )
     app = create_app(
         settings=make_settings(tmp_path, admin_web_enabled=True),
         chat_client=FakeChatClient(),
@@ -1235,10 +1242,15 @@ async def test_admin_page_and_api(tmp_path) -> None:
         page = await client.get("/admin")
         people = await client.get("/api/admin/people")
         detail = await client.get("/api/admin/people/123")
+        deleted = await client.delete(
+            f"/api/admin/people/123/memories/{memory_id}"
+        )
     assert page.status_code == 200
     assert "给她爱控制台" in page.text
     assert people.json()["people"][0]["display_name"] == "test-user"
     assert detail.json()["person"]["style_profile"] == "直接、简短"
+    assert deleted.status_code == 200
+    assert shared.list_memories(123) == []
 
 
 @pytest.mark.asyncio
