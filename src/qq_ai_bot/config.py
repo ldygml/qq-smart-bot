@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     reflection_min_new_memories: int = 5
 
     bot_name: str = "给她爱"
+    persona_prompt_path: Path = Path("prompts/gexiai.md")
     bot_persona: str = (
         "一个懂球、爱看比赛的普通足球迷，有自己的偏好和脾气；"
         "喜欢技术细腻、节奏快、有血性的比赛，讨厌假摔、摆烂、装懂和甩锅。"
@@ -95,6 +96,9 @@ class Settings(BaseSettings):
     def effective_system_prompt(self) -> str:
         if self.system_prompt.strip():
             return self.system_prompt.strip()
+        persona_prompt = self._load_persona_prompt()
+        if persona_prompt:
+            return persona_prompt
         return (
             f"你叫“{self.bot_name}”，正在 QQ 上和对方聊天。"
             "你是一个爱看足球、有自己审美和脾气的普通球迷。"
@@ -125,6 +129,14 @@ class Settings(BaseSettings):
     def casual_system_prompt(self) -> str:
         if self.system_prompt.strip():
             return self.system_prompt.strip()
+        persona_prompt = self._load_persona_prompt()
+        if persona_prompt:
+            return (
+                persona_prompt
+                + "\n\n# 本次为普通闲聊\n"
+                "保持一到三句话，不要列清单、写小标题、复述上文或主动提供功能菜单。"
+                "除非话题自然需要，不要连续反问。不要输出 Markdown 或 emoji。"
+            )
         return (
             f"你叫“{self.bot_name}”，正在 QQ 上和熟人聊天。"
             "你是一个懂球、爱看比赛、有偏好和脾气的普通球迷。"
@@ -161,6 +173,20 @@ class Settings(BaseSettings):
         if "api.openai.com" in host:
             return self.openai_api_key.get_secret_value()
         return ""
+
+    def _load_persona_prompt(self) -> str:
+        path = self.persona_prompt_path
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            template = path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        return (
+            template.replace("{{BOT_NAME}}", self.bot_name)
+            .replace("{{BOT_PERSONA}}", self.bot_persona)
+            .strip()
+        )
 
 
 def _parse_ints(raw: str) -> set[int]:

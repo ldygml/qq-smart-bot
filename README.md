@@ -295,6 +295,7 @@ REMINDER_POLL_SECONDS=15
 | 配置 | 默认值 | 作用 |
 |---|---|---|
 | `BOT_NAME` | 给她爱 | 机器人身份名 |
+| `PERSONA_PROMPT_PATH` | prompts/gexiai.md | 完整人格提示词文件 |
 | `BOT_PERSONA` | 足球迷、嘴毒但不脏 | 身份、偏好和说话风格 |
 | `CASUAL_MODEL` | qwen3.8-flash | 普通闲聊使用的轻量模型 |
 | `LLM_TRUST_ENV` | false | 是否让模型请求使用系统代理 |
