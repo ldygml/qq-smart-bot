@@ -140,6 +140,20 @@ class SearchFailureChat(FeatureChat):
         return "不应继续生成"
 
 
+class CodeFallbackChat(FeatureChat):
+    def __init__(self) -> None:
+        self.models: list[str | None] = []
+
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        self.models.append(model)
+        if model == "slow-model":
+            raise RuntimeError("timeout")
+        return (
+            '{"project_name":"fallback_demo","summary":"备用模型生成",'
+            '"files":[{"path":"main.py","content":"print(\\"ok\\")\\n"}]}'
+        )
+
+
 @pytest.mark.parametrize(
     ("text", "command"),
     [
@@ -379,6 +393,20 @@ async def test_code_generation_repairs_python_syntax_error(tmp_path) -> None:
         output_dir=tmp_path,
     )
     assert "def ok()" in artifact.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_code_generation_falls_back_after_model_timeout(tmp_path) -> None:
+    client = CodeFallbackChat()
+    artifact = await generate_code(
+        client,
+        model="slow-model",
+        fallback_model="fast-model",
+        prompt="写一个 Python 程序",
+        output_dir=tmp_path,
+    )
+    assert client.models == ["slow-model", "fast-model"]
+    assert 'print("ok")' in artifact.path.read_text(encoding="utf-8")
 
 
 def test_sticker_management_and_disabled_filter(tmp_path) -> None:

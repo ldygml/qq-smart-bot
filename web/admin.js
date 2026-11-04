@@ -86,6 +86,7 @@ async function loadOverview() {
   const rows = [
     ["任务模型", data.models.chat],
     ["闲聊模型", data.models.casual],
+    ["代码模型", data.models.code],
     ["图片模型", data.models.vision],
     ["语音模型", data.models.audio],
     ["向量模型", data.models.embedding],

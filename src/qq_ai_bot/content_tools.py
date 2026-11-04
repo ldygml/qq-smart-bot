@@ -447,15 +447,58 @@ async def generate_file(
     )
 
 
+async def _code_chat_with_fallback(
+    chat_client: ChatClient,
+    *,
+    messages: list[dict[str, Any]],
+    model: str,
+    fallback_model: str | None,
+    extra_payload: dict[str, Any],
+) -> str:
+    try:
+        return await chat_client.chat(
+            messages,
+            model=model,
+            extra_payload=extra_payload,
+        )
+    except Exception as first_error:
+        fallback = (fallback_model or "").strip()
+        if not fallback or fallback == model:
+            raise ContentGenerationError(
+                "代码模型请求失败或超时。已停止发送不完整文件，请稍后重试。"
+            ) from first_error
+        fallback_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "上一个模型请求超时。请使用备用模型快速生成完整文件，"
+                    "优先保证代码可运行和 JSON 结构完整。"
+                ),
+            },
+        ]
+        try:
+            return await chat_client.chat(
+                fallback_messages,
+                model=fallback,
+                extra_payload=extra_payload,
+            )
+        except Exception as second_error:
+            raise ContentGenerationError(
+                "代码主模型和备用模型都未能完成请求。"
+                "请稍后重试或降低多文件规模。"
+            ) from second_error
+
+
 async def generate_code(
     chat_client: ChatClient,
     *,
     model: str,
+    fallback_model: str | None = None,
     prompt: str,
     output_dir: Path,
 ) -> GeneratedArtifact:
-    reply = await chat_client.chat(
-        [
+    request_messages = [
             {
                 "role": "system",
                 "content": (
@@ -475,8 +518,12 @@ async def generate_code(
                     f"代码需求：{prompt}"
                 ),
             },
-        ],
+        ]
+    reply = await _code_chat_with_fallback(
+        chat_client,
+        messages=request_messages,
         model=model,
+        fallback_model=fallback_model,
         extra_payload={
             "reasoning_effort": "none",
             "response_format": {"type": "json_object"},
@@ -491,8 +538,7 @@ async def generate_code(
         raise ContentGenerationError("模型返回的文件路径或代码内容无效。")
     syntax_errors = _code_syntax_errors(files)
     if syntax_errors:
-        repair_reply = await chat_client.chat(
-            [
+        repair_messages = [
                 {
                     "role": "system",
                     "content": (
@@ -518,8 +564,12 @@ async def generate_code(
                         + "\n\n返回与之前相同的 files JSON 结构，并修复全部错误。"
                     ),
                 },
-            ],
+            ]
+        repair_reply = await _code_chat_with_fallback(
+            chat_client,
+            messages=repair_messages,
             model=model,
+            fallback_model=fallback_model,
             extra_payload={
                 "reasoning_effort": "none",
                 "response_format": {"type": "json_object"},

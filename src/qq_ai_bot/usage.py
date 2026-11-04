@@ -232,6 +232,8 @@ def _operation_for(messages: Sequence[dict[str, Any]]) -> str:
         return "profile"
     if "多条记忆" in text:
         return "reflection"
+    if "代码文件生成器" in text or "代码修复器" in text:
+        return "code_generation"
     if "文档" in text or "分段摘要" in text:
         return "document"
     if "ocr" in lowered or "转写" in text:

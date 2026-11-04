@@ -367,6 +367,8 @@ def create_app(
             "ok": True,
             "model": config.llm_model,
             "casual_model": config.casual_model,
+            "code_model": config.code_model,
+            "code_fallback_model": config.code_fallback_model,
             "web_search_enabled": config.web_search_enabled,
             "web_reader_enabled": config.web_reader_enabled,
             "vector_memory_enabled": config.vector_memory_enabled,
@@ -432,6 +434,7 @@ def create_app(
             "models": {
                 "chat": config.llm_model,
                 "casual": config.casual_model,
+                "code": config.code_model,
                 "vision": config.vision_model,
                 "audio": config.audio_model,
                 "embedding": config.embedding_model,
@@ -993,7 +996,8 @@ def create_app(
             elif kind == "code":
                 artifact = await generate_code(
                     llm,
-                    model=config.llm_model,
+                    model=config.code_model,
+                    fallback_model=config.code_fallback_model,
                     prompt=prompt,
                     output_dir=_generated_media_dir(),
                 )
@@ -2462,7 +2466,8 @@ def create_app(
             try:
                 artifact = await generate_code(
                     llm,
-                    model=config.llm_model,
+                    model=config.code_model,
+                    fallback_model=config.code_fallback_model,
                     prompt=argument,
                     output_dir=_generated_media_dir(),
                 )

@@ -737,6 +737,8 @@ todo_web.zip
 |---|---|---|
 | 任务、总结、计划和搜索 | `qwen-plus` | `LLM_MODEL` |
 | 普通闲聊 | `qwen3.8-flash` | `CASUAL_MODEL` |
+| 代码文件生成 | `qwen3.8-flash` | `CODE_MODEL` |
+| 代码生成备用模型 | `qwen-plus` | `CODE_FALLBACK_MODEL` |
 | 图片理解 | `qwen3-vl-plus` | `VISION_MODEL` |
 | 扫描件 OCR | `qwen3-vl-plus` | `VISION_MODEL` |
 | 语音识别 | `qwen3.8-omni-flash` | `AUDIO_MODEL` |
@@ -772,6 +774,8 @@ todo_web.zip
 | `LLM_API_KEY` | 空 | 主模型 Key |
 | `LLM_MODEL` | `qwen-plus` | 任务模型 |
 | `CASUAL_MODEL` | `qwen3.8-flash` | 闲聊模型 |
+| `CODE_MODEL` | `qwen3.8-flash` | 代码生成优先模型 |
+| `CODE_FALLBACK_MODEL` | `qwen-plus` | 代码模型失败后的备用模型 |
 | `LLM_TIMEOUT_SECONDS` | `90` | 模型请求超时 |
 | `LLM_TRUST_ENV` | `false` | 是否让模型请求读取系统代理 |
 | `WEB_SEARCH_ENABLED` | `true` | 允许联网搜索 |
@@ -958,6 +962,7 @@ powershell -ExecutionPolicy Bypass -File .\control.ps1
 - 检查模型 Key、余额和超时。
 - 查看实例后台的调用错误记录。
 - 代码文件语法检查失败时不会发送坏文件，可补充更明确的需求后重试。
+- 代码主模型超时后会自动尝试备用模型；如果两个模型都失败，才会返回错误。
 
 ### 文件名看起来不正确
 

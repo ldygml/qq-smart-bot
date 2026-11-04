@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_model: str = "qwen-plus"
     casual_model: str = "qwen3.8-flash"
+    code_model: str = "qwen3.8-flash"
+    code_fallback_model: str = "qwen-plus"
     llm_api_key: SecretStr = SecretStr("")
     dashscope_api_key: SecretStr = SecretStr("")
     deepseek_api_key: SecretStr = SecretStr("")
