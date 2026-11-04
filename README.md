@@ -220,6 +220,38 @@ http://127.0.0.1:8080/admin
 
 网站只监听本机 `127.0.0.1`，不要直接暴露到公网。
 
+### 登录式一站式控制台
+
+完整控制台运行在独立的本机服务：
+
+```text
+http://127.0.0.1:8090/
+```
+
+双击 [启动控制台.cmd](启动控制台.cmd) 启动并打开浏览器。
+
+首次访问会要求创建网站管理员账号。这个账号与 QQ 无关，QQ 密码不会进入网站或日志。
+登录后自动进入控制台，可以：
+
+- 新增和编辑 OpenAI 兼容 API 供应商
+- 加密保存每个供应商的 API Key
+- 选择千问、DeepSeek、OpenAI、OpenRouter、Ollama 或自定义接口
+- 创建和管理多个本地机器人实例
+- 配置实例端口、OneBot API、Token、供应商和数据库路径
+- 启动、停止、重启机器人
+- 打开实例自己的管理页面
+
+API Key 和 OneBot Token 使用本地主密钥加密后写入 `data/control.db`。主密钥保存在
+`.runtime/control-master.key`，不会提交 Git。保存后的 Key 只显示“已配置”，不会再
+回传完整明文。
+
+QQ 登录仍然通过 NapCat 二维码完成。控制台不提供 QQ 密码输入框。
+
+```dotenv
+CONTROL_HOST=127.0.0.1
+CONTROL_PORT=8090
+```
+
 ## 架构
 
 ```text
@@ -346,6 +378,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 | `TTS_MODEL` | qwen-audio-3.1-tts-flash | 语音合成模型 |
 | `MEDIA_SEND_ENABLED` | true | 允许管理员发送媒体 |
 | `ADMIN_WEB_ENABLED` | true | 启用本地管理网站 |
+| `CONTROL_PORT` | 8090 | 登录式控制台端口 |
 | `VISION_MODEL` | qwen3-vl-plus | 图片理解模型 |
 | `AUDIO_MODEL` | qwen3.8-omni-flash | 语音识别模型 |
 | `HISTORY_MESSAGES` | 40 | 短期上下文消息数 |
@@ -411,8 +444,10 @@ qq-smart-bot/
 ├─ web/                  本地管理网站
 ├─ start.ps1             总启动脚本
 ├─ stop.ps1              关闭脚本
+├─ control.ps1           登录式控制台启动脚本
 ├─ 启动机器人.cmd
 ├─ 停止机器人.cmd
+├─ 启动控制台.cmd
 ├─ 群聊免艾特.cmd
 ├─ 群聊必须艾特.cmd
 └─ data/                 本地数据库（不提交）

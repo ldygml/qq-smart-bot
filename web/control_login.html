@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · 给她爱控制台</title>
+  <link rel="stylesheet" href="/portal/control.css">
+</head>
+<body class="auth-page">
+  <main class="auth-shell">
+    <section class="auth-brand">
+      <div class="logo">G</div>
+      <p class="eyebrow">LOCAL CONTROL PLANE</p>
+      <h1>一个账号，<br>管理你的机器人。</h1>
+      <p>登录网站账号后连接本地机器人实例。网站从不要求 QQ 密码；QQ 绑定仍由 NapCat 扫码完成。</p>
+      <div class="security-note"><span>×</span> 无 QQ 密码输入框</div>
+    </section>
+    <section class="auth-card">
+      <p id="auth-mode" class="eyebrow">SIGN IN</p>
+      <h2 id="auth-title">登录控制台</h2>
+      <p id="auth-copy" class="muted">使用本地网站账号登录。</p>
+      <form id="auth-form">
+        <label>用户名<input id="username" autocomplete="username" required minlength="3"></label>
+        <label>网站密码<input id="password" type="password" autocomplete="current-password" required minlength="8"></label>
+        <button class="primary" type="submit" id="auth-submit">登录</button>
+      </form>
+      <p id="auth-error" class="error"></p>
+      <p class="footnote">密码使用 PBKDF2 哈希保存，API Key 使用本地主密钥加密。</p>
+    </section>
+  </main>
+  <script>
+    const setupMode = new URLSearchParams(location.search).get("setup") === "1";
+    let isSetup = setupMode;
+
+    async function detectMode() {
+      const response = await fetch("/api/auth/status");
+      const data = await response.json();
+      isSetup = data.setup_required;
+      if (isSetup) {
+        document.querySelector("#auth-mode").textContent = "FIRST RUN";
+        document.querySelector("#auth-title").textContent = "创建管理员账号";
+        document.querySelector("#auth-copy").textContent = "这是本机控制台的第一个网站账号，不是 QQ 密码。";
+        document.querySelector("#auth-submit").textContent = "创建并进入";
+      }
+    }
+
+    document.querySelector("#auth-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const error = document.querySelector("#auth-error");
+      error.textContent = "";
+      const payload = {
+        username: document.querySelector("#username").value.trim(),
+        password: document.querySelector("#password").value
+      };
+      try {
+        const response = await fetch(isSetup ? "/api/auth/setup" : "/api/auth/login", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "登录失败");
+        location.href = "/portal";
+      } catch (err) {
+        error.textContent = err.message;
+      }
+    });
+    detectMode().catch(() => {});
+  </script>
+</body>
+</html>

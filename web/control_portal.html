@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>给她爱 · 机器人控制台</title>
+  <link rel="stylesheet" href="/portal/control.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/portal"><span class="logo small">G</span><span><b>给她爱控制台</b><small>LOCAL CONTROL PLANE</small></span></a>
+    <div class="top-actions"><span id="user-label"></span><a href="/admin" target="_blank">实例管理页</a><button id="logout">退出</button></div>
+  </header>
+
+  <main class="portal">
+    <section class="hero-panel">
+      <div><p class="eyebrow">ONE-STOP CONTROL</p><h1>机器人<br>控制中心</h1><p>在这里管理供应商 API、本地实例、启动状态和后台页面。QQ 密码永远不会进入本站。</p></div>
+      <div class="hero-stats"><article><small>API 供应商</small><strong id="provider-count">0</strong></article><article><small>机器人实例</small><strong id="instance-count">0</strong></article><article><small>在线实例</small><strong id="online-count">0</strong></article></div>
+    </section>
+
+    <section class="panel-grid">
+      <article class="panel">
+        <div class="panel-head"><div><p class="eyebrow">PROVIDERS</p><h2>API 供应商</h2></div><button class="text-button" data-open="provider-form">新增</button></div>
+        <div id="providers" class="stack"></div>
+      </article>
+      <article class="panel">
+        <div class="panel-head"><div><p class="eyebrow">INSTANCES</p><h2>机器人实例</h2></div><button class="text-button" data-open="instance-form">新增</button></div>
+        <div id="instances" class="stack"></div>
+      </article>
+    </section>
+
+    <section id="provider-form" class="form-panel" hidden>
+      <div class="panel-head"><div><p class="eyebrow">NEW / EDIT PROVIDER</p><h2>配置 API</h2></div><button class="close" data-close="provider-form">×</button></div>
+      <form id="provider-editor">
+        <input type="hidden" id="provider-id">
+        <label>名称<input id="provider-name" placeholder="我的 qwen-plus" required></label>
+        <label>供应商类型<select id="provider-type"><option value="qwen">千问 / 百炼</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="openrouter">OpenRouter</option><option value="ollama">Ollama</option><option value="custom">自定义兼容 API</option></select></label>
+        <label>Base URL<input id="provider-base" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" required></label>
+        <label>模型名称<input id="provider-model" placeholder="qwen-plus" required></label>
+        <label>API Key<input id="provider-key" type="password" placeholder="编辑时留空表示保持原 Key"></label>
+        <button class="primary" type="submit">保存供应商</button>
+        <p id="provider-error" class="error"></p>
+      </form>
+    </section>
+
+    <section id="instance-form" class="form-panel" hidden>
+      <div class="panel-head"><div><p class="eyebrow">NEW / EDIT INSTANCE</p><h2>创建机器人实例</h2></div><button class="close" data-close="instance-form">×</button></div>
+      <form id="instance-editor">
+        <input type="hidden" id="instance-id">
+        <label>实例名称<input id="instance-name" placeholder="我的小号" required></label>
+        <label>本地端口<input id="instance-port" type="number" min="1024" max="65535" value="8081" required></label>
+        <label>NapCat OneBot API<input id="instance-onebot" value="http://127.0.0.1:3000" required></label>
+        <label>OneBot Token<input id="instance-token" type="password" placeholder="编辑时留空表示保持原 Token"></label>
+        <label>API 供应商<select id="instance-provider" required></select></label>
+        <label>数据库路径<input id="instance-db" value="data/instances/bot.db" required></label>
+        <button class="primary" type="submit">保存实例</button>
+        <p id="instance-error" class="error"></p>
+      </form>
+    </section>
+
+    <section class="notice"><b>QQ 绑定方式</b><span>实例启动后进入对应 NapCat WebUI 扫码登录。本站不提供 QQ 密码输入框，也不会处理你的 QQ 密码。</span></section>
+  </main>
+  <script src="/portal/control.js"></script>
+</body>
+</html>
