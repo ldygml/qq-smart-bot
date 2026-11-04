@@ -106,3 +106,35 @@ async def test_control_plane_rejects_missing_csrf(tmp_path, monkeypatch) -> None
             },
         )
     assert response.status_code == 403
+
+
+def test_import_current_config_encrypts_local_secrets(tmp_path, monkeypatch) -> None:
+    store = ControlStore(tmp_path / "control.db")
+    box = SecretBox()
+    monkeypatch.setattr(control_plane, "store", store)
+    monkeypatch.setattr(control_plane, "secrets_box", box)
+    user_id = store.create_user("owner", "secure-password")
+    imported = control_plane._import_current_config(
+        user_id,
+        {
+            "LLM_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "LLM_MODEL": "qwen-plus",
+            "LLM_API_KEY": "local-secret-api-key",
+            "ONEBOT_API_BASE": "http://127.0.0.1:3000",
+            "ONEBOT_TOKEN": "local-onebot-token",
+            "APP_PORT": "8080",
+            "DATABASE_PATH": "data/bot.db",
+        },
+    )
+    assert imported["name"] == "当前机器人"
+    assert imported["port"] == 8080
+    assert imported["provider_name"] == "当前机器人配置"
+    with sqlite3.connect(tmp_path / "control.db") as connection:
+        provider_key = connection.execute(
+            "SELECT api_key_encrypted FROM provider_profiles"
+        ).fetchone()[0]
+        onebot_token = connection.execute(
+            "SELECT onebot_token_encrypted FROM bot_instances"
+        ).fetchone()[0]
+    assert "local-secret-api-key" not in provider_key
+    assert "local-onebot-token" not in onebot_token

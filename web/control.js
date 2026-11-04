@@ -169,6 +169,13 @@ document.querySelector("#logout").addEventListener("click", async () => {
   location.href = "/login";
 });
 
+document.querySelector("#import-current").addEventListener("click", async () => {
+  try {
+    await api("/api/import-current", {method:"POST"});
+    await Promise.all([loadProviders(), loadInstances()]);
+  } catch (error) { alert(error.message); }
+});
+
 async function init() {
   try {
     await loadMe();

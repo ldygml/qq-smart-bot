@@ -258,6 +258,17 @@ class ControlStore:
                 (provider_id, user_id),
             ).fetchone()
 
+    def provider_by_name(self, user_id: int, name: str) -> sqlite3.Row | None:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM provider_profiles
+                WHERE user_id = ? AND name = ?
+                LIMIT 1
+                """,
+                (user_id, name),
+            ).fetchone()
+
     def save_provider(
         self,
         *,
@@ -358,13 +369,25 @@ class ControlStore:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT i.*, p.base_url, p.model, p.api_key_encrypted,
+                SELECT i.*, p.name AS provider_name,
+                       p.base_url, p.model, p.api_key_encrypted,
                        p.provider_type
                 FROM bot_instances i
                 JOIN provider_profiles p ON p.id = i.provider_id
                 WHERE i.id = ? AND i.user_id = ?
                 """,
                 (instance_id, user_id),
+            ).fetchone()
+
+    def instance_by_port(self, port: int, user_id: int) -> sqlite3.Row | None:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM bot_instances
+                WHERE port = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (port, user_id),
             ).fetchone()
 
     def save_instance(
@@ -563,6 +586,59 @@ def _instance_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "dashboard_url": f"http://127.0.0.1:{item['port']}/admin",
         "health_url": f"http://127.0.0.1:{item['port']}/healthz",
     }
+
+
+def _import_current_config(
+    user_id: int,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    base_url = str(values.get("LLM_BASE_URL") or "").strip().rstrip("/")
+    model = str(values.get("LLM_MODEL") or "").strip()
+    api_key = str(values.get("LLM_API_KEY") or "").strip()
+    onebot_base = str(
+        values.get("ONEBOT_API_BASE") or "http://127.0.0.1:3000"
+    ).strip().rstrip("/")
+    onebot_token = str(values.get("ONEBOT_TOKEN") or "").strip()
+    if not base_url or not model:
+        raise ValueError("Current .env is missing LLM_BASE_URL or LLM_MODEL")
+    if not onebot_token:
+        raise ValueError("Current .env is missing ONEBOT_TOKEN")
+
+    provider_name = "当前机器人配置"
+    existing_provider = store.provider_by_name(user_id, provider_name)
+    provider_type = (
+        "qwen"
+        if "dashscope.aliyuncs.com" in base_url
+        else "deepseek"
+        if "deepseek.com" in base_url
+        else "custom"
+    )
+    provider_id = store.save_provider(
+        user_id=user_id,
+        provider_id=int(existing_provider["id"]) if existing_provider else None,
+        name=provider_name,
+        provider_type=provider_type,
+        base_url=base_url,
+        model=model,
+        api_key_encrypted=secrets_box.encrypt(api_key),
+    )
+
+    port = int(str(values.get("APP_PORT") or "8080"))
+    existing_instance = store.instance_by_port(port, user_id)
+    instance_id = store.save_instance(
+        user_id=user_id,
+        instance_id=int(existing_instance["id"]) if existing_instance else None,
+        name="当前机器人",
+        port=port,
+        onebot_api_base=onebot_base,
+        onebot_token_encrypted=secrets_box.encrypt(onebot_token),
+        provider_id=provider_id,
+        database_path=str(values.get("DATABASE_PATH") or "data/bot.db"),
+    )
+    row = store.instance(instance_id, user_id)
+    if row is None:
+        raise ValueError("Imported instance not found")
+    return _instance_public(row)
 
 
 def _start_instance(instance_id: int, user_id: int) -> dict[str, Any]:
@@ -813,6 +889,24 @@ async def instances(request: Request) -> dict[str, Any]:
             for item in store.instances(int(user["id"]))
         ]
     }
+
+
+@app.post("/api/import-current")
+async def import_current(request: Request) -> dict[str, Any]:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    values = dotenv_values(PROJECT_ROOT / ".env")
+    if not values.get("LLM_API_KEY"):
+        values["LLM_API_KEY"] = (
+            os.getenv("DASHSCOPE_API_KEY")
+            or os.getenv("DEEPSEEK_API_KEY")
+            or ""
+        )
+    try:
+        instance = _import_current_config(int(user["id"]), values)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "instance": instance}
 
 
 @app.post("/api/instances")
