@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     memory_model: str = "qwen3.8-flash"
     memory_context_limit: int = 14
     memory_privacy_protection: bool = True
+    profile_learning_enabled: bool = True
+    profile_update_after_messages: int = 5
     reflection_enabled: bool = False
     reflection_model: str = "qwen-plus"
     reflection_interval_seconds: float = 1800.0

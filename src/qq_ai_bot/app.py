@@ -51,6 +51,7 @@ from .security import request_is_authorized
 from .shared_memory import (
     SharedMemoryStore,
     extract_memory_candidates,
+    extract_person_profile,
     reflect_on_memories,
 )
 
@@ -199,6 +200,7 @@ def create_app(
             "shared_memory_enabled": config.shared_memory_enabled,
             "memory_model": config.memory_model,
             "memory_privacy_protection": config.memory_privacy_protection,
+            "profile_learning_enabled": config.profile_learning_enabled,
             "reflection_enabled": config.reflection_enabled,
             "reflection_model": config.reflection_model,
             "group_enabled": config.enable_group,
@@ -826,8 +828,58 @@ def create_app(
                     visibility=memory.visibility,
                     source_conversation=target.conversation_id,
                 )
+            if config.profile_learning_enabled:
+                await _refresh_person_profile(
+                    user_id=event.user_id,
+                    display_name=display_name,
+                )
         except Exception:
             logger.warning("Long-term memory extraction failed", exc_info=True)
+
+    async def _refresh_person_profile(
+        *,
+        user_id: int,
+        display_name: str,
+    ) -> None:
+        state_key = f"profile_episode_cursor:{user_id}"
+        try:
+            cursor = int(shared_memory.get_state(state_key, "0"))
+        except ValueError:
+            cursor = 0
+        samples = shared_memory.episodes_for_speaker(
+            user_id,
+            after_id=cursor,
+            limit=20,
+        )
+        if len(samples) < max(1, config.profile_update_after_messages):
+            return
+        current = shared_memory.get_person(user_id) or {}
+        profile = await extract_person_profile(
+            llm,
+            model=config.memory_model,
+            display_name=display_name,
+            current_profile=str(current.get("style_profile", "")),
+            current_relationship_note=str(
+                current.get("relationship_note", "")
+            ),
+            samples=samples,
+        )
+        if profile.style_profile or profile.relationship_note:
+            shared_memory.update_person_profile(
+                user_id,
+                style_profile=(
+                    profile.style_profile
+                    or str(current.get("style_profile", ""))
+                ),
+                relationship_note=(
+                    profile.relationship_note
+                    or str(current.get("relationship_note", ""))
+                ),
+            )
+        shared_memory.set_state(
+            state_key,
+            str(max(int(item["id"]) for item in samples)),
+        )
 
     def _handle_command(
         event: OneBotEvent,

@@ -58,7 +58,10 @@ class SharedMemoryStore:
                     user_id INTEGER PRIMARY KEY,
                     display_name TEXT NOT NULL,
                     first_seen TEXT NOT NULL,
-                    last_seen TEXT NOT NULL
+                    last_seen TEXT NOT NULL,
+                    style_profile TEXT NOT NULL DEFAULT '',
+                    relationship_note TEXT NOT NULL DEFAULT '',
+                    profile_updated_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS shared_memories (
@@ -119,6 +122,28 @@ class SharedMemoryStore:
                 ON shared_episodes (speaker_user_id, id DESC);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(shared_people)"
+                ).fetchall()
+            }
+            for column, definition in (
+                (
+                    "style_profile",
+                    "TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "relationship_note",
+                    "TEXT NOT NULL DEFAULT ''",
+                ),
+                ("profile_updated_at", "TEXT"),
+            ):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE shared_people "
+                        f"ADD COLUMN {column} {definition}"
+                    )
 
     def record_person(self, user_id: int, display_name: str) -> None:
         name = display_name.strip() or str(user_id)
@@ -209,6 +234,83 @@ class SharedMemoryStore:
                 matches.append((user_id, name))
         return matches
 
+    def get_person(self, user_id: int) -> dict[str, Any] | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT user_id, display_name, first_seen, last_seen,
+                       style_profile, relationship_note, profile_updated_at
+                FROM shared_people
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_people(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT p.user_id, p.display_name, p.first_seen, p.last_seen,
+                       p.style_profile, p.relationship_note,
+                       p.profile_updated_at,
+                       (
+                           SELECT COUNT(*)
+                           FROM shared_episodes e
+                           WHERE e.speaker_user_id = p.user_id
+                       ) AS episode_count
+                FROM shared_people p
+                ORDER BY p.last_seen DESC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_person_profile(
+        self,
+        user_id: int,
+        *,
+        style_profile: str,
+        relationship_note: str,
+    ) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE shared_people
+                SET style_profile = ?, relationship_note = ?,
+                    profile_updated_at = ?
+                WHERE user_id = ?
+                """,
+                (
+                    style_profile.strip()[:1000],
+                    relationship_note.strip()[:1000],
+                    _utc_now(),
+                    user_id,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def episodes_for_speaker(
+        self,
+        user_id: int,
+        *,
+        after_id: int = 0,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, user_content, assistant_content, created_at
+                FROM shared_episodes
+                WHERE speaker_user_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (user_id, after_id, max(1, limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def context_for(
         self,
         *,
@@ -274,6 +376,16 @@ class SharedMemoryStore:
                 "不能告诉其他联系人，也不要复述私密原话。"
             ),
         ]
+        current_person = self.get_person(current_user_id)
+        if current_person:
+            style_profile = str(current_person["style_profile"]).strip()
+            relationship_note = str(
+                current_person["relationship_note"]
+            ).strip()
+            if style_profile:
+                lines.append(f"当前联系人互动画像：{style_profile}")
+            if relationship_note:
+                lines.append(f"当前关系备注：{relationship_note}")
         for row in rows:
             subject_name = str(row["subject_name"])
             if int(row["subject_user_id"]) == current_user_id:
@@ -574,6 +686,12 @@ class MemoryCandidate:
 
 
 @dataclass(frozen=True)
+class PersonProfileCandidate:
+    style_profile: str
+    relationship_note: str
+
+
+@dataclass(frozen=True)
 class ReflectionCandidate:
     content: str
     visibility: str
@@ -591,6 +709,53 @@ class GrowthCandidate:
 class ReflectionResult:
     reflections: list[ReflectionCandidate]
     growth: list[GrowthCandidate]
+
+
+async def extract_person_profile(
+    chat_client: MemoryChatClient,
+    *,
+    model: str,
+    display_name: str,
+    current_profile: str,
+    current_relationship_note: str,
+    samples: list[dict[str, Any]],
+) -> PersonProfileCandidate:
+    sample_lines = [
+        (
+            f"- 用户：{str(item.get('user_content', ''))[:400]}\n"
+            f"  当时回复：{str(item.get('assistant_content', ''))[:300]}"
+        )
+        for item in samples[-12:]
+    ]
+    prompt = (
+        "根据这个联系人的真实聊天样本，总结稳定的互动画像。不要做心理诊断，"
+        "不要推断敏感身份。style_profile 说明对方偏好的回复长度、语气、"
+        "直接程度、是否爱开玩笑和适合的沟通方式；relationship_note 说明"
+        "当前关系更像陌生人、普通朋友、熟人还是工作关系。"
+        "只总结有多次证据支持的稳定倾向，最多各两句话。"
+        "若证据不足，保留已有内容或返回空字符串。\n"
+        '只返回 JSON：{"style_profile":"...","relationship_note":"..."}\n\n'
+        f"联系人：{display_name}\n"
+        f"已有互动画像：{current_profile}\n"
+        f"已有关系备注：{current_relationship_note}\n"
+        "聊天样本：\n"
+        + "\n".join(sample_lines)
+    )
+    reply = await chat_client.chat(
+        [
+            {
+                "role": "system",
+                "content": "严格输出 JSON，不要 Markdown，不要解释。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        model=model,
+        extra_payload={
+            "reasoning_effort": "none",
+            "response_format": {"type": "json_object"},
+        },
+    )
+    return _parse_person_profile(reply)
 
 
 async def extract_memory_candidates(
@@ -814,6 +979,38 @@ def _parse_memory_candidates(reply: str) -> list[MemoryCandidate]:
             continue
         result.append(MemoryCandidate(content.strip(), visibility))
     return result
+
+
+def _parse_person_profile(reply: str) -> PersonProfileCandidate:
+    value = reply.strip()
+    value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s*```$", "", value)
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", value, re.DOTALL)
+        if not match:
+            return PersonProfileCandidate("", "")
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return PersonProfileCandidate("", "")
+    if not isinstance(data, dict):
+        return PersonProfileCandidate("", "")
+    style_profile = data.get("style_profile")
+    relationship_note = data.get("relationship_note")
+    return PersonProfileCandidate(
+        style_profile=(
+            style_profile.strip()[:1000]
+            if isinstance(style_profile, str)
+            else ""
+        ),
+        relationship_note=(
+            relationship_note.strip()[:1000]
+            if isinstance(relationship_note, str)
+            else ""
+        ),
+    )
 
 
 def _parse_reflection_result(reply: str) -> ReflectionResult:

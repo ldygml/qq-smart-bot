@@ -6,6 +6,7 @@ from qq_ai_bot.shared_memory import (
     SharedMemoryStore,
     _parse_memory_candidates,
     detect_common_terms,
+    extract_person_profile,
     extract_memory_candidates,
     reflect_on_memories,
 )
@@ -39,6 +40,14 @@ class ReflectionChat:
 class EmptyReflectionChat:
     async def chat(self, messages, *, model=None, extra_payload=None) -> str:
         return '{"reflections":[],"growth":[]}'
+
+
+class ProfileChat:
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        return (
+            '{"style_profile":"喜欢短句和直接回答，偶尔接梗；'
+            '不喜欢长篇解释。","relationship_note":"熟悉的普通朋友。"}'
+        )
 
 
 def test_shared_context_respects_visibility(tmp_path) -> None:
@@ -141,6 +150,39 @@ def test_cross_conversation_episode_is_visible_to_other_contact(tmp_path) -> Non
     )
     assert "我周末去看利物浦的比赛" in context
     assert "别又看完骂中场" in context
+
+
+@pytest.mark.asyncio
+async def test_person_profile_is_stored_and_used_in_context(tmp_path) -> None:
+    store = SharedMemoryStore(tmp_path / "memory.db")
+    store.record_person(222, "小明")
+    profile = await extract_person_profile(
+        ProfileChat(),
+        model="test-model",
+        display_name="小明",
+        current_profile="",
+        current_relationship_note="",
+        samples=[
+            {
+                "user_content": "行，别废话，直接说",
+                "assistant_content": "好，结论是这个。",
+            }
+        ],
+    )
+    assert store.update_person_profile(
+        222,
+        style_profile=profile.style_profile,
+        relationship_note=profile.relationship_note,
+    )
+    person = store.get_person(222)
+    assert person["style_profile"].startswith("喜欢短句")
+    context = store.context_for(
+        current_user_id=222,
+        current_user_name="小明",
+        query="说重点",
+    )
+    assert "当前联系人互动画像" in context
+    assert "熟悉的普通朋友" in context
 
 
 @pytest.mark.asyncio

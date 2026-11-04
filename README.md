@@ -77,6 +77,19 @@ MEMORY_PRIVACY_PROTECTION=false
 /成长
 ```
 
+### 联系人画像
+
+机器人会为每个联系人保存一份稳定但可更新的互动画像，包括偏好的回复长度、直接程度、
+幽默感、适合的沟通方式和当前关系定位。每个联系人累计至少 5 条新对话后，后台会更新
+一次画像；画像只总结聊天证据，不做心理诊断。
+
+```dotenv
+PROFILE_LEARNING_ENABLED=true
+PROFILE_UPDATE_AFTER_MESSAGES=5
+```
+
+因此同一个人会保持前后一致的语气，不同联系人之间不会套用完全相同的回复模板。
+
 ### 4. 图片与题目理解
 
 - 普通截图自动切换到 `qwen3-vl-plus`。
@@ -269,6 +282,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 | `HISTORY_MESSAGES` | 40 | 短期上下文消息数 |
 | `SHARED_MEMORY_ENABLED` | true | 跨会话长期记忆 |
 | `MEMORY_PRIVACY_PROTECTION` | 可配置 | 私密记忆是否跨联系人隔离 |
+| `PROFILE_LEARNING_ENABLED` | true | 自动学习联系人互动画像 |
+| `PROFILE_UPDATE_AFTER_MESSAGES` | 5 | 每积累多少条对话更新一次画像 |
 | `REFLECTION_ENABLED` | true | 后台关联和成长笔记 |
 | `REFLECTION_INTERVAL_SECONDS` | 1800 | 反思间隔 |
 | `ENABLE_GROUP` | false | 是否启用群聊 |
