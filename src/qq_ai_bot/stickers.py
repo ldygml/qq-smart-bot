@@ -134,6 +134,29 @@ class StickerStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_by_id(self, sticker_id: int) -> StickerSource | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT summary, emoji_id, emoji_package_id, sticker_key
+                FROM sticker_catalog
+                WHERE id = ?
+                """,
+                (sticker_id,),
+            ).fetchone()
+            if not row:
+                return None
+            connection.execute(
+                "UPDATE sticker_catalog SET use_count = use_count + 1 WHERE id = ?",
+                (sticker_id,),
+            )
+        return StickerSource(
+            summary=str(row["summary"]),
+            emoji_id=str(row["emoji_id"]),
+            emoji_package_id=str(row["emoji_package_id"]),
+            key=str(row["sticker_key"]),
+        )
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()

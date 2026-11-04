@@ -69,6 +69,7 @@ from .vector_memory import (
     VectorMemoryStore,
 )
 from .stickers import StickerStore
+from .sticker_policy import LLMStickerChoiceDecider, StickerChoiceDecider
 from .tts import TTSClient, TTSError
 from .web_reader import WebArticleReader, WebReadError
 
@@ -137,6 +138,7 @@ def create_app(
     embedding_client: EmbeddingClient | None = None,
     vector_store: VectorMemoryStore | None = None,
     group_reply_decider: GroupReplyDecider | None = None,
+    sticker_choice_decider: StickerChoiceDecider | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -206,6 +208,11 @@ def create_app(
         model=config.group_participation_model,
         min_confidence=config.group_min_reply_confidence,
     )
+    sticker_decider = sticker_choice_decider or LLMStickerChoiceDecider(
+        llm,
+        model=config.sticker_model,
+        min_confidence=config.sticker_min_confidence,
+    )
 
     limiter = SlidingWindowRateLimiter(config.rate_limit_per_minute, 60.0)
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
@@ -273,6 +280,7 @@ def create_app(
             "tts_enabled": config.tts_enabled,
             "tts_model": config.tts_model,
             "media_send_enabled": config.media_send_enabled,
+            "auto_sticker_enabled": config.auto_sticker_enabled,
             "sticker_count": stickers.count(),
             "shared_memory_enabled": config.shared_memory_enabled,
             "memory_model": config.memory_model,
@@ -609,7 +617,8 @@ def create_app(
         file_sources = content.file_sources[: max(0, config.max_files_per_message)]
         audio_sources = content.audio_sources[:1]
         sticker_summaries = content.sticker_summaries[:3]
-        for sticker in content.sticker_sources[:3]:
+        sticker_sources = content.sticker_sources[:3]
+        for sticker in sticker_sources:
             stickers.record(sticker)
         if sticker_summaries:
             sticker_text = "、".join(dict.fromkeys(sticker_summaries))
@@ -942,6 +951,20 @@ def create_app(
             )
 
         await _send_long_reply(target, reply)
+        if (
+            config.auto_sticker_enabled
+            and stickers.count() > 0
+            and (
+                bool(sticker_sources)
+                or _has_sticker_context(text, reply)
+            )
+        ):
+            await _maybe_send_sticker(
+                target=target,
+                user_text=text,
+                assistant_text=reply,
+                explicit_request=False,
+            )
         await _remember_exchange(
             event=event,
             target=target,
@@ -1389,12 +1412,32 @@ def create_app(
             return True
 
         if command == "/发表情":
-            sticker = stickers.random_sticker(argument)
-            if sticker is None:
+            candidates = stickers.list_recent(limit=50)
+            if argument:
+                candidates = [
+                    item
+                    for item in candidates
+                    if argument.lower() in str(item["summary"]).lower()
+                ]
+            if not candidates:
                 await _safe_send(
                     target,
                     "表情包库里还没有可发送的表情。先让别人发几个表情包给我。",
                 )
+                return True
+            sticker_id = await sticker_decider.choose(
+                history=store.history(
+                    target.conversation_id,
+                    config.history_messages,
+                ),
+                user_text=value,
+                assistant_text="",
+                candidates=candidates,
+                explicit_request=True,
+            )
+            sticker = stickers.get_by_id(sticker_id) if sticker_id else None
+            if sticker is None:
+                await _safe_send(target, "没有找到和当前语气匹配的表情包。")
                 return True
             try:
                 await sender.send_sticker(target, sticker)
@@ -1402,6 +1445,36 @@ def create_app(
                 await _safe_send(target, f"表情包发送失败：{exc}")
             return True
         return False
+
+    async def _maybe_send_sticker(
+        *,
+        target: ReplyTarget,
+        user_text: str,
+        assistant_text: str,
+        explicit_request: bool,
+    ) -> bool:
+        candidates = stickers.list_recent(limit=50)
+        if not candidates:
+            return False
+        choice_id = await sticker_decider.choose(
+            history=store.history(
+                target.conversation_id,
+                config.history_messages,
+            ),
+            user_text=user_text,
+            assistant_text=assistant_text,
+            candidates=candidates,
+            explicit_request=explicit_request,
+        )
+        sticker = stickers.get_by_id(choice_id) if choice_id else None
+        if sticker is None:
+            return False
+        try:
+            await sender.send_sticker(target, sticker)
+            return True
+        except Exception:
+            logger.warning("Failed to send context-selected sticker", exc_info=True)
+            return False
 
     async def _handle_web_request(
         target: ReplyTarget,
@@ -1841,6 +1914,30 @@ def _needs_doc_lookup(text: str) -> bool:
             r"(什么|讲|说|内容|含义|结论|数据|怎么|如何|为什么|哪|找)",
             value,
             re.IGNORECASE,
+        )
+    )
+
+
+def _has_sticker_context(user_text: str, assistant_text: str) -> bool:
+    text = f"{user_text} {assistant_text}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "哈哈",
+            "笑死",
+            "无语",
+            "离谱",
+            "尴尬",
+            "开心",
+            "难过",
+            "生气",
+            "服了",
+            "绝了",
+            "好家伙",
+            "绷不住",
+            "破防",
+            "表情包",
+            "牛",
         )
     )
 

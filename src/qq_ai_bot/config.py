@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     tts_voice: str = "longanhuan_v3.1"
     max_tts_chars: int = 800
     media_send_enabled: bool = True
+    auto_sticker_enabled: bool = True
+    sticker_model: str = "qwen3.8-flash"
+    sticker_min_confidence: float = 0.7
     admin_web_enabled: bool = True
     shared_memory_enabled: bool = False
     memory_model: str = "qwen3.8-flash"

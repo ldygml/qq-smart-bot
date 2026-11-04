@@ -183,6 +183,16 @@ class ReflectionOnlyChat:
         return None
 
 
+class FakeStickerDecider:
+    def __init__(self, sticker_id: int | None) -> None:
+        self.sticker_id = sticker_id
+        self.calls = 0
+
+    async def choose(self, **kwargs) -> int | None:
+        self.calls += 1
+        return self.sticker_id
+
+
 class VerboseThenConciseChatClient(FakeChatClient):
     async def chat(
         self,
@@ -908,6 +918,7 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
         document_loader=FakeDocumentLoader(),
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
         sticker_store=sticker_store,
+        sticker_choice_decider=FakeStickerDecider(1),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -940,6 +951,7 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     assert "表情包" in llm.calls[0][-1]["content"]
     assert sender.sent[0][0].message_id is None
     assert sticker_store.count() == 1
+    assert sender.stickers[0][1].summary == "奶龙"
 
 
 @pytest.mark.asyncio
@@ -1111,6 +1123,7 @@ async def test_media_commands_send_voice_image_file_and_sticker(tmp_path) -> Non
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
         tts_client=FakeTTS(),
         sticker_store=sticker_store,
+        sticker_choice_decider=FakeStickerDecider(1),
     )
     transport = httpx.ASGITransport(app=app)
     commands = [
