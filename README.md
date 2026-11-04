@@ -391,7 +391,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 | `PROFILE_LEARNING_ENABLED` | true | 自动学习联系人互动画像 |
 | `PROFILE_UPDATE_AFTER_MESSAGES` | 5 | 每积累多少条对话更新一次画像 |
 | `REFLECTION_ENABLED` | true | 后台关联和成长笔记 |
-| `REFLECTION_INTERVAL_SECONDS` | 1800 | 反思间隔 |
+| `REFLECTION_INTERVAL_SECONDS` | 1200 | 反思间隔（秒） |
 | `ENABLE_GROUP` | false | 是否启用群聊 |
 | `GROUP_REQUIRE_MENTION` | true | 群聊是否必须 @ |
 | `GROUP_SMART_PARTICIPATION` | true | 免 @ 时智能判断是否插话 |
