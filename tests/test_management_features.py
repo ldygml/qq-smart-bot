@@ -23,6 +23,7 @@ from qq_ai_bot.control_plane import (
     restore_encrypted_backup,
 )
 from qq_ai_bot.group_behavior import GroupBehaviorStore
+from qq_ai_bot.group_profiles import GroupProfileStore
 from qq_ai_bot.onebot import StickerSource
 from qq_ai_bot.stickers import StickerStore
 from qq_ai_bot.usage import MeteredChatClient, UsageStore
@@ -87,6 +88,9 @@ class MultiCodeChat(FeatureChat):
         ("把打卡记录导出为CSV给我", "/生成文件"),
         ("写个 Python 脚本发给我", "/生成代码"),
         ("实现一个待办网页并生成代码文件", "/生成代码"),
+        ("写个 C++文件，输出helloworld", "/生成代码"),
+        ("给我一份可以输出helloworld的cpp文件", "/生成代码"),
+        ("生成一个包含多个文件的代码项目并发给我", "/生成代码"),
     ],
 )
 def test_natural_language_generation_intents(
@@ -153,6 +157,31 @@ async def test_group_settings_api_is_persistent_and_reloadable(tmp_path) -> None
         )
         assert invalid.status_code == 400
 
+        created_group = await client.post(
+            "/api/admin/group-profiles",
+            json={"group_id": 90001, "name": "测试群"},
+        )
+        assert created_group.status_code == 200
+        changed_group = await client.patch(
+            "/api/admin/group-profiles/90001",
+            json={
+                "enabled": False,
+                "require_mention": True,
+                "hourly_reply_limit": 3,
+                "avoid_last_word": True,
+                "custom_prompt": "这个群只回答明确问题。",
+            },
+        )
+        assert changed_group.status_code == 200
+        profiles = await client.get("/api/admin/group-profiles")
+        profile = next(
+            item
+            for item in profiles.json()["groups"]
+            if item["group_id"] == 90001
+        )
+        assert profile["enabled"] is False
+        assert profile["hourly_reply_limit"] == 3
+
     reloaded = create_app(
         settings=settings(),
         chat_client=FeatureChat(),
@@ -166,6 +195,21 @@ async def test_group_settings_api_is_persistent_and_reloadable(tmp_path) -> None
     assert loaded.group_min_reply_confidence == 0.72
     assert loaded.quote_replies is False
     assert loaded.trigger_prefixes == ()
+    transport = httpx.ASGITransport(app=reloaded)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        persisted_profiles = await client.get(
+            "/api/admin/group-profiles"
+        )
+    persisted = next(
+        item
+        for item in persisted_profiles.json()["groups"]
+        if item["group_id"] == 90001
+    )
+    assert persisted["require_mention"] is True
+    assert persisted["custom_prompt"] == "这个群只回答明确问题。"
 
 
 @pytest.mark.asyncio
@@ -273,8 +317,50 @@ def test_group_behavior_learns_silence_and_resets(tmp_path) -> None:
     policy = store.policy(100)
     assert policy["silence_bias"] > 0.9
     assert not store.should_attempt_ordinary(100, cooldown_seconds=0)
+    store.record_reply(100)
+    store.record_reply(100)
+    assert store.policy(100)["replies_last_hour"] == 2
+    assert not store.can_reply_now(100, 2)
     assert store.reset(100) == 1
     assert store.policy(100)["silence_bias"] == 0
+    assert store.policy(100)["replies_last_hour"] == 0
+
+
+def test_group_profiles_are_independent(tmp_path) -> None:
+    store = GroupProfileStore(tmp_path / "bot.db")
+    defaults = {
+        "enabled": True,
+        "require_mention": False,
+        "smart_participation": True,
+        "behavior_learning": True,
+        "min_reply_confidence": 0.65,
+        "reply_cooldown_seconds": 90,
+        "hourly_reply_limit": 20,
+        "participation_model": "qwen3.8-flash",
+        "trigger_prefixes": "/ai",
+        "quote_replies": True,
+        "quote_counts_as_mention": True,
+        "auto_sticker_enabled": True,
+        "avoid_last_word": True,
+        "custom_prompt": "",
+    }
+    first = store.ensure(100, defaults=defaults, name="技术群")
+    second = store.ensure(200, defaults=defaults, name="闲聊群")
+    assert first.require_mention is False
+    assert second.require_mention is False
+    updated = store.update(
+        100,
+        values={
+            "require_mention": True,
+            "reply_cooldown_seconds": 300,
+            "custom_prompt": "只回答技术问题，不讲笑话。",
+        },
+    )
+    assert updated is not None
+    assert updated.require_mention is True
+    assert updated.reply_cooldown_seconds == 300
+    assert store.get(200).require_mention is False
+    assert len(store.list_all()) == 2
 
 
 def test_encrypted_backup_round_trip_and_wrong_passphrase(tmp_path) -> None:

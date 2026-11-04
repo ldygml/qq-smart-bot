@@ -282,10 +282,124 @@ async function loadGroupSettings(instanceId) {
     document.querySelector("#settings-model").value = settings.group_participation_model || "";
     document.querySelector("#settings-allowlist").value = settings.group_allowlist || "";
     document.querySelector("#settings-prefixes").value = settings.group_trigger_prefixes || "";
+    await loadGroupProfiles(instanceId);
   } catch (err) {
     error.textContent = err.message;
   }
 }
+
+async function loadGroupProfiles(instanceId) {
+  const data = await api(`/api/instances/${instanceId}/group-profiles`);
+  const select = document.querySelector("#settings-profile-select");
+  const previous = select.value;
+  select.dataset.instance = String(instanceId);
+  select.innerHTML = data.groups.length
+    ? data.groups.map((item) => `<option value="${item.group_id}">${esc(item.name || "未命名群聊")} · ${item.group_id}</option>`).join("")
+    : `<option value="">暂无群聊记录</option>`;
+  if (previous && data.groups.some((item) => String(item.group_id) === previous)) {
+    select.value = previous;
+  }
+  if (select.value) renderGroupProfile(data.groups, Number(select.value));
+}
+
+function renderGroupProfile(profiles, groupId) {
+  const item = profiles.find((profile) => Number(profile.group_id) === groupId);
+  if (!item) return;
+  document.querySelector("#profile-name").value = item.name || "";
+  document.querySelector("#profile-enabled").checked = Boolean(item.enabled);
+  document.querySelector("#profile-require-mention").checked = Boolean(item.require_mention);
+  document.querySelector("#profile-smart").checked = Boolean(item.smart_participation);
+  document.querySelector("#profile-learning").checked = Boolean(item.behavior_learning);
+  document.querySelector("#profile-quote").checked = Boolean(item.quote_replies);
+  document.querySelector("#profile-quote-mention").checked = Boolean(item.quote_counts_as_mention);
+  document.querySelector("#profile-sticker").checked = Boolean(item.auto_sticker_enabled);
+  document.querySelector("#profile-avoid-last").checked = Boolean(item.avoid_last_word);
+  document.querySelector("#profile-confidence").value = item.min_reply_confidence;
+  document.querySelector("#profile-cooldown").value = item.reply_cooldown_seconds;
+  document.querySelector("#profile-hourly-limit").value = item.hourly_reply_limit;
+  document.querySelector("#profile-model").value = item.participation_model || "";
+  document.querySelector("#profile-prefixes").value = item.trigger_prefixes || "";
+  document.querySelector("#profile-custom-prompt").value = item.custom_prompt || "";
+}
+
+document.querySelector("#settings-profile-select").addEventListener("change", async (event) => {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  if (!instanceId || !event.target.value) return;
+  const data = await api(`/api/instances/${instanceId}/group-profiles`);
+  renderGroupProfile(data.groups, Number(event.target.value));
+});
+
+document.querySelector("#profile-add-group").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const groupId = Number(document.querySelector("#profile-new-group-id").value);
+  const error = document.querySelector("#profile-error");
+  error.textContent = "";
+  if (!instanceId || !Number.isInteger(groupId) || groupId <= 0) {
+    error.textContent = "请选择实例并填写有效群号。";
+    return;
+  }
+  try {
+    await api(`/api/instances/${instanceId}/group-profiles`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({group_id:groupId, name:document.querySelector("#profile-new-group-name").value.trim()}),
+    });
+    document.querySelector("#profile-new-group-id").value = "";
+    document.querySelector("#profile-new-group-name").value = "";
+    await loadGroupProfiles(instanceId);
+    document.querySelector("#settings-profile-select").value = String(groupId);
+  } catch (err) { error.textContent = err.message; }
+});
+
+document.querySelector("#save-group-profile").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const groupId = Number(document.querySelector("#settings-profile-select").value);
+  const error = document.querySelector("#profile-error");
+  const result = document.querySelector("#profile-result");
+  error.textContent = "";
+  result.textContent = "";
+  if (!instanceId || !groupId) {
+    error.textContent = "请选择实例和群聊。";
+    return;
+  }
+  try {
+    await api(`/api/instances/${instanceId}/group-profiles/${groupId}`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        name:document.querySelector("#profile-name").value.trim(),
+        enabled:document.querySelector("#profile-enabled").checked,
+        require_mention:document.querySelector("#profile-require-mention").checked,
+        smart_participation:document.querySelector("#profile-smart").checked,
+        behavior_learning:document.querySelector("#profile-learning").checked,
+        quote_replies:document.querySelector("#profile-quote").checked,
+        quote_counts_as_mention:document.querySelector("#profile-quote-mention").checked,
+        auto_sticker_enabled:document.querySelector("#profile-sticker").checked,
+        avoid_last_word:document.querySelector("#profile-avoid-last").checked,
+        min_reply_confidence:Number(document.querySelector("#profile-confidence").value),
+        reply_cooldown_seconds:Number(document.querySelector("#profile-cooldown").value),
+        hourly_reply_limit:Number(document.querySelector("#profile-hourly-limit").value),
+        participation_model:document.querySelector("#profile-model").value.trim(),
+        trigger_prefixes:document.querySelector("#profile-prefixes").value.trim(),
+        custom_prompt:document.querySelector("#profile-custom-prompt").value.trim(),
+      }),
+    });
+    result.textContent = "本群设置已保存并立即生效。";
+  } catch (err) { error.textContent = err.message; }
+});
+
+document.querySelector("#reset-group-profile").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const groupId = Number(document.querySelector("#settings-profile-select").value);
+  if (!instanceId || !groupId || !confirm("恢复此群的默认设置并清空行为学习？")) return;
+  try {
+    await api(`/api/instances/${instanceId}/group-profiles/${groupId}/reset`, {method:"POST"});
+    await loadGroupProfiles(instanceId);
+    document.querySelector("#profile-result").textContent = "已恢复默认设置。";
+  } catch (err) {
+    document.querySelector("#profile-error").textContent = err.message;
+  }
+});
 
 document.querySelector("#settings-instance").addEventListener("change", async (event) => {
   if (event.target.value) await loadGroupSettings(Number(event.target.value));

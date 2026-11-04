@@ -178,8 +178,23 @@ async def test_control_plane_proxies_group_settings(tmp_path, monkeypatch) -> No
             headers={"X-CSRF-Token": csrf},
             json={"group_require_mention": False},
         )
+        profile_response = await client.post(
+            "/api/instances/9/group-profiles/100",
+            headers={"X-CSRF-Token": csrf},
+            json={"require_mention": True},
+        )
+        reset_response = await client.post(
+            "/api/instances/9/group-profiles/100/reset",
+            headers={"X-CSRF-Token": csrf},
+        )
     assert response.status_code == 200
     assert calls[0][0] == 9
     assert calls[0][2] == "/api/admin/group-settings"
     assert calls[0][3] == "PATCH"
     assert calls[0][4] == {"group_require_mention": False}
+    assert profile_response.status_code == 200
+    assert calls[1][2] == "/api/admin/group-profiles/100"
+    assert calls[1][3] == "PATCH"
+    assert calls[1][4] == {"require_mention": True}
+    assert reset_response.status_code == 200
+    assert calls[2][2] == "/api/admin/group-profiles/100/reset"

@@ -32,10 +32,12 @@ class LLMGroupReplyDecider:
         *,
         model: str,
         min_confidence: float = 0.65,
+        extra_instructions: str = "",
     ) -> None:
         self.chat_client = chat_client
         self.model = model
         self.min_confidence = min_confidence
+        self.extra_instructions = extra_instructions.strip()
 
     async def should_reply(
         self,
@@ -58,7 +60,12 @@ class LLMGroupReplyDecider:
             "短确认、表情回应；只是在自言自语；别人已经回答了；"
             "机器人刚说完后没有新问题；没有把握或不相关的话题。\n"
             "不要因为机器人是足球迷就把无关话题硬扯到足球。\n\n"
-            f"群里最近消息：\n{recent or '无'}\n\n"
+            + (
+                f"本群额外规则：{self.extra_instructions[:2000]}\n\n"
+                if self.extra_instructions
+                else ""
+            )
+            + f"群里最近消息：\n{recent or '无'}\n\n"
             f"最新消息来自：{current_sender}\n"
             f"最新内容：{current_text}"
         )

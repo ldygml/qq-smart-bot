@@ -2,6 +2,7 @@ const state = {
   selectedUser: null,
   people: [],
   selectedMemories: new Set(),
+  groupProfiles: [],
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -450,12 +451,14 @@ async function loadKnowledge() {
 }
 
 async function loadOperations() {
-  const [usage, groups, settingsData] = await Promise.all([
+  const [usage, groups, settingsData, profileData] = await Promise.all([
     api("/api/admin/usage"),
     api("/api/admin/group-behavior"),
     api("/api/admin/group-settings"),
+    api("/api/admin/group-profiles"),
   ]);
   renderGroupSettings(settingsData.settings);
+  renderGroupProfiles(profileData.groups);
   const totals = usage.totals;
   $("#input-price").value = usage.pricing?.input || 0;
   $("#output-price").value = usage.pricing?.output || 0;
@@ -489,6 +492,111 @@ async function loadOperations() {
     };
   });
 }
+
+function renderGroupProfiles(profiles) {
+  state.groupProfiles = profiles;
+  const select = $("#group-profile-select");
+  const previous = select.value;
+  select.innerHTML = profiles.length
+    ? profiles.map((item) => `<option value="${item.group_id}">${esc(item.name || "未命名群聊")} · ${item.group_id}</option>`).join("")
+    : `<option value="">暂无群聊记录</option>`;
+  if (previous && profiles.some((item) => String(item.group_id) === previous)) {
+    select.value = previous;
+  }
+  if (select.value) renderGroupProfile(Number(select.value));
+}
+
+function renderGroupProfile(groupId) {
+  const profile = state.groupProfiles.find((item) => Number(item.group_id) === groupId);
+  if (!profile) return;
+  $("#profile-name").value = profile.name || "";
+  $("#profile-enabled").checked = Boolean(profile.enabled);
+  $("#profile-require-mention").checked = Boolean(profile.require_mention);
+  $("#profile-smart").checked = Boolean(profile.smart_participation);
+  $("#profile-learning").checked = Boolean(profile.behavior_learning);
+  $("#profile-quote").checked = Boolean(profile.quote_replies);
+  $("#profile-quote-mention").checked = Boolean(profile.quote_counts_as_mention);
+  $("#profile-sticker").checked = Boolean(profile.auto_sticker_enabled);
+  $("#profile-avoid-last").checked = Boolean(profile.avoid_last_word);
+  $("#profile-confidence").value = profile.min_reply_confidence;
+  $("#profile-cooldown").value = profile.reply_cooldown_seconds;
+  $("#profile-hourly-limit").value = profile.hourly_reply_limit;
+  $("#profile-model").value = profile.participation_model || "";
+  $("#profile-prefixes").value = profile.trigger_prefixes || "";
+  $("#profile-custom-prompt").value = profile.custom_prompt || "";
+  $("#group-profile-status").textContent = `已记录消息 ${profile.messages_seen || 0} 条，已回复 ${profile.replies_sent || 0} 次。`;
+}
+
+$("#group-profile-select").addEventListener("change", (event) => {
+  if (event.target.value) renderGroupProfile(Number(event.target.value));
+});
+
+$("#add-group-profile").addEventListener("click", async () => {
+  const groupId = Number($("#new-group-id").value);
+  const status = $("#group-profile-status");
+  if (!Number.isInteger(groupId) || groupId <= 0) {
+    status.textContent = "请填写有效的 QQ 群号。";
+    return;
+  }
+  try {
+    await jsonRequest("/api/admin/group-profiles", "POST", {
+      group_id: groupId,
+      name: $("#new-group-name").value.trim(),
+    });
+    $("#new-group-id").value = "";
+    $("#new-group-name").value = "";
+    await loadOperations();
+    $("#group-profile-select").value = String(groupId);
+    renderGroupProfile(groupId);
+  } catch (error) { status.textContent = error.message; }
+});
+
+$("#save-group-profile").addEventListener("click", async () => {
+  const groupId = Number($("#group-profile-select").value);
+  const status = $("#group-profile-status");
+  if (!groupId) {
+    status.textContent = "请先选择群聊。";
+    return;
+  }
+  try {
+    await jsonRequest(`/api/admin/group-profiles/${groupId}`, "PATCH", {
+      name: $("#profile-name").value.trim(),
+      enabled: $("#profile-enabled").checked,
+      require_mention: $("#profile-require-mention").checked,
+      smart_participation: $("#profile-smart").checked,
+      behavior_learning: $("#profile-learning").checked,
+      quote_replies: $("#profile-quote").checked,
+      quote_counts_as_mention: $("#profile-quote-mention").checked,
+      auto_sticker_enabled: $("#profile-sticker").checked,
+      avoid_last_word: $("#profile-avoid-last").checked,
+      min_reply_confidence: Number($("#profile-confidence").value),
+      reply_cooldown_seconds: Number($("#profile-cooldown").value),
+      hourly_reply_limit: Number($("#profile-hourly-limit").value),
+      participation_model: $("#profile-model").value.trim(),
+      trigger_prefixes: $("#profile-prefixes").value.trim(),
+      custom_prompt: $("#profile-custom-prompt").value.trim(),
+    });
+    await loadOperations();
+    $("#group-profile-select").value = String(groupId);
+    renderGroupProfile(groupId);
+    status.textContent = "本群设置已保存并立即生效。";
+  } catch (error) { status.textContent = error.message; }
+});
+
+$("#reset-group-profile").addEventListener("click", async () => {
+  const groupId = Number($("#group-profile-select").value);
+  if (!groupId || !confirm("恢复此群的全局默认设置，并清空该群的行为学习记录？")) return;
+  try {
+    await jsonRequest(`/api/admin/group-profiles/${groupId}/reset`, "POST", {
+      reset_behavior: true,
+    });
+    await loadOperations();
+    $("#group-profile-select").value = String(groupId);
+    renderGroupProfile(groupId);
+  } catch (error) {
+    $("#group-profile-status").textContent = error.message;
+  }
+});
 
 function renderGroupSettings(settings) {
   $("#group-enabled").checked = Boolean(settings.enable_group);

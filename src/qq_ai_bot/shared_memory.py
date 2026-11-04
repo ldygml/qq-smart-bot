@@ -761,6 +761,19 @@ class SharedMemoryStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def known_group_ids(self) -> list[int]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT group_id FROM shared_episodes
+                WHERE group_id IS NOT NULL
+                UNION
+                SELECT group_id FROM shared_observations
+                WHERE group_id IS NOT NULL
+                """
+            ).fetchall()
+        return sorted({int(row["group_id"]) for row in rows})
+
     def memory_timeline(
         self,
         user_id: int | None = None,

@@ -1311,6 +1311,71 @@ async def instance_update_group_settings(
     )
 
 
+@app.get("/api/instances/{instance_id}/group-profiles")
+async def instance_group_profiles(
+    instance_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/group-profiles",
+    )
+
+
+@app.post("/api/instances/{instance_id}/group-profiles")
+async def instance_add_group_profile(
+    instance_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/group-profiles",
+        method="POST",
+        json_body=payload,
+    )
+
+
+@app.post("/api/instances/{instance_id}/group-profiles/{group_id}")
+async def instance_update_group_profile(
+    instance_id: int,
+    group_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/group-profiles/{group_id}",
+        method="PATCH",
+        json_body=payload,
+    )
+
+
+@app.post("/api/instances/{instance_id}/group-profiles/{group_id}/reset")
+async def instance_reset_group_profile(
+    instance_id: int,
+    group_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/group-profiles/{group_id}/reset",
+        method="POST",
+        json_body={"reset_behavior": True},
+    )
+
+
 @app.delete(
     "/api/instances/{instance_id}/group-behavior/{group_id}"
 )

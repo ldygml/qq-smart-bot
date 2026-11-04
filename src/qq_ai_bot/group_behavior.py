@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,21 @@ class GroupBehaviorStore:
                     last_reply_at TEXT,
                     updated_at TEXT NOT NULL
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS group_reply_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_group_reply_events_group
+                ON group_reply_events (group_id, created_at DESC)
                 """
             )
 
@@ -103,6 +118,33 @@ class GroupBehaviorStore:
                 """,
                 (group_id, now, now),
             )
+            connection.execute(
+                """
+                INSERT INTO group_reply_events (group_id, created_at)
+                VALUES (?, ?)
+                """,
+                (group_id, now),
+            )
+            connection.execute(
+                """
+                DELETE FROM group_reply_events
+                WHERE created_at < ?
+                """,
+                ((datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),),
+            )
+
+    def can_reply_now(self, group_id: int, hourly_limit: int) -> bool:
+        since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM group_reply_events
+                WHERE group_id = ? AND created_at >= ?
+                """,
+                (group_id, since),
+            ).fetchone()
+        return int(row["total"]) < max(1, hourly_limit)
 
     def policy(self, group_id: int) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
@@ -122,11 +164,13 @@ class GroupBehaviorStore:
                 "last_message_at": None,
                 "last_reply_at": None,
                 "reply_rate": 0.0,
+                "replies_last_hour": 0,
             }
         item = dict(row)
         candidates = int(item.get("ordinary_candidates") or 0)
         replies = int(item.get("replies_sent") or 0)
         item["reply_rate"] = replies / candidates if candidates else 0.0
+        item["replies_last_hour"] = self._reply_count_last_hour(group_id)
         return item
 
     def list_policies(self) -> list[dict[str, Any]]:
@@ -140,6 +184,9 @@ class GroupBehaviorStore:
             candidates = int(item.get("ordinary_candidates") or 0)
             replies = int(item.get("replies_sent") or 0)
             item["reply_rate"] = replies / candidates if candidates else 0.0
+            item["replies_last_hour"] = self._reply_count_last_hour(
+                int(item["group_id"])
+            )
             result.append(item)
         return result
 
@@ -147,9 +194,14 @@ class GroupBehaviorStore:
         with self._lock, self._connect() as connection:
             if group_id is None:
                 cursor = connection.execute("DELETE FROM group_behavior")
+                connection.execute("DELETE FROM group_reply_events")
             else:
                 cursor = connection.execute(
                     "DELETE FROM group_behavior WHERE group_id = ?",
+                    (group_id,),
+                )
+                connection.execute(
+                    "DELETE FROM group_reply_events WHERE group_id = ?",
                     (group_id,),
                 )
             return cursor.rowcount
@@ -199,6 +251,19 @@ class GroupBehaviorStore:
                     now,
                 ),
             )
+
+    def _reply_count_last_hour(self, group_id: int) -> int:
+        since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM group_reply_events
+                WHERE group_id = ? AND created_at >= ?
+                """,
+                (group_id, since),
+            ).fetchone()
+        return int(row["total"]) if row else 0
 
 
 def _utc_now() -> str:

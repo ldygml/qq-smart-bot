@@ -138,6 +138,46 @@
         <p id="group-settings-status" class="muted"></p>
       </article>
       <article class="panel">
+        <div class="detail-head">
+          <div><p class="eyebrow">PER-GROUP CONTROL</p><h2>单个群聊独立管理</h2></div>
+          <div class="toolbar">
+            <input id="new-group-id" inputmode="numeric" placeholder="QQ 群号">
+            <input id="new-group-name" placeholder="群备注">
+            <button id="add-group-profile">新增群聊</button>
+          </div>
+        </div>
+        <p class="muted">每个群拥有独立设置；新群默认复制上面的全局设置，之后互不影响。</p>
+        <label>选择群聊<select id="group-profile-select"></select></label>
+        <div class="settings-grid">
+          <label class="check"><input id="profile-enabled" type="checkbox"> 群聊启用</label>
+          <label class="check"><input id="profile-require-mention" type="checkbox"> 必须 @</label>
+          <label class="check"><input id="profile-smart" type="checkbox"> 智能参与</label>
+          <label class="check"><input id="profile-learning" type="checkbox"> 行为学习</label>
+          <label class="check"><input id="profile-quote" type="checkbox"> 按语境引用</label>
+          <label class="check"><input id="profile-quote-mention" type="checkbox"> 引用视为 @</label>
+          <label class="check"><input id="profile-sticker" type="checkbox"> 自动发表情</label>
+          <label class="check"><input id="profile-avoid-last" type="checkbox"> 避免连续成为最后一个发言者</label>
+        </div>
+        <div class="field-row settings-row">
+          <label>群备注<input id="profile-name"></label>
+          <label>最低置信度<input id="profile-confidence" type="number" min="0" max="1" step="0.01"></label>
+          <label>冷却秒数<input id="profile-cooldown" type="number" min="0" max="3600"></label>
+          <label>每小时回复上限<input id="profile-hourly-limit" type="number" min="1" max="500"></label>
+          <label>参与模型<input id="profile-model"></label>
+        </div>
+        <div class="field-row settings-row">
+          <label>本群触发前缀<input id="profile-prefixes" placeholder="/ai,/问"></label>
+        </div>
+        <label>本群专属发言规则
+          <textarea id="profile-custom-prompt" rows="4" placeholder="例如：这个群只回答技术问题，少插话；不要接梗；每次最多两句……"></textarea>
+        </label>
+        <div class="item-actions">
+          <button id="save-group-profile" class="primary">保存本群设置</button>
+          <button id="reset-group-profile">恢复全局默认并清空行为学习</button>
+        </div>
+        <p id="group-profile-status" class="muted"></p>
+      </article>
+      <article class="panel">
         <h2>模型费用与延迟</h2>
         <div id="usage-cards" class="cards compact"></div>
         <div class="field-row pricing-row">
