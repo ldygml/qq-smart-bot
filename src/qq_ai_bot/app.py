@@ -400,6 +400,14 @@ def create_app(
             ),
         }
 
+    @app.post("/api/admin/reflect")
+    async def admin_reflect() -> JSONResponse:
+        try:
+            result = await _run_reflection(force=True)
+        except LLMError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=502)
+        return JSONResponse({"ok": True, **result})
+
     @app.get("/api/admin/stickers")
     async def admin_stickers() -> dict[str, Any]:
         return {"stickers": stickers.list_recent(limit=100)}
@@ -491,54 +499,71 @@ def create_app(
         await asyncio.sleep(10)
         while True:
             try:
-                async with reflection_lock:
-                    last_id_text = shared_memory.get_state(
-                        "last_reflected_memory_id",
-                        "0",
-                    )
-                    try:
-                        last_id = int(last_id_text)
-                    except ValueError:
-                        last_id = 0
-                    memories = shared_memory.memories_since(last_id, limit=60)
-                    if len(memories) >= config.reflection_min_new_memories:
-                        result = await reflect_on_memories(
-                            llm,
-                            model=config.reflection_model,
-                            memories=memories,
-                            existing_growth=shared_memory.growth_summary(
-                                limit=20,
-                                include_private=not config.memory_privacy_protection,
-                            ),
-                            allow_private_sharing=not config.memory_privacy_protection,
-                        )
-                        for reflection in result.reflections:
-                            shared_memory.add_reflection(
-                                content=reflection.content,
-                                visibility=reflection.visibility,
-                                confidence=reflection.confidence,
-                            )
-                        for item in result.growth:
-                            shared_memory.add_growth(
-                                aspect=item.aspect,
-                                content=item.content,
-                                visibility=item.visibility,
-                            )
-                        shared_memory.set_state(
-                            "last_reflected_memory_id",
-                            str(max(int(memory["id"]) for memory in memories)),
-                        )
-                        logger.info(
-                            "Reflected on %s new memories (%s insights, %s growth notes)",
-                            len(memories),
-                            len(result.reflections),
-                            len(result.growth),
-                        )
+                await _run_reflection(force=False)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.warning("Periodic memory reflection failed", exc_info=True)
             await asyncio.sleep(max(60.0, config.reflection_interval_seconds))
+
+    async def _run_reflection(*, force: bool) -> dict[str, int]:
+        if not (
+            config.shared_memory_enabled
+            and config.reflection_enabled
+        ):
+            return {"memories": 0, "reflections": 0, "growth": 0}
+        async with reflection_lock:
+            last_id_text = shared_memory.get_state(
+                "last_reflected_memory_id",
+                "0",
+            )
+            try:
+                last_id = int(last_id_text)
+            except ValueError:
+                last_id = 0
+            memories = shared_memory.memories_since(last_id, limit=80)
+            if not memories or (
+                len(memories) < config.reflection_min_new_memories
+                and not force
+            ):
+                return {"memories": 0, "reflections": 0, "growth": 0}
+            result = await reflect_on_memories(
+                llm,
+                model=config.reflection_model,
+                memories=memories,
+                existing_growth=shared_memory.growth_summary(
+                    limit=20,
+                    include_private=not config.memory_privacy_protection,
+                ),
+                allow_private_sharing=not config.memory_privacy_protection,
+            )
+            for reflection in result.reflections:
+                shared_memory.add_reflection(
+                    content=reflection.content,
+                    visibility=reflection.visibility,
+                    confidence=reflection.confidence,
+                )
+            for item in result.growth:
+                shared_memory.add_growth(
+                    aspect=item.aspect,
+                    content=item.content,
+                    visibility=item.visibility,
+                )
+            shared_memory.set_state(
+                "last_reflected_memory_id",
+                str(max(int(memory["id"]) for memory in memories)),
+            )
+            logger.info(
+                "Reflected on %s memories (%s insights, %s growth notes)",
+                len(memories),
+                len(result.reflections),
+                len(result.growth),
+            )
+            return {
+                "memories": len(memories),
+                "reflections": len(result.reflections),
+                "growth": len(result.growth),
+            }
 
     async def _process_event(event: OneBotEvent) -> None:
         assert event.user_id is not None
@@ -665,6 +690,27 @@ def create_app(
         if text.strip().lower() in {"/戳", "/戳一戳", "戳一戳", "戳我"}:
             if not await _safe_poke(target):
                 await _safe_send(target, "戳不动，NapCat 可能没有启用这个互动接口。")
+            return
+
+        if text.strip() in {"/反思", "/立即反思"}:
+            if event.user_id != config.owner_qq:
+                await _safe_send(target, "立即反思仅限管理员使用。")
+                return
+            await _safe_send(target, "正在整理最近的长期记忆…")
+            try:
+                reflection = await _run_reflection(force=True)
+            except LLMError as exc:
+                await _safe_send(target, str(exc))
+                return
+            if reflection["memories"] == 0:
+                await _safe_send(target, "没有尚未反思的新记忆。")
+            else:
+                await _safe_send(
+                    target,
+                    f"已整理 {reflection['memories']} 条记忆，"
+                    f"形成 {reflection['reflections']} 条反思、"
+                    f"{reflection['growth']} 条成长笔记。",
+                )
             return
 
         if await _handle_web_request(target, text):
@@ -1460,7 +1506,8 @@ def create_app(
                 "搜索：/搜 最新问题，机器人会联网核实\n"
                 "网页：直接发链接，或使用 /网页 URL 总结正文\n"
                 "互动：/戳，或者私聊直接说“戳一戳”\n"
-                "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情\n"
+                "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情；/表情库\n"
+                "反思：/反思，管理员可立即整理长期记忆\n"
                 "引用：机器人会引用你的原消息；引用机器人消息可以直接追问\n"
                 "/重置：忘记当前聊天上下文\n"
                 "/id：查看 QQ、群号和会话标识\n"
@@ -1557,6 +1604,16 @@ def create_app(
                 return "我还没有形成可共享的成长笔记。"
             lines = ["我目前整理出的成长笔记："]
             lines.extend(f"- {item['content']}" for item in growth)
+            return "\n".join(lines)
+        if command == "/表情库":
+            recent = stickers.list_recent(limit=20)
+            if not recent:
+                return "表情包库还是空的。发几个表情包给我，我会自动收藏。"
+            lines = [f"表情包库里有 {stickers.count()} 个表情："]
+            for item in recent:
+                lines.append(
+                    f"- {item['summary']}（使用 {item['use_count']} 次）"
+                )
             return "\n".join(lines)
         if command == "/待办":
             todo_text = text.partition(" ")[2].strip()

@@ -133,6 +133,25 @@ async function loadGrowth() {
     : `<div class="empty">还没有成长笔记。</div>`;
 }
 
+$("#reflect-now").addEventListener("click", async () => {
+  const button = $("#reflect-now");
+  button.disabled = true;
+  button.textContent = "整理中…";
+  try {
+    const result = await api("/api/admin/reflect", {method:"POST"});
+    alert(
+      `已整理 ${result.memories} 条记忆，形成 ` +
+      `${result.reflections} 条反思、${result.growth} 条成长笔记。`
+    );
+    await loadGrowth();
+  } catch (error) {
+    alert(`反思失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = "立即反思";
+  }
+});
+
 async function loadStickers() {
   const data = await api("/api/admin/stickers");
   $("#sticker-list").innerHTML = data.stickers.length

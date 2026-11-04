@@ -170,6 +170,19 @@ class FakeGroupDecider:
         return self.result
 
 
+class ReflectionOnlyChat:
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        return (
+            '{"reflections":[{"content":"多人都在准备杭州项目",'
+            '"visibility":"shareable","confidence":0.75}],'
+            '"growth":[{"aspect":"shared_topics",'
+            '"content":"近期经常讨论杭州项目","visibility":"shareable"}]}'
+        )
+
+    async def close(self) -> None:
+        return None
+
+
 class VerboseThenConciseChatClient(FakeChatClient):
     async def chat(
         self,
@@ -885,6 +898,7 @@ async def test_privacy_protection_can_be_disabled(tmp_path) -> None:
 async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()
+    sticker_store = StickerStore(tmp_path / "stickers.db")
     app = create_app(
         settings=make_settings(tmp_path),
         chat_client=llm,
@@ -893,6 +907,7 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
         image_loader=FakeImageLoader(),
         document_loader=FakeDocumentLoader(),
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        sticker_store=sticker_store,
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -924,6 +939,7 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     assert llm.models == ["qwen3.8-flash"]
     assert "表情包" in llm.calls[0][-1]["content"]
     assert sender.sent[0][0].message_id is None
+    assert sticker_store.count() == 1
 
 
 @pytest.mark.asyncio
@@ -1299,6 +1315,50 @@ async def test_smart_group_mode_can_stay_silent(tmp_path) -> None:
 
     assert sender.sent == []
     assert decider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_reflection_persists_insights(tmp_path) -> None:
+    shared = SharedMemoryStore(tmp_path / "shared.db")
+    for user_id, name, content in (
+        (201, "小明", "下周去杭州出差"),
+        (202, "小李", "正在准备杭州项目"),
+        (203, "小王", "询问杭州项目进度"),
+    ):
+        shared.add_memory(
+            subject_user_id=user_id,
+            subject_name=name,
+            content=content,
+            visibility="shareable",
+            source_conversation=f"private:{user_id}",
+        )
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            shared_memory_enabled=True,
+            reflection_enabled=True,
+            reflection_min_new_memories=20,
+        ),
+        chat_client=ReflectionOnlyChat(),
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        shared_memory_store=shared,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = await client.post("/api/admin/reflect")
+    assert response.status_code == 200
+    assert response.json()["memories"] == 3
+    assert response.json()["reflections"] == 1
+    assert response.json()["growth"] == 1
+    assert shared.reflection_summary(limit=10)[0]["content"].startswith("多人")
+    assert shared.growth_summary(limit=10)[0]["content"] == "近期经常讨论杭州项目"
 
 
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:
