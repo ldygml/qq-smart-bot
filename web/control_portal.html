@@ -29,6 +29,22 @@
       </article>
     </section>
 
+    <section class="panel backup-panel">
+      <div class="panel-head"><div><p class="eyebrow">ENCRYPTED BACKUP</p><h2>全部实例备份与恢复</h2></div><span class="status"><i></i>AES / PBKDF2</span></div>
+      <p>备份包含控制数据库、全部实例数据库快照、当前 .env 和控制台主密钥，并使用你设置的备份口令加密。请单独记住口令，丢失后无法恢复。</p>
+      <div class="backup-grid">
+        <label>备份口令<input id="backup-passphrase" type="password" minlength="8" placeholder="至少 8 个字符"></label>
+        <button id="create-backup" class="primary">下载加密备份</button>
+      </div>
+      <div class="backup-grid restore-grid">
+        <label>选择 .qqbackup 文件<input id="restore-file" type="file" accept=".qqbackup"></label>
+        <label>恢复口令<input id="restore-passphrase" type="password" minlength="8" placeholder="输入备份时的口令"></label>
+        <button id="restore-backup">停止实例并恢复</button>
+      </div>
+      <p id="backup-error" class="error"></p>
+      <p id="backup-result" class="muted"></p>
+    </section>
+
     <section id="provider-form" class="form-panel" hidden>
       <div class="panel-head"><div><p class="eyebrow">NEW / EDIT PROVIDER</p><h2>配置 API</h2></div><button class="close" data-close="provider-form">×</button></div>
       <form id="provider-editor">

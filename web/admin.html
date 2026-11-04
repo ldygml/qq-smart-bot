@@ -18,8 +18,12 @@
   <nav>
     <button class="active" data-tab="overview">概览</button>
     <button data-tab="people">联系人</button>
+    <button data-tab="timeline">记忆时间线</button>
     <button data-tab="growth">反思与成长</button>
     <button data-tab="stickers">表情包</button>
+    <button data-tab="knowledge">知识来源</button>
+    <button data-tab="operations">群聊与成本</button>
+    <button data-tab="generate">内容生成</button>
   </nav>
 
   <main>
@@ -51,7 +55,7 @@
               <textarea id="style-profile" rows="5" placeholder="回复长度、语气、直接程度、幽默感……"></textarea>
             </label>
             <label>关系备注
-              <textarea id="relationship-note" rows="3" placeholder="陌生人、朋友、熟人、工作关系……"></textarea>
+              <textarea id="relationship-note" rows="3" placeholder="陌生、朋友、熟人、工作关系……"></textarea>
             </label>
             <div id="person-sections"></div>
           </div>
@@ -59,25 +63,92 @@
       </div>
     </section>
 
+    <section id="timeline" class="tab">
+      <article class="panel">
+        <div class="detail-head">
+          <div><p class="eyebrow">MEMORY TIMELINE</p><h2>记忆与来源</h2></div>
+          <div class="toolbar">
+            <select id="timeline-person"><option value="">全部联系人</option></select>
+            <button id="merge-memories">合并所选</button>
+            <button id="refresh-timeline">刷新</button>
+          </div>
+        </div>
+        <p class="muted">旧说法被相同主题的新信息取代时会保留在时间线中并标记为“已取代”。选择两条记忆可以合并。</p>
+        <div id="conflict-list" class="conflict-list"></div>
+        <div id="memory-timeline" class="timeline-list"></div>
+      </article>
+    </section>
+
     <section id="growth" class="tab">
       <article class="panel">
         <div class="detail-head">
-          <h2>长期反思</h2>
+          <div><p class="eyebrow">REFLECTION</p><h2>长期反思</h2></div>
           <button id="reflect-now" class="primary">立即反思</button>
         </div>
-        <div id="reflections"></div>
+        <div id="reflections" class="edit-list"></div>
       </article>
       <article class="panel">
-        <h2>成长笔记</h2>
-        <div id="growth-list"></div>
+        <div class="detail-head">
+          <div><p class="eyebrow">GROWTH</p><h2>成长笔记</h2></div>
+        </div>
+        <div id="growth-list" class="edit-list"></div>
       </article>
     </section>
 
     <section id="stickers" class="tab">
       <article class="panel">
-        <h2>已收集表情包</h2>
-        <p class="muted">机器人收到表情包后会保存可复用元数据，可用 /发表情 发送。</p>
+        <h2>表情包管理</h2>
+        <p class="muted">可以预览有图片地址的表情，修改分类和适用场景，或停用、删除。机器人只会从启用项中选择。</p>
         <div id="sticker-list" class="sticker-grid"></div>
+      </article>
+    </section>
+
+    <section id="knowledge" class="tab">
+      <article class="panel">
+        <h2>知识库来源</h2>
+        <p class="muted">这里汇总上传文件和收藏网页。删除来源会同时移除对应向量片段。QQ 中发送“/收藏网页 URL”即可收藏网页。</p>
+        <div id="knowledge-list" class="source-list"></div>
+      </article>
+    </section>
+
+    <section id="operations" class="tab">
+      <article class="panel">
+        <h2>模型费用与延迟</h2>
+        <div id="usage-cards" class="cards compact"></div>
+        <div class="field-row pricing-row">
+          <label>输入价格 / 百万 Token<input id="input-price" type="number" min="0" step="0.0001" placeholder="人民币"></label>
+          <label>输出价格 / 百万 Token<input id="output-price" type="number" min="0" step="0.0001" placeholder="人民币"></label>
+          <button id="save-pricing">保存价格</button>
+        </div>
+        <div id="usage-models" class="table-wrap"></div>
+        <div id="usage-recent" class="recent-usage"></div>
+      </article>
+      <article class="panel">
+        <div class="detail-head">
+          <div><h2>群聊沉默策略</h2></div>
+          <button id="refresh-groups">刷新</button>
+        </div>
+        <p class="muted">机器人会根据各群中“普通消息被跳过”的比例提高沉默倾向，并在刚发言后进入冷却。艾特、引用机器人或明确命令不受影响。</p>
+        <div id="group-list" class="source-list"></div>
+      </article>
+    </section>
+
+    <section id="generate" class="tab">
+      <article class="panel">
+        <h2>生成图表、文档或文件</h2>
+        <label>生成类型
+          <select id="generate-kind">
+            <option value="chart">数据图表</option>
+            <option value="document">Word 文档</option>
+            <option value="file">Markdown / CSV / TXT</option>
+          </select>
+        </label>
+        <label>内容要求
+          <textarea id="generate-prompt" rows="8" placeholder="例如：把本周学习时长做成柱状图，周一 2 小时、周二 1.5 小时……"></textarea>
+        </label>
+        <button id="generate-submit" class="primary">开始生成</button>
+        <p id="generate-error" class="error"></p>
+        <div id="generate-result"></div>
       </article>
     </section>
   </main>

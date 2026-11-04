@@ -31,12 +31,33 @@ class StickerStore:
                     emoji_id TEXT NOT NULL,
                     emoji_package_id TEXT NOT NULL,
                     sticker_key TEXT NOT NULL,
+                    image_source TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT '未分类',
+                    usage_hint TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
                     seen_at TEXT NOT NULL,
                     use_count INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(summary, emoji_id, emoji_package_id, sticker_key)
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(sticker_catalog)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("image_source", "TEXT NOT NULL DEFAULT ''"),
+                ("category", "TEXT NOT NULL DEFAULT '未分类'"),
+                ("usage_hint", "TEXT NOT NULL DEFAULT ''"),
+                ("enabled", "INTEGER NOT NULL DEFAULT 1"),
+            ):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE sticker_catalog "
+                        f"ADD COLUMN {column} {definition}"
+                    )
 
     def record(self, sticker: StickerSource) -> None:
         if not (
@@ -51,17 +72,23 @@ class StickerStore:
                 INSERT INTO sticker_catalog
                     (
                         summary, emoji_id, emoji_package_id,
-                        sticker_key, seen_at
+                        sticker_key, image_source, seen_at
                     )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(summary, emoji_id, emoji_package_id, sticker_key)
-                DO UPDATE SET seen_at = excluded.seen_at
+                DO UPDATE SET seen_at = excluded.seen_at,
+                    image_source = CASE
+                        WHEN excluded.image_source != ''
+                        THEN excluded.image_source
+                        ELSE sticker_catalog.image_source
+                    END
                 """,
                 (
                     sticker.summary,
                     sticker.emoji_id,
                     sticker.emoji_package_id,
                     sticker.key,
+                    sticker.image_source,
                     _utc_now(),
                 ),
             )
@@ -73,17 +100,24 @@ class StickerStore:
                     """
                     SELECT summary, emoji_id, emoji_package_id, sticker_key
                     FROM sticker_catalog
-                    WHERE summary LIKE ?
+                    WHERE enabled = 1
+                      AND (summary LIKE ? OR usage_hint LIKE ?
+                           OR category LIKE ?)
                     ORDER BY RANDOM()
                     LIMIT 1
                     """,
-                    (f"%{keyword}%",),
+                    (
+                        f"%{keyword}%",
+                        f"%{keyword}%",
+                        f"%{keyword}%",
+                    ),
                 ).fetchall()
             else:
                 rows = connection.execute(
                     """
                     SELECT summary, emoji_id, emoji_package_id, sticker_key
                     FROM sticker_catalog
+                    WHERE enabled = 1
                     ORDER BY RANDOM()
                     LIMIT 1
                     """
@@ -116,17 +150,25 @@ class StickerStore:
     def count(self) -> int:
         with self._lock, self._connect() as connection:
             row = connection.execute(
-                "SELECT COUNT(*) AS total FROM sticker_catalog"
+                "SELECT COUNT(*) AS total FROM sticker_catalog WHERE enabled = 1"
             ).fetchone()
         return int(row["total"]) if row else 0
 
-    def list_recent(self, limit: int = 50) -> list[dict[str, object]]:
+    def list_recent(
+        self,
+        limit: int = 50,
+        *,
+        include_disabled: bool = False,
+    ) -> list[dict[str, object]]:
+        where = "" if include_disabled else "WHERE enabled = 1"
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT id, summary, emoji_id, emoji_package_id,
-                       sticker_key, seen_at, use_count
+                       sticker_key, image_source, category, usage_hint,
+                       enabled, seen_at, use_count
                 FROM sticker_catalog
+                {where}
                 ORDER BY seen_at DESC
                 LIMIT ?
                 """,
@@ -140,7 +182,7 @@ class StickerStore:
                 """
                 SELECT summary, emoji_id, emoji_package_id, sticker_key
                 FROM sticker_catalog
-                WHERE id = ?
+                WHERE id = ? AND enabled = 1
                 """,
                 (sticker_id,),
             ).fetchone()
@@ -156,6 +198,64 @@ class StickerStore:
             emoji_package_id=str(row["emoji_package_id"]),
             key=str(row["sticker_key"]),
         )
+
+    def get_metadata(self, sticker_id: int) -> dict[str, object] | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, summary, emoji_id, emoji_package_id,
+                       sticker_key, image_source, category, usage_hint,
+                       enabled, seen_at, use_count
+                FROM sticker_catalog
+                WHERE id = ?
+                """,
+                (sticker_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update(
+        self,
+        sticker_id: int,
+        *,
+        category: str,
+        usage_hint: str,
+        enabled: bool,
+    ) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sticker_catalog
+                SET category = ?, usage_hint = ?, enabled = ?
+                WHERE id = ?
+                """,
+                (
+                    category.strip()[:80] or "未分类",
+                    usage_hint.strip()[:300],
+                    1 if enabled else 0,
+                    sticker_id,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def delete(self, sticker_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM sticker_catalog WHERE id = ?",
+                (sticker_id,),
+            )
+            return cursor.rowcount > 0
+
+    def categories(self) -> list[str]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT category
+                FROM sticker_catalog
+                WHERE enabled = 1
+                ORDER BY category ASC
+                """
+            ).fetchall()
+        return [str(row["category"]) for row in rows]
 
 
 def _utc_now() -> str:

@@ -44,6 +44,8 @@ class LLMStickerChoiceDecider:
             return None
         catalog = "\n".join(
             f"id={item.get('id')}；名称={item.get('summary')}；"
+            f"分类={item.get('category', '未分类')}；"
+            f"适用场景={item.get('usage_hint') or '未设置'}；"
             f"已使用={item.get('use_count', 0)}次"
             for item in candidates[:30]
         )

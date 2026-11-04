@@ -26,7 +26,8 @@ $botProcesses = @(
     Get-CimInstance Win32_Process |
         Where-Object {
             ($_.Name -in @("uv.exe", "qq-smart-bot.exe", "python.exe")) -and
-            $_.CommandLine -match "qq-smart-bot"
+            $_.CommandLine -match "qq-smart-bot\.exe" -and
+            $_.CommandLine -notmatch "qq-control"
         }
 )
 if ($botProcesses.Count -gt 0) {

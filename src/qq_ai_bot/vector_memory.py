@@ -222,6 +222,66 @@ class VectorMemoryStore:
             ).fetchone()
         return row is not None
 
+    def delete_source(self, namespace: str, source_id: str) -> int:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM vector_chunks
+                WHERE namespace = ? AND source_id = ?
+                """,
+                (namespace, source_id),
+            )
+            return cursor.rowcount
+
+    def delete_sources(self, namespace: str, source_ids: list[str]) -> int:
+        if not source_ids:
+            return 0
+        placeholders = ",".join("?" for _ in source_ids)
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                DELETE FROM vector_chunks
+                WHERE namespace = ? AND source_id IN ({placeholders})
+                """,
+                [namespace, *source_ids],
+            )
+            return cursor.rowcount
+
+    def list_sources(
+        self,
+        namespace: str | None = None,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE namespace = ?" if namespace else ""
+        parameters: list[Any] = [namespace] if namespace else []
+        parameters.append(max(1, limit))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT namespace, source_id, MIN(title) AS title,
+                       MIN(location) AS location,
+                       MIN(created_at) AS created_at,
+                       COUNT(*) AS chunk_count,
+                       MAX(metadata) AS metadata
+                FROM vector_chunks
+                {where}
+                GROUP BY namespace, source_id
+                ORDER BY MIN(created_at) DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        sources: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(str(item.get("metadata") or "{}"))
+            except json.JSONDecodeError:
+                item["metadata"] = {}
+            sources.append(item)
+        return sources
+
     def count(self, namespace: str | None = None) -> int:
         with self._lock, self._connect() as connection:
             if namespace:

@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.8
     llm_timeout_seconds: float = 90.0
     llm_trust_env: bool = False
+    llm_input_price_per_million: float = 0.0
+    llm_output_price_per_million: float = 0.0
     web_search_enabled: bool = True
     web_reader_enabled: bool = True
     web_reader_timeout_seconds: float = 30.0
@@ -53,6 +55,7 @@ class Settings(BaseSettings):
     tts_voice: str = "longanhuan_v3.1"
     max_tts_chars: int = 800
     media_send_enabled: bool = True
+    generated_media_dir: Path = Path("data/generated")
     auto_sticker_enabled: bool = True
     sticker_model: str = "qwen3.8-flash"
     sticker_min_confidence: float = 0.7
@@ -85,6 +88,8 @@ class Settings(BaseSettings):
     group_smart_participation: bool = True
     group_participation_model: str = "qwen3.8-flash"
     group_min_reply_confidence: float = 0.65
+    group_reply_cooldown_seconds: float = 90.0
+    group_behavior_learning: bool = True
     quote_replies: bool = True
     group_quote_counts_as_mention: bool = True
 

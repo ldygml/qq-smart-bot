@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections import OrderedDict, deque
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
@@ -18,6 +19,12 @@ from pydantic import ValidationError
 
 from .audio import AudioLoader, AudioLoaderProtocol, AudioLoadError
 from .config import Settings
+from .content_tools import (
+    ContentGenerationError,
+    generate_chart,
+    generate_document,
+    generate_file,
+)
 from .files import (
     DocumentLoader,
     DocumentSection,
@@ -33,6 +40,7 @@ from .group_policy import (
     LLMGroupReplyDecider,
     obvious_ignore,
 )
+from .group_behavior import GroupBehaviorStore
 from .images import ImageLoader, ImageLoaderProtocol, ImageLoadError
 from .llm import ChatClient, CompatibleChatClient, LLMError
 from .memory import ChatMemory
@@ -71,6 +79,7 @@ from .vector_memory import (
 from .stickers import StickerStore
 from .sticker_policy import LLMStickerChoiceDecider, StickerChoiceDecider
 from .tts import TTSClient, TTSError
+from .usage import MeteredChatClient, UsageStore
 from .web_reader import WebArticleReader, WebReadError
 
 logger = logging.getLogger(__name__)
@@ -138,6 +147,7 @@ def create_app(
     embedding_client: EmbeddingClient | None = None,
     vector_store: VectorMemoryStore | None = None,
     group_reply_decider: GroupReplyDecider | None = None,
+    group_behavior_store: GroupBehaviorStore | None = None,
     sticker_choice_decider: StickerChoiceDecider | None = None,
 ) -> FastAPI:
     config = settings or Settings()
@@ -159,6 +169,8 @@ def create_app(
         token=config.onebot_token.get_secret_value(),
     )
     store = memory or ChatMemory(config.database_path)
+    usage = UsageStore(config.database_path)
+    llm = MeteredChatClient(llm, usage)
     images = image_loader or ImageLoader(
         max_bytes=config.max_image_bytes,
         timeout_seconds=config.image_timeout_seconds,
@@ -213,6 +225,30 @@ def create_app(
         model=config.sticker_model,
         min_confidence=config.sticker_min_confidence,
     )
+    group_behavior = group_behavior_store or GroupBehaviorStore(
+        config.database_path
+    )
+    usage_pricing = {
+        "input": _safe_price(
+            shared_memory.get_state(
+                "usage_input_price",
+                str(config.llm_input_price_per_million),
+            )
+        ),
+        "output": _safe_price(
+            shared_memory.get_state(
+                "usage_output_price",
+                str(config.llm_output_price_per_million),
+            )
+        ),
+    }
+
+    def _generated_media_dir() -> Path:
+        path = config.generated_media_dir
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     limiter = SlidingWindowRateLimiter(config.rate_limit_per_minute, 60.0)
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
@@ -293,6 +329,10 @@ def create_app(
             "group_enabled": config.enable_group,
             "group_require_mention": config.group_require_mention,
             "group_smart_participation": config.group_smart_participation,
+            "group_behavior_learning": config.group_behavior_learning,
+            "group_reply_cooldown_seconds": (
+                config.group_reply_cooldown_seconds
+            ),
             "quote_replies": config.quote_replies,
             "group_quote_counts_as_mention": config.group_quote_counts_as_mention,
             "history_messages": config.history_messages,
@@ -334,6 +374,12 @@ def create_app(
             "group_require_mention": config.group_require_mention,
             "web_search_enabled": config.web_search_enabled,
             "memory_privacy_protection": config.memory_privacy_protection,
+            "group_behavior": group_behavior.list_policies(),
+            "usage": usage.summary(
+                input_price_per_million=usage_pricing["input"],
+                output_price_per_million=usage_pricing["output"],
+                recent_limit=10,
+            )["totals"],
         }
 
     @app.get("/api/admin/people")
@@ -397,6 +443,90 @@ def create_app(
             status_code=200 if removed else 404,
         )
 
+    @app.get("/api/admin/memory/timeline")
+    async def admin_memory_timeline(
+        user_id: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "memories": shared_memory.memory_timeline(
+                user_id,
+                limit=300,
+            ),
+            "conflicts": shared_memory.list_conflicts(
+                user_id=user_id,
+                limit=100,
+            ),
+        }
+
+    @app.patch("/api/admin/memories/{memory_id}")
+    async def admin_update_memory(
+        memory_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        user_id = _optional_int(payload.get("user_id"))
+        updated = shared_memory.update_memory(
+            memory_id,
+            user_id=user_id,
+            content=(
+                str(payload["content"])
+                if "content" in payload
+                else None
+            ),
+            visibility=(
+                str(payload["visibility"])
+                if "visibility" in payload
+                else None
+            ),
+            category=(
+                str(payload["category"])
+                if "category" in payload
+                else None
+            ),
+            fact_key=(
+                str(payload["fact_key"])
+                if "fact_key" in payload
+                else None
+            ),
+        )
+        if updated and user_id is not None:
+            await _reindex_memory(memory_id, user_id)
+        return JSONResponse(
+            {"ok": updated},
+            status_code=200 if updated else 404,
+        )
+
+    @app.post("/api/admin/memories/merge")
+    async def admin_merge_memories(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        user_id = _optional_int(payload.get("user_id"))
+        primary_id = _optional_int(payload.get("primary_memory_id"))
+        secondary_id = _optional_int(payload.get("secondary_memory_id"))
+        if not user_id or not primary_id or not secondary_id:
+            return JSONResponse(
+                {"detail": "user_id and both memory ids are required"},
+                status_code=400,
+            )
+        merged_id = shared_memory.merge_memories(
+            user_id=user_id,
+            primary_memory_id=primary_id,
+            secondary_memory_id=secondary_id,
+            content=str(payload.get("content") or ""),
+        )
+        if merged_id is not None and vectors is not None:
+            vectors.delete_sources(
+                "memory",
+                [
+                    f"memory:{primary_id}",
+                    f"memory:{secondary_id}",
+                ],
+            )
+            await _reindex_memory(merged_id, user_id)
+        return JSONResponse(
+            {"ok": merged_id is not None, "memory_id": merged_id},
+            status_code=200 if merged_id is not None else 404,
+        )
+
     @app.get("/api/admin/growth")
     async def admin_growth() -> dict[str, Any]:
         return {
@@ -410,6 +540,56 @@ def create_app(
             ),
         }
 
+    @app.patch("/api/admin/reflections/{reflection_id}")
+    async def admin_update_reflection(
+        reflection_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        updated = shared_memory.update_reflection(
+            reflection_id,
+            content=str(payload.get("content") or ""),
+            visibility=str(payload.get("visibility") or "shareable"),
+            confidence=_optional_float(payload.get("confidence")),
+        )
+        return JSONResponse(
+            {"ok": updated},
+            status_code=200 if updated else 404,
+        )
+
+    @app.delete("/api/admin/reflections/{reflection_id}")
+    async def admin_delete_reflection(
+        reflection_id: int,
+    ) -> JSONResponse:
+        removed = shared_memory.delete_reflection(reflection_id)
+        return JSONResponse(
+            {"ok": removed},
+            status_code=200 if removed else 404,
+        )
+
+    @app.patch("/api/admin/growth/{growth_id}")
+    async def admin_update_growth(
+        growth_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        updated = shared_memory.update_growth(
+            growth_id,
+            aspect=str(payload.get("aspect") or "general"),
+            content=str(payload.get("content") or ""),
+            visibility=str(payload.get("visibility") or "shareable"),
+        )
+        return JSONResponse(
+            {"ok": updated},
+            status_code=200 if updated else 404,
+        )
+
+    @app.delete("/api/admin/growth/{growth_id}")
+    async def admin_delete_growth(growth_id: int) -> JSONResponse:
+        removed = shared_memory.delete_growth(growth_id)
+        return JSONResponse(
+            {"ok": removed},
+            status_code=200 if removed else 404,
+        )
+
     @app.post("/api/admin/reflect")
     async def admin_reflect() -> JSONResponse:
         try:
@@ -420,7 +600,174 @@ def create_app(
 
     @app.get("/api/admin/stickers")
     async def admin_stickers() -> dict[str, Any]:
-        return {"stickers": stickers.list_recent(limit=100)}
+        return {
+            "stickers": stickers.list_recent(
+                limit=100,
+                include_disabled=True,
+            ),
+            "categories": stickers.categories(),
+        }
+
+    @app.patch("/api/admin/stickers/{sticker_id}")
+    async def admin_update_sticker(
+        sticker_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        updated = stickers.update(
+            sticker_id,
+            category=str(payload.get("category") or "未分类"),
+            usage_hint=str(payload.get("usage_hint") or ""),
+            enabled=bool(payload.get("enabled", True)),
+        )
+        return JSONResponse(
+            {"ok": updated},
+            status_code=200 if updated else 404,
+        )
+
+    @app.delete("/api/admin/stickers/{sticker_id}")
+    async def admin_delete_sticker(sticker_id: int) -> JSONResponse:
+        removed = stickers.delete(sticker_id)
+        return JSONResponse(
+            {"ok": removed},
+            status_code=200 if removed else 404,
+        )
+
+    @app.get("/api/admin/knowledge")
+    async def admin_knowledge() -> dict[str, Any]:
+        return {
+            "sources": (
+                vectors.list_sources(limit=300)
+                if vectors is not None
+                else []
+            )
+        }
+
+    @app.post("/api/admin/knowledge/delete")
+    async def admin_delete_knowledge(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        if vectors is None:
+            return JSONResponse(
+                {"detail": "vector memory is disabled"},
+                status_code=404,
+            )
+        namespace = str(payload.get("namespace") or "")
+        source_id = str(payload.get("source_id") or "")
+        if namespace not in {"document", "web"} or not source_id:
+            return JSONResponse(
+                {"detail": "invalid source"},
+                status_code=400,
+            )
+        removed = vectors.delete_source(namespace, source_id)
+        return JSONResponse(
+            {"ok": removed > 0, "chunks_removed": removed},
+            status_code=200 if removed else 404,
+        )
+
+    @app.get("/api/admin/usage")
+    async def admin_usage() -> dict[str, Any]:
+        summary = usage.summary(
+            input_price_per_million=usage_pricing["input"],
+            output_price_per_million=usage_pricing["output"],
+            recent_limit=80,
+        )
+        summary["pricing"] = dict(usage_pricing)
+        return summary
+
+    @app.post("/api/admin/usage/pricing")
+    async def admin_usage_pricing(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        input_price = _safe_price(payload.get("input"))
+        output_price = _safe_price(payload.get("output"))
+        usage_pricing["input"] = input_price
+        usage_pricing["output"] = output_price
+        shared_memory.set_state("usage_input_price", str(input_price))
+        shared_memory.set_state("usage_output_price", str(output_price))
+        summary = usage.summary(
+            input_price_per_million=input_price,
+            output_price_per_million=output_price,
+            recent_limit=80,
+        )
+        summary["pricing"] = dict(usage_pricing)
+        return summary
+
+    @app.get("/api/admin/group-behavior")
+    async def admin_group_behavior() -> dict[str, Any]:
+        return {"groups": group_behavior.list_policies()}
+
+    @app.delete("/api/admin/group-behavior/{group_id}")
+    async def admin_reset_group_behavior(group_id: int) -> dict[str, Any]:
+        return {
+            "ok": group_behavior.reset(group_id) > 0,
+            "groups": group_behavior.list_policies(),
+        }
+
+    @app.post("/api/admin/generate")
+    async def admin_generate(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        kind = str(payload.get("kind") or "").strip()
+        prompt = str(payload.get("prompt") or "").strip()
+        if not prompt:
+            return JSONResponse(
+                {"detail": "prompt is required"},
+                status_code=400,
+            )
+        try:
+            if kind == "chart":
+                artifact = await generate_chart(
+                    llm,
+                    model=config.llm_model,
+                    prompt=prompt,
+                    output_dir=_generated_media_dir(),
+                )
+            elif kind == "document":
+                artifact = await generate_document(
+                    llm,
+                    model=config.llm_model,
+                    prompt=prompt,
+                    output_dir=_generated_media_dir(),
+                )
+            elif kind == "file":
+                artifact = await generate_file(
+                    llm,
+                    model=config.llm_model,
+                    prompt=prompt,
+                    output_dir=_generated_media_dir(),
+                )
+            else:
+                return JSONResponse(
+                    {"detail": "kind must be chart, document, or file"},
+                    status_code=400,
+                )
+        except (ContentGenerationError, LLMError) as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=502)
+        return JSONResponse(
+            {
+                "ok": True,
+                "name": artifact.name,
+                "kind": artifact.kind,
+                "summary": artifact.summary,
+                "download_url": (
+                    f"/api/admin/generated/{artifact.path.name}"
+                ),
+            }
+        )
+
+    @app.get("/api/admin/generated/{file_name}")
+    async def admin_generated_file(file_name: str) -> Response:
+        safe_name = Path(file_name).name
+        path = (_generated_media_dir() / safe_name).resolve()
+        if path.parent != _generated_media_dir().resolve() or not path.is_file():
+            return JSONResponse({"detail": "file not found"}, status_code=404)
+        return FileResponse(
+            path,
+            filename=safe_name,
+            content_disposition_type=(
+                "inline" if path.suffix.lower() in {".png", ".jpg", ".jpeg"} else "attachment"
+            ),
+        )
 
     @app.post("/onebot")
     async def receive_onebot_event(request: Request) -> Response:
@@ -516,13 +863,164 @@ def create_app(
                 logger.warning("Periodic memory reflection failed", exc_info=True)
             await asyncio.sleep(max(60.0, config.reflection_interval_seconds))
 
+    async def _harvest_episode_memories(*, force: bool) -> dict[str, int]:
+        extracted = 0
+        conflicts = 0
+
+        async def extract_and_store(
+            *,
+            user_id: int,
+            speaker_name: str,
+            conversation_id: str,
+            content: str,
+            source_episode_id: int | None = None,
+            source_observation_id: int | None = None,
+        ) -> None:
+            nonlocal extracted, conflicts
+            candidates = await extract_memory_candidates(
+                llm,
+                model=config.memory_model,
+                speaker_name=speaker_name,
+                speaker_id=user_id,
+                user_message=content,
+            )
+            chunks: list[VectorChunk] = []
+            for memory in candidates:
+                memory_id = shared_memory.add_memory(
+                    subject_user_id=user_id,
+                    subject_name=speaker_name,
+                    content=memory.content,
+                    visibility=memory.visibility,
+                    source_conversation=conversation_id,
+                    category=memory.category,
+                    fact_key=memory.fact_key,
+                    confidence=memory.confidence,
+                    source_episode_id=source_episode_id,
+                    source_observation_id=source_observation_id,
+                )
+                if memory_id is None:
+                    continue
+                extracted += 1
+                superseded_ids = shared_memory.superseded_ids_for(memory_id)
+                conflicts += len(superseded_ids)
+                if vectors is not None:
+                    vectors.delete_sources(
+                        "memory",
+                        [
+                            f"memory:{old_id}"
+                            for old_id in superseded_ids
+                        ],
+                    )
+                    vectors.delete_source(
+                        "memory",
+                        f"memory:{memory_id}",
+                    )
+                chunks.append(
+                    VectorChunk(
+                        namespace="memory",
+                        source_id=f"memory:{memory_id}",
+                        title=speaker_name,
+                        location=(
+                            f"长期记忆/{memory.category}"
+                            + (
+                                f"/{memory.fact_key}"
+                                if memory.fact_key
+                                else ""
+                            )
+                        ),
+                        content=memory.content,
+                    )
+                )
+            await _index_vector_chunks(
+                chunks,
+                metadata={
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                },
+            )
+
+        cursor_text = shared_memory.get_state(
+            "last_harvested_episode_id",
+            "0",
+        )
+        try:
+            cursor = int(cursor_text)
+        except ValueError:
+            cursor = 0
+        episodes = shared_memory.episodes_since(
+            cursor,
+            limit=40 if force else 8,
+        )
+        for episode in episodes:
+            text = str(episode.get("user_content") or "").strip()
+            episode_id = int(episode["id"])
+            if text:
+                await extract_and_store(
+                    user_id=int(episode["speaker_user_id"]),
+                    speaker_name=str(episode["speaker_name"]),
+                    conversation_id=str(episode["conversation_id"]),
+                    content=text,
+                    source_episode_id=episode_id,
+                )
+            shared_memory.mark_episode_processed(episode_id)
+            shared_memory.set_state(
+                "last_harvested_episode_id",
+                str(episode_id),
+            )
+
+        observation_cursor_text = shared_memory.get_state(
+            "last_harvested_observation_id",
+            "0",
+        )
+        try:
+            observation_cursor = int(observation_cursor_text)
+        except ValueError:
+            observation_cursor = 0
+        observations = shared_memory.observations_since(
+            observation_cursor,
+            limit=40 if force else 12,
+        )
+        for observation in observations:
+            text = str(observation.get("content") or "").strip()
+            observation_id = int(observation["id"])
+            if text:
+                await extract_and_store(
+                    user_id=int(observation["speaker_user_id"]),
+                    speaker_name=str(observation["speaker_name"]),
+                    conversation_id=str(observation["conversation_id"]),
+                    content=text,
+                    source_observation_id=observation_id,
+                )
+            shared_memory.mark_observation(
+                observation_id,
+                processed=True,
+                replied=False,
+            )
+            shared_memory.set_state(
+                "last_harvested_observation_id",
+                str(observation_id),
+            )
+        return {
+            "episodes": len(episodes),
+            "observations": len(observations),
+            "extracted": extracted,
+            "conflicts": conflicts,
+        }
+
     async def _run_reflection(*, force: bool) -> dict[str, int]:
         if not (
             config.shared_memory_enabled
             and config.reflection_enabled
         ):
-            return {"memories": 0, "reflections": 0, "growth": 0}
+            return {
+                "memories": 0,
+                "extracted": 0,
+                "reflections": 0,
+                "growth": 0,
+                "conflicts": 0,
+            }
         async with reflection_lock:
+            harvest = await _harvest_episode_memories(force=force)
             last_id_text = shared_memory.get_state(
                 "last_reflected_memory_id",
                 "0",
@@ -532,11 +1030,23 @@ def create_app(
             except ValueError:
                 last_id = 0
             memories = shared_memory.memories_since(last_id, limit=80)
+            if not memories and force:
+                memories = shared_memory.recent_active_memories(limit=40)
             if not memories or (
                 len(memories) < config.reflection_min_new_memories
                 and not force
             ):
-                return {"memories": 0, "reflections": 0, "growth": 0}
+                return {
+                    "memories": 0,
+                    "extracted": harvest["extracted"],
+                    "reflections": 0,
+                    "growth": 0,
+                    "conflicts": harvest["conflicts"],
+                }
+            existing_reflections = shared_memory.reflection_summary(
+                limit=20,
+                include_private=not config.memory_privacy_protection,
+            )
             result = await reflect_on_memories(
                 llm,
                 model=config.reflection_model,
@@ -545,19 +1055,25 @@ def create_app(
                     limit=20,
                     include_private=not config.memory_privacy_protection,
                 ),
+                existing_reflections=existing_reflections,
                 allow_private_sharing=not config.memory_privacy_protection,
             )
+            memory_ids = [int(memory["id"]) for memory in memories]
             for reflection in result.reflections:
                 shared_memory.add_reflection(
                     content=reflection.content,
                     visibility=reflection.visibility,
                     confidence=reflection.confidence,
+                    source_memory_ids=memory_ids,
+                    supersedes_id=reflection.supersedes_id,
                 )
             for item in result.growth:
                 shared_memory.add_growth(
                     aspect=item.aspect,
                     content=item.content,
                     visibility=item.visibility,
+                    source_memory_ids=memory_ids,
+                    supersedes_id=item.supersedes_id,
                 )
             shared_memory.set_state(
                 "last_reflected_memory_id",
@@ -571,8 +1087,10 @@ def create_app(
             )
             return {
                 "memories": len(memories),
+                "extracted": harvest["extracted"],
                 "reflections": len(result.reflections),
                 "growth": len(result.growth),
+                "conflicts": harvest["conflicts"],
             }
 
     async def _process_event(event: OneBotEvent) -> None:
@@ -625,6 +1143,21 @@ def create_app(
         if sticker_summaries:
             sticker_text = "、".join(dict.fromkeys(sticker_summaries))
             text = f"[对方发了一个表情包：{sticker_text}] {text}".strip()
+        observation_id: int | None = None
+        if (
+            config.shared_memory_enabled
+            and len(text.strip()) >= 4
+            and not text.strip().startswith("/")
+            and not obvious_ignore(text)
+        ):
+            observation_id = shared_memory.observe_message(
+                conversation_id=target.conversation_id,
+                message_type=target.message_type,
+                group_id=target.group_id,
+                speaker_user_id=event.user_id,
+                speaker_name=display_name,
+                content=text,
+            )
         should_quote = (
             config.quote_replies
             and (
@@ -650,6 +1183,7 @@ def create_app(
                     content=text,
                 )
             )
+            group_behavior.observe_message(group_id)
             prefix_triggered = any(
                 text.lower().startswith(prefix.lower())
                 for prefix in config.trigger_prefixes
@@ -683,6 +1217,16 @@ def create_app(
                 and not directly_addressed
             ):
                 if obvious_ignore(text):
+                    group_behavior.record_ordinary_ignored(group_id)
+                    return
+                if (
+                    config.group_behavior_learning
+                    and not group_behavior.should_attempt_ordinary(
+                        group_id,
+                        cooldown_seconds=config.group_reply_cooldown_seconds,
+                    )
+                ):
+                    group_behavior.record_ordinary_ignored(group_id)
                     return
                 should_join = await group_decider.should_reply(
                     history=list(group_history)[:-1],
@@ -690,6 +1234,7 @@ def create_app(
                     current_text=text,
                 )
                 if not should_join:
+                    group_behavior.record_ordinary_ignored(group_id)
                     return
             text = strip_trigger_prefix(text, config.trigger_prefixes)
 
@@ -973,6 +1518,7 @@ def create_app(
             display_name=display_name,
             user_text=text,
             assistant_text=reply,
+            observation_id=observation_id,
         )
 
     async def _process_file_request(
@@ -1176,7 +1722,7 @@ def create_app(
             return
         try:
             texts = [chunk.content for chunk in chunks]
-            stored_embeddings = await embeddings.embed(texts)
+            stored_embeddings = await _embed_texts(texts)
             vectors.upsert_chunks(
                 chunks,
                 stored_embeddings,
@@ -1196,7 +1742,7 @@ def create_app(
         if not any(vectors.count(namespace) for namespace in namespaces):
             return []
         try:
-            query_embedding = (await embeddings.embed([query]))[0]
+            query_embedding = (await _embed_texts([query]))[0]
         except Exception:
             logger.warning("Query embedding failed", exc_info=True)
             return []
@@ -1207,6 +1753,67 @@ def create_app(
             min_score=0.25,
         )
 
+    async def _embed_texts(texts: list[str]) -> list[list[float]]:
+        if embeddings is None:
+            return []
+        started = time.perf_counter()
+        try:
+            result = await embeddings.embed(texts)
+        except Exception as exc:
+            usage.record(
+                operation="embedding",
+                model=config.embedding_model,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                input_chars=sum(len(text) for text in texts),
+                output_chars=0,
+                success=False,
+                error=str(exc),
+            )
+            raise
+        usage.record(
+            operation="embedding",
+            model=config.embedding_model,
+            duration_ms=(time.perf_counter() - started) * 1000,
+            input_chars=sum(len(text) for text in texts),
+            output_chars=0,
+            success=True,
+        )
+        return result
+
+    async def _reindex_memory(memory_id: int, user_id: int) -> None:
+        if vectors is None:
+            return
+        memories = shared_memory.memory_timeline(user_id, limit=300)
+        memory = next(
+            (item for item in memories if int(item["id"]) == memory_id),
+            None,
+        )
+        vectors.delete_source("memory", f"memory:{memory_id}")
+        if memory is None or memory.get("status") != "active":
+            return
+        await _index_vector_chunks(
+            [
+                VectorChunk(
+                    namespace="memory",
+                    source_id=f"memory:{memory_id}",
+                    title=str(memory["subject_name"]),
+                    location=(
+                        f"长期记忆/{memory.get('category', 'general')}"
+                        + (
+                            f"/{memory['fact_key']}"
+                            if memory.get("fact_key")
+                            else ""
+                        )
+                    ),
+                    content=str(memory["content"]),
+                )
+            ],
+            metadata={
+                "user_id": user_id,
+                "conversation_id": str(memory["source_conversation"]),
+            },
+        )
+
     async def _remember_exchange(
         *,
         event: OneBotEvent,
@@ -1214,6 +1821,7 @@ def create_app(
         display_name: str,
         user_text: str,
         assistant_text: str,
+        observation_id: int | None = None,
     ) -> None:
         if not config.shared_memory_enabled or event.user_id is None:
             return
@@ -1226,6 +1834,7 @@ def create_app(
                 speaker_name=display_name,
                 user_content=user_text,
                 assistant_content=assistant_text,
+                processed=True,
             )
             await _index_vector_chunks(
                 [
@@ -1260,15 +1869,43 @@ def create_app(
                     content=memory.content,
                     visibility=memory.visibility,
                     source_conversation=target.conversation_id,
+                    category=memory.category,
+                    fact_key=memory.fact_key,
+                    confidence=memory.confidence,
+                    source_episode_id=episode_id,
                 )
                 if memory_id is not None:
+                    if vectors is not None:
+                        vectors.delete_sources(
+                            "memory",
+                            [
+                                f"memory:{old_id}"
+                                for old_id in shared_memory.superseded_ids_for(
+                                    memory_id
+                                )
+                            ],
+                        )
+                        vectors.delete_source(
+                            "memory",
+                            f"memory:{memory_id}",
+                        )
                     memory_chunks.append(
                         VectorChunk(
                             namespace="memory",
                             source_id=f"memory:{memory_id}",
                             title=display_name,
-                            location="长期记忆",
-                            content=memory.content,
+                            location=(
+                                f"长期记忆/{memory.category}"
+                                + (
+                                    f"/{memory.fact_key}"
+                                    if memory.fact_key
+                                    else ""
+                                )
+                            ),
+                            content=(
+                                f"{memory.content}"
+                                f"（来源会话：{target.conversation_id}）"
+                            ),
                         )
                     )
             await _index_vector_chunks(
@@ -1283,7 +1920,19 @@ def create_app(
                     user_id=event.user_id,
                     display_name=display_name,
                 )
+            if observation_id is not None:
+                shared_memory.mark_observation(
+                    observation_id,
+                    processed=True,
+                    replied=True,
+                )
         except Exception:
+            if observation_id is not None:
+                shared_memory.mark_observation(
+                    observation_id,
+                    processed=False,
+                    replied=True,
+                )
             logger.warning("Long-term memory extraction failed", exc_info=True)
 
     async def _refresh_person_profile(
@@ -1339,7 +1988,15 @@ def create_app(
         value = text.strip()
         command = ""
         argument = ""
-        for prefix in ("/发语音", "/发图", "/发文件", "/发表情"):
+        for prefix in (
+            "/发语音",
+            "/发图",
+            "/发文件",
+            "/发表情",
+            "/生成图表",
+            "/生成文档",
+            "/生成文件",
+        ):
             if value == prefix or value.startswith(prefix + " "):
                 command = prefix
                 argument = value[len(prefix) :].strip()
@@ -1347,16 +2004,99 @@ def create_app(
         if not command and value.startswith("用语音说"):
             command = "/发语音"
             argument = value[len("用语音说") :].lstrip("：:，, ")
+        if not command:
+            for phrase, target_command in (
+                ("生成图表", "/生成图表"),
+                ("做个图表", "/生成图表"),
+                ("生成文档", "/生成文档"),
+                ("写个Word", "/生成文档"),
+                ("写个文档", "/生成文档"),
+                ("生成文件", "/生成文件"),
+            ):
+                if phrase in value:
+                    command = target_command
+                    argument = value.split(phrase, 1)[1].lstrip(
+                        "：:，, 。"
+                    )
+                    break
         if not command and value in {"发个表情包", "来个表情包"}:
             command = "/发表情"
 
         if not command:
             return False
-        if event.user_id != config.owner_qq:
+        if (
+            command.startswith("/发")
+            and event.user_id != config.owner_qq
+        ):
             await _safe_send(target, "媒体发送命令仅限管理员使用。")
             return True
         if not config.media_send_enabled:
             await _safe_send(target, "媒体发送功能目前没有开启。")
+            return True
+
+        if command == "/生成图表":
+            if not argument:
+                await _safe_send(
+                    target,
+                    "用法：/生成图表 项目A 10，项目B 20；也可以直接描述数据。",
+                )
+                return True
+            if not limiter.allow(str(event.user_id)):
+                await _safe_send(target, "生成请求太频繁，等一分钟再试。")
+                return True
+            await _safe_send(target, "正在整理数据并生成图表…")
+            try:
+                artifact = await generate_chart(
+                    llm,
+                    model=config.llm_model,
+                    prompt=argument,
+                    output_dir=_generated_media_dir(),
+                )
+                await sender.send_image(target, str(artifact.path))
+            except (ContentGenerationError, LLMError, OneBotError) as exc:
+                await _safe_send(target, f"图表生成失败：{exc}")
+            except Exception:
+                logger.exception("Unexpected chart generation failure")
+                await _safe_send(target, "图表生成失败，请稍后再试。")
+            return True
+
+        if command in {"/生成文档", "/生成文件"}:
+            if not argument:
+                await _safe_send(
+                    target,
+                    f"用法：{command} 标题或具体写作要求",
+                )
+                return True
+            if not limiter.allow(str(event.user_id)):
+                await _safe_send(target, "生成请求太频繁，等一分钟再试。")
+                return True
+            await _safe_send(target, "正在生成可下载文件…")
+            try:
+                artifact = (
+                    await generate_document(
+                        llm,
+                        model=config.llm_model,
+                        prompt=argument,
+                        output_dir=_generated_media_dir(),
+                    )
+                    if command == "/生成文档"
+                    else await generate_file(
+                        llm,
+                        model=config.llm_model,
+                        prompt=argument,
+                        output_dir=_generated_media_dir(),
+                    )
+                )
+                await sender.upload_file(
+                    target,
+                    path=str(artifact.path),
+                    name=artifact.name,
+                )
+            except (ContentGenerationError, LLMError, OneBotError) as exc:
+                await _safe_send(target, f"文件生成失败：{exc}")
+            except Exception:
+                logger.exception("Unexpected generated-file failure")
+                await _safe_send(target, "文件生成失败，请稍后再试。")
             return True
 
         if command == "/发语音":
@@ -1486,13 +2226,17 @@ def create_app(
             return False
         url = _find_url(text)
         if not url:
-            if text.strip().startswith(("/网页", "/读网页")):
-                await _safe_send(target, "用法：/网页 https://example.com")
+            if text.strip().startswith(("/网页", "/读网页", "/收藏网页")):
+                await _safe_send(
+                    target,
+                    "用法：/网页 https://example.com，"
+                    "或 /收藏网页 https://example.com",
+                )
                 return True
             return False
         if not (
             text.strip() == url
-            or text.strip().startswith(("/网页", "/读网页"))
+            or text.strip().startswith(("/网页", "/读网页", "/收藏网页"))
             or any(
                 marker in text
                 for marker in ("看下这个链接", "总结网页", "读一下", "看看这篇")
@@ -1531,7 +2275,11 @@ def create_app(
             ]
             await _index_vector_chunks(
                 chunks,
-                metadata={"url": url},
+                metadata={
+                    "url": url,
+                    "saved": text.strip().startswith("/收藏网页"),
+                    "title": article.title,
+                },
             )
             try:
                 reply = await summarize_documents(
@@ -1580,8 +2328,10 @@ def create_app(
                 "学习工作：/计划、/总结、/出题、/翻译、/润色、/解释\n"
                 "搜索：/搜 最新问题，机器人会联网核实\n"
                 "网页：直接发链接，或使用 /网页 URL 总结正文\n"
+                "网页收藏：/收藏网页 URL，会写入知识库来源并参与后续检索\n"
                 "互动：/戳，或者私聊直接说“戳一戳”\n"
                 "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情；/表情库\n"
+                "生成：/生成图表 数据；/生成文档 要求；/生成文件 要求\n"
                 "反思：/反思，管理员可立即整理长期记忆\n"
                 "引用：机器人会引用你的原消息；引用机器人消息可以直接追问\n"
                 "/重置：忘记当前聊天上下文\n"
@@ -1770,6 +2520,7 @@ def create_app(
         try:
             await sender.send_text(target, text)
             if target.message_type == "group" and target.group_id is not None:
+                group_behavior.record_reply(target.group_id)
                 group_histories.setdefault(
                     target.group_id,
                     deque(maxlen=24),
@@ -1808,6 +2559,31 @@ def _parse_id(raw: str) -> int | None:
     except ValueError:
         return None
     return value if value > 0 else None
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_price(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(10_000.0, max(0.0, parsed))
 
 
 def _expand_ai_command(text: str) -> tuple[str, str | None]:

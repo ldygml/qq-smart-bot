@@ -9,6 +9,7 @@ dependencies = [
     "cryptography>=44,<47",
     "httpx>=0.28,<1",
     "openpyxl>=3.1,<4",
+    "pillow>=11,<14",
     "pydantic-settings>=2.6,<3",
     "pypdf>=5.1,<7",
     "pypdfium2>=5,<6",

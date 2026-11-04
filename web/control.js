@@ -251,6 +251,95 @@ document.querySelector("#memory-person").addEventListener("change", async (event
   if (instanceId && event.target.value) await loadMemoryPerson(instanceId, Number(event.target.value));
 });
 
+document.querySelector("#create-backup").addEventListener("click", async () => {
+  const error = document.querySelector("#backup-error");
+  const result = document.querySelector("#backup-result");
+  error.textContent = "";
+  result.textContent = "";
+  const passphrase = document.querySelector("#backup-passphrase").value;
+  if (passphrase.length < 8) {
+    error.textContent = "备份口令至少需要 8 个字符。";
+    return;
+  }
+  const button = document.querySelector("#create-backup");
+  button.disabled = true;
+  button.textContent = "正在打包…";
+  try {
+    const response = await fetch("/api/backup", {
+      method:"POST",
+      headers:{"Content-Type":"application/json", "X-CSRF-Token":csrf},
+      body:JSON.stringify({passphrase}),
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.detail || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const match = disposition.match(/filename="([^"]+)"/);
+    const name = match ? match[1] : "qq-bot-backup.qqbackup";
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    link.click();
+    URL.revokeObjectURL(url);
+    result.textContent = `已生成 ${name}，请把备份文件和口令分开保管。`;
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = "下载加密备份";
+  }
+});
+
+document.querySelector("#restore-backup").addEventListener("click", async () => {
+  const error = document.querySelector("#backup-error");
+  const result = document.querySelector("#backup-result");
+  error.textContent = "";
+  result.textContent = "";
+  const file = document.querySelector("#restore-file").files[0];
+  const passphrase = document.querySelector("#restore-passphrase").value;
+  if (!file) {
+    error.textContent = "请选择备份文件。";
+    return;
+  }
+  if (passphrase.length < 8) {
+    error.textContent = "恢复口令至少需要 8 个字符。";
+    return;
+  }
+  if (!confirm("恢复会停止当前全部实例并覆盖数据库、.env 和控制台密钥。确定继续？")) return;
+  const button = document.querySelector("#restore-backup");
+  button.disabled = true;
+  button.textContent = "正在恢复…";
+  try {
+    const contentBase64 = await fileToBase64(file);
+    const data = await api("/api/restore", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({passphrase, content_base64:contentBase64}),
+    });
+    result.textContent = data.note;
+    alert(`恢复完成。原数据安全副本位于：\n${data.safety_directory}\n\n请重新登录控制台。`);
+    setTimeout(() => { location.href = "/login"; }, 800);
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = "停止实例并恢复";
+  }
+});
+
+async function fileToBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
 async function init() {
   try {
     await loadMe();

@@ -60,6 +60,7 @@ class StickerSource:
     emoji_id: str = ""
     emoji_package_id: str = ""
     key: str = ""
+    image_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -405,6 +406,12 @@ def extract_message_content(
                                 data.get("emoji_package_id") or ""
                             ),
                             key=str(data.get("key") or ""),
+                            image_source=str(
+                                data.get("url")
+                                or data.get("path")
+                                or data.get("file")
+                                or ""
+                            ),
                         )
                     )
                     parts.append("[表情包]")
@@ -424,6 +431,12 @@ def extract_message_content(
                             data.get("emoji_package_id") or ""
                         ),
                         key=str(data.get("key") or ""),
+                        image_source=str(
+                            data.get("url")
+                            or data.get("path")
+                            or data.get("file")
+                            or ""
+                        ),
                     )
                 )
                 parts.append("[表情包]")
@@ -512,6 +525,11 @@ def extract_message_content(
                         "",
                     ),
                     key=parameters.get("key", ""),
+                    image_source=(
+                        parameters.get("url")
+                        or parameters.get("path")
+                        or parameters.get("file", "")
+                    ),
                 )
             )
             return "[表情包]"
@@ -532,6 +550,11 @@ def extract_message_content(
                 emoji_id=parameters.get("emoji_id", ""),
                 emoji_package_id=parameters.get("emoji_package_id", ""),
                 key=parameters.get("key", ""),
+                image_source=(
+                    parameters.get("url")
+                    or parameters.get("path")
+                    or parameters.get("file", "")
+                ),
             )
         )
         return "[表情包]"

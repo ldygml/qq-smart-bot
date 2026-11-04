@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
 import secrets
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,8 @@ import httpx
 import psutil
 import uvicorn
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from dotenv import dotenv_values
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -29,6 +34,8 @@ RUNTIME_ROOT = PROJECT_ROOT / ".runtime"
 CONTROL_DB = PROJECT_ROOT / "data" / "control.db"
 SESSION_COOKIE = "qq_control_session"
 SESSION_HOURS = 24
+BACKUP_MAGIC = b"QQBOTBK1"
+MAX_BACKUP_BYTES = 300 * 1024 * 1024
 
 
 def _control_key() -> bytes:
@@ -100,6 +107,212 @@ def _verify_password(password: str, stored: str) -> bool:
         )
     except (ValueError, TypeError):
         return False
+
+
+def encrypt_backup(payload: bytes, passphrase: str) -> bytes:
+    if len(passphrase) < 8:
+        raise ValueError("备份口令至少需要 8 个字符")
+    salt = secrets.token_bytes(16)
+    key = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=390_000,
+    ).derive(passphrase.encode("utf-8"))
+    token = Fernet(base64.urlsafe_b64encode(key)).encrypt(payload)
+    return BACKUP_MAGIC + salt + token
+
+
+def decrypt_backup(payload: bytes, passphrase: str) -> bytes:
+    if not payload.startswith(BACKUP_MAGIC) or len(payload) < 60:
+        raise ValueError("不是有效的机器人备份文件")
+    salt = payload[len(BACKUP_MAGIC) : len(BACKUP_MAGIC) + 16]
+    token = payload[len(BACKUP_MAGIC) + 16 :]
+    key = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=390_000,
+    ).derive(passphrase.encode("utf-8"))
+    try:
+        return Fernet(base64.urlsafe_b64encode(key)).decrypt(token)
+    except InvalidToken as exc:
+        raise ValueError("备份口令错误或文件已损坏") from exc
+
+
+def _sqlite_snapshot(path: Path) -> bytes:
+    if not path.is_file():
+        raise ValueError(f"数据库不存在：{path}")
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "snapshot.db"
+        source_connection = sqlite3.connect(path, timeout=20)
+        target_connection = sqlite3.connect(target)
+        try:
+            source_connection.backup(target_connection)
+            target_connection.commit()
+        finally:
+            target_connection.close()
+            source_connection.close()
+        return target.read_bytes()
+
+
+def _project_path(path_text: str, project_root: Path) -> Path:
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = project_root / path
+    resolved = path.resolve()
+    if not resolved.is_relative_to(project_root.resolve()):
+        raise ValueError(f"备份路径超出项目目录：{path_text}")
+    return resolved
+
+
+def build_encrypted_backup(
+    *,
+    instances: list[dict[str, Any]],
+    username: str,
+    passphrase: str,
+    project_root: Path = PROJECT_ROOT,
+    control_path: Path = CONTROL_DB,
+) -> bytes:
+    database_paths = [control_path]
+    for item in instances:
+        database_paths.append(
+            _project_path(str(item["database_path"]), project_root)
+        )
+    unique_paths = list(dict.fromkeys(path.resolve() for path in database_paths))
+    manifest: dict[str, Any] = {
+        "version": 1,
+        "created_at": _utc_now(),
+        "username": username,
+        "databases": [],
+        "files": [],
+    }
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(
+        archive_buffer,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+    ) as archive:
+        for index, path in enumerate(unique_paths):
+            archive_name = f"databases/{index}.db"
+            archive.writestr(archive_name, _sqlite_snapshot(path))
+            manifest_path = (
+                "__CONTROL_DB__"
+                if path == control_path.resolve()
+                else path.relative_to(project_root.resolve()).as_posix()
+            )
+            manifest["databases"].append(
+                {
+                    "archive": archive_name,
+                    "path": manifest_path,
+                }
+            )
+        optional_files = {
+            ".env": project_root / ".env",
+            ".runtime/control-master.key": (
+                project_root / ".runtime" / "control-master.key"
+            ),
+        }
+        for relative_name, path in optional_files.items():
+            if not path.is_file():
+                continue
+            archive_name = f"config/{relative_name.replace('/', '_')}"
+            archive.write(path, archive_name)
+            manifest["files"].append(
+                {
+                    "archive": archive_name,
+                    "path": relative_name,
+                }
+            )
+        archive.writestr(
+            "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+    return encrypt_backup(archive_buffer.getvalue(), passphrase)
+
+
+def restore_encrypted_backup(
+    *,
+    encrypted: bytes,
+    passphrase: str,
+    project_root: Path = PROJECT_ROOT,
+    control_path: Path = CONTROL_DB,
+) -> dict[str, Any]:
+    raw = decrypt_backup(encrypted, passphrase)
+    if len(raw) > MAX_BACKUP_BYTES:
+        raise ValueError("备份解压后体积过大")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("备份压缩包已损坏") from exc
+    with archive:
+        if sum(item.file_size for item in archive.infolist()) > MAX_BACKUP_BYTES:
+            raise ValueError("备份解压后体积过大")
+        try:
+            manifest = json.loads(archive.read("manifest.json"))
+        except (KeyError, json.JSONDecodeError) as exc:
+            raise ValueError("备份清单缺失或损坏") from exc
+        if not isinstance(manifest, dict) or manifest.get("version") != 1:
+            raise ValueError("不支持的备份版本")
+        safety_dir = (
+            project_root
+            / ".runtime"
+            / f"pre-restore-{datetime.now():%Y%m%d-%H%M%S}"
+        )
+        safety_dir.mkdir(parents=True, exist_ok=True)
+        restored: list[str] = []
+        for index, item in enumerate(manifest.get("databases") or []):
+            if not isinstance(item, dict):
+                continue
+            archive_name = str(item.get("archive") or "")
+            path_text = str(item.get("path") or "")
+            if not archive_name or not path_text:
+                continue
+            if path_text == "__CONTROL_DB__":
+                target = control_path.resolve()
+            else:
+                target = _project_path(path_text, project_root)
+            if target.is_file():
+                (safety_dir / f"database-{index}.db").write_bytes(
+                    _sqlite_snapshot(target)
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = target.with_name(
+                f".{target.name}.restore-{secrets.token_hex(4)}.tmp"
+            )
+            temp_path.write_bytes(archive.read(archive_name))
+            os.replace(temp_path, target)
+            try:
+                restored.append(
+                    str(target.relative_to(project_root.resolve()))
+                )
+            except ValueError:
+                restored.append("control.db")
+        for index, item in enumerate(manifest.get("files") or []):
+            if not isinstance(item, dict):
+                continue
+            archive_name = str(item.get("archive") or "")
+            relative_name = str(item.get("path") or "")
+            if not archive_name or not relative_name:
+                continue
+            target = _project_path(relative_name, project_root)
+            if target.is_file():
+                (safety_dir / f"config-{index}-{target.name}").write_bytes(
+                    target.read_bytes()
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = target.with_name(
+                f".{target.name}.restore-{secrets.token_hex(4)}.tmp"
+            )
+            temp_path.write_bytes(archive.read(archive_name))
+            os.replace(temp_path, target)
+            restored.append(relative_name)
+    return {
+        "restored": restored,
+        "safety_directory": str(safety_dir),
+        "created_at": manifest.get("created_at"),
+    }
 
 
 class ControlStore:
@@ -501,6 +714,14 @@ class InstancePayload(BaseModel):
 class AuthPayload(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     password: str = Field(min_length=8, max_length=200)
+
+
+class BackupPayload(BaseModel):
+    passphrase: str = Field(min_length=8, max_length=200)
+
+
+class RestorePayload(BackupPayload):
+    content_base64: str = Field(min_length=16)
 
 
 store = ControlStore()
@@ -907,6 +1128,81 @@ async def import_current(request: Request) -> dict[str, Any]:
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "instance": instance}
+
+
+@app.post("/api/backup")
+async def create_backup(
+    payload: BackupPayload,
+    request: Request,
+) -> Response:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    try:
+        data = build_encrypted_backup(
+            instances=[
+                dict(item)
+                for item in store.instances(int(user["id"]))
+            ],
+            username=str(user["username"]),
+            passphrase=payload.passphrase,
+            project_root=PROJECT_ROOT,
+            control_path=store.path,
+        )
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    file_name = f"qq-bot-backup-{datetime.now():%Y%m%d-%H%M%S}.qqbackup"
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{file_name}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/restore")
+async def restore_backup(
+    payload: RestorePayload,
+    request: Request,
+) -> dict[str, Any]:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    try:
+        encrypted = base64.b64decode(
+            payload.content_base64,
+            validate=True,
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="备份文件编码无效",
+        ) from exc
+    if len(encrypted) > MAX_BACKUP_BYTES:
+        raise HTTPException(status_code=413, detail="备份文件过大")
+    for item in store.instances(int(user["id"])):
+        try:
+            _stop_instance(int(item["id"]), int(user["id"]))
+        except (ValueError, OSError):
+            pass
+    try:
+        result = restore_encrypted_backup(
+            encrypted=encrypted,
+            passphrase=payload.passphrase,
+            project_root=PROJECT_ROOT,
+            control_path=store.path,
+        )
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        **result,
+        "relogin_required": True,
+        "note": (
+            "数据已恢复。若恢复包来自其他电脑，请重启控制台后重新登录，"
+            "并确认各实例的 NapCat 地址和端口。"
+        ),
+    }
 
 
 async def _instance_admin_json(

@@ -86,7 +86,8 @@ class SharedMemoryStore:
                     visibility TEXT NOT NULL
                         CHECK (visibility IN ('shareable', 'private')),
                     confidence REAL NOT NULL DEFAULT 0.5,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS shared_growth (
@@ -96,8 +97,34 @@ class SharedMemoryStore:
                     visibility TEXT NOT NULL
                         CHECK (visibility IN ('shareable', 'private')),
                     evidence_count INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS memory_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id INTEGER NOT NULL,
+                    subject_user_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    old_content TEXT NOT NULL DEFAULT '',
+                    new_content TEXT NOT NULL DEFAULT '',
+                    details TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_events_memory
+                ON memory_events (memory_id, id DESC);
+
+                CREATE TABLE IF NOT EXISTS memory_conflicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject_user_id INTEGER NOT NULL,
+                    old_memory_id INTEGER NOT NULL,
+                    new_memory_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    resolution TEXT NOT NULL DEFAULT 'newer_wins',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_conflicts_subject
+                ON memory_conflicts (subject_user_id, id DESC);
 
                 CREATE TABLE IF NOT EXISTS mind_state (
                     key TEXT PRIMARY KEY,
@@ -120,6 +147,21 @@ class SharedMemoryStore:
                 ON shared_episodes (id DESC);
                 CREATE INDEX IF NOT EXISTS idx_shared_episodes_speaker
                 ON shared_episodes (speaker_user_id, id DESC);
+
+                CREATE TABLE IF NOT EXISTS shared_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    group_id INTEGER,
+                    speaker_user_id INTEGER NOT NULL,
+                    speaker_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    processed INTEGER NOT NULL DEFAULT 0,
+                    replied INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_shared_observations_pending
+                ON shared_observations (processed, id ASC);
                 """
             )
             columns = {
@@ -145,6 +187,88 @@ class SharedMemoryStore:
                         f"ADD COLUMN {column} {definition}"
                     )
 
+            memory_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(shared_memories)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("category", "TEXT NOT NULL DEFAULT 'general'"),
+                ("fact_key", "TEXT NOT NULL DEFAULT ''"),
+                ("confidence", "REAL NOT NULL DEFAULT 0.7"),
+                ("source_episode_id", "INTEGER"),
+                ("source_observation_id", "INTEGER"),
+                ("status", "TEXT NOT NULL DEFAULT 'active'"),
+                ("superseded_by", "INTEGER"),
+                ("superseded_at", "TEXT"),
+            ):
+                if column not in memory_columns:
+                    connection.execute(
+                        f"ALTER TABLE shared_memories "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+
+            reflection_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(shared_reflections)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+                ("source_memory_ids", "TEXT NOT NULL DEFAULT '[]'"),
+                ("evidence_count", "INTEGER NOT NULL DEFAULT 1"),
+                ("status", "TEXT NOT NULL DEFAULT 'active'"),
+            ):
+                if column not in reflection_columns:
+                    connection.execute(
+                        f"ALTER TABLE shared_reflections "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                UPDATE shared_reflections
+                SET updated_at = created_at
+                WHERE updated_at = ''
+                """
+            )
+
+            growth_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(shared_growth)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
+                ("source_memory_ids", "TEXT NOT NULL DEFAULT '[]'"),
+            ):
+                if column not in growth_columns:
+                    connection.execute(
+                        f"ALTER TABLE shared_growth "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                UPDATE shared_growth
+                SET created_at = updated_at
+                WHERE created_at = ''
+                """
+            )
+
+            episode_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(shared_episodes)"
+                ).fetchall()
+            }
+            if "processed" not in episode_columns:
+                connection.execute(
+                    "ALTER TABLE shared_episodes "
+                    "ADD COLUMN processed INTEGER NOT NULL DEFAULT 0"
+                )
+
     def record_person(self, user_id: int, display_name: str) -> None:
         name = display_name.strip() or str(user_id)
         now = _utc_now()
@@ -169,6 +293,11 @@ class SharedMemoryStore:
         content: str,
         visibility: str,
         source_conversation: str,
+        category: str = "general",
+        fact_key: str = "",
+        confidence: float = 0.7,
+        source_episode_id: int | None = None,
+        source_observation_id: int | None = None,
     ) -> int | None:
         fact = content.strip()
         if not fact:
@@ -176,11 +305,14 @@ class SharedMemoryStore:
         normalized_visibility = (
             "private" if visibility == "private" else "shareable"
         )
+        normalized_category = _normalize_label(category, "general")
+        normalized_key = _normalize_label(fact_key, "")
+        normalized_confidence = min(1.0, max(0.0, float(confidence)))
         now = _utc_now()
         with self._lock, self._connect() as connection:
             existing = connection.execute(
                 """
-                SELECT id FROM shared_memories
+                SELECT id, content, status FROM shared_memories
                 WHERE subject_user_id = ? AND content = ?
                 LIMIT 1
                 """,
@@ -190,21 +322,47 @@ class SharedMemoryStore:
                 connection.execute(
                     """
                     UPDATE shared_memories
-                    SET visibility = ?, updated_at = ?
+                    SET visibility = ?, category = ?, fact_key = ?,
+                        confidence = MAX(confidence, ?), updated_at = ?,
+                        status = 'active', superseded_by = NULL,
+                        superseded_at = NULL
                     WHERE id = ?
                     """,
-                    (normalized_visibility, now, int(existing["id"])),
+                    (
+                        normalized_visibility,
+                        normalized_category,
+                        normalized_key,
+                        normalized_confidence,
+                        now,
+                        int(existing["id"]),
+                    ),
                 )
                 return int(existing["id"])
+
+            conflicted: sqlite3.Row | None = None
+            if normalized_key:
+                conflicted = connection.execute(
+                    """
+                    SELECT id, content
+                    FROM shared_memories
+                    WHERE subject_user_id = ? AND category = ?
+                      AND fact_key = ? AND status = 'active'
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (subject_user_id, normalized_category, normalized_key),
+                ).fetchone()
 
             cursor = connection.execute(
                 """
                 INSERT INTO shared_memories
                     (
                         subject_user_id, subject_name, content, visibility,
-                        source_conversation, created_at, updated_at
+                        source_conversation, created_at, updated_at,
+                        category, fact_key, confidence, source_episode_id,
+                        source_observation_id, status
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
                 """,
                 (
                     subject_user_id,
@@ -214,9 +372,70 @@ class SharedMemoryStore:
                     source_conversation,
                     now,
                     now,
+                    normalized_category,
+                    normalized_key,
+                    normalized_confidence,
+                    source_episode_id,
+                    source_observation_id,
                 ),
             )
-            return int(cursor.lastrowid)
+            memory_id = int(cursor.lastrowid)
+            if conflicted is not None:
+                old_memory_id = int(conflicted["id"])
+                connection.execute(
+                    """
+                    UPDATE shared_memories
+                    SET status = 'superseded', superseded_by = ?,
+                        superseded_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (memory_id, now, now, old_memory_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO memory_conflicts
+                        (
+                            subject_user_id, old_memory_id, new_memory_id,
+                            reason, resolution, created_at
+                        )
+                    VALUES (?, ?, ?, ?, 'newer_wins', ?)
+                    """,
+                    (
+                        subject_user_id,
+                        old_memory_id,
+                        memory_id,
+                        f"同一主题“{normalized_key}”出现了更新后的说法",
+                        now,
+                    ),
+                )
+                self._record_memory_event(
+                    connection,
+                    memory_id=old_memory_id,
+                    subject_user_id=subject_user_id,
+                    event_type="superseded",
+                    old_content=str(conflicted["content"]),
+                    new_content=fact,
+                    details=f"由记忆 #{memory_id} 取代",
+                    created_at=now,
+                )
+            self._record_memory_event(
+                connection,
+                memory_id=memory_id,
+                subject_user_id=subject_user_id,
+                event_type="created",
+                old_content="",
+                new_content=fact,
+                details=(
+                    f"来源会话：{source_conversation}"
+                    + (
+                        f"；来源片段：#{source_episode_id}"
+                        if source_episode_id is not None
+                        else ""
+                    )
+                ),
+                created_at=now,
+            )
+            return memory_id
 
     def mentioned_people(self, text: str) -> list[tuple[int, str]]:
         with self._lock, self._connect() as connection:
@@ -328,7 +547,7 @@ class SharedMemoryStore:
                 """
                 SELECT id, subject_user_id, subject_name, content, visibility
                 FROM shared_memories
-                WHERE subject_user_id = ?
+                WHERE subject_user_id = ? AND status = 'active'
                 ORDER BY updated_at DESC, id DESC
                 LIMIT 6
                 """,
@@ -345,6 +564,7 @@ class SharedMemoryStore:
                     SELECT id, subject_user_id, subject_name, content, visibility
                     FROM shared_memories
                     WHERE subject_user_id IN ({placeholders})
+                      AND status = 'active'
                       AND (visibility = 'shareable' OR ? = 1)
                     ORDER BY updated_at DESC, id DESC
                     LIMIT 8
@@ -358,7 +578,8 @@ class SharedMemoryStore:
                 """
                 SELECT id, subject_user_id, subject_name, content, visibility
                 FROM shared_memories
-                WHERE visibility = 'shareable' OR ? = 1
+                WHERE status = 'active'
+                  AND (visibility = 'shareable' OR ? = 1)
                 ORDER BY updated_at DESC, id DESC
                 LIMIT 6
                 """,
@@ -439,15 +660,47 @@ class SharedMemoryStore:
                     f"- [{context_label}] {row['speaker_name']}：{user_preview}；"
                     f"你当时回复：{bot_preview}"
                 )
+        with self._lock, self._connect() as connection:
+            observation_rows = connection.execute(
+                """
+                SELECT conversation_id, message_type, group_id,
+                       speaker_user_id, speaker_name, content
+                FROM shared_observations
+                WHERE replied = 0 AND conversation_id != ?
+                  AND (speaker_user_id = ? OR ? = 1)
+                ORDER BY id DESC
+                LIMIT 6
+                """,
+                (
+                    current_conversation_id,
+                    current_user_id,
+                    1 if include_private else 0,
+                ),
+            ).fetchall()
+        if observation_rows:
+            lines.append("最近未回复的其他群聊消息（只在相关时参考）：")
+            for row in observation_rows:
+                context_label = (
+                    f"群 {row['group_id']}"
+                    if row["message_type"] == "group"
+                    else "私聊"
+                )
+                content = str(row["content"]).replace("\n", " ")[:220]
+                lines.append(
+                    f"- [{context_label}] {row['speaker_name']}：{content}"
+                )
         return "\n".join(lines)
 
     def list_memories(self, user_id: int) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, content, visibility, updated_at
+                SELECT id, subject_user_id, subject_name, content, visibility,
+                       category, fact_key, confidence, source_conversation,
+                       source_episode_id, status, superseded_by,
+                       created_at, updated_at, superseded_at
                 FROM shared_memories
-                WHERE subject_user_id = ?
+                WHERE subject_user_id = ? AND status = 'active'
                 ORDER BY updated_at DESC, id DESC
                 LIMIT 50
                 """,
@@ -459,15 +712,301 @@ class SharedMemoryStore:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, subject_user_id, subject_name, content, visibility
+                SELECT id, subject_user_id, subject_name, content, visibility,
+                       category, fact_key, confidence, source_conversation,
+                       source_episode_id, status, created_at, updated_at
                 FROM shared_memories
-                WHERE id > ?
+                WHERE id > ? AND status IN ('active', 'superseded')
                 ORDER BY id ASC
                 LIMIT ?
                 """,
                 (memory_id, max(1, limit)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def recent_active_memories(self, limit: int = 60) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, subject_user_id, subject_name, content, visibility,
+                       category, fact_key, confidence, source_conversation,
+                       source_episode_id, status, created_at, updated_at
+                FROM shared_memories
+                WHERE status = 'active'
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def episodes_since(
+        self,
+        episode_id: int,
+        *,
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, conversation_id, message_type, group_id,
+                       speaker_user_id, speaker_name, user_content,
+                       assistant_content, created_at
+                FROM shared_episodes
+                WHERE id > ? AND processed = 0
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (episode_id, max(1, limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def memory_timeline(
+        self,
+        user_id: int | None = None,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            if user_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT m.*,
+                           COALESCE(e.user_content, o.content) AS source_text,
+                           COALESCE(e.assistant_content, '') AS source_reply,
+                           COALESCE(e.created_at, o.created_at)
+                               AS source_created_at,
+                           (
+                               SELECT COUNT(*) FROM memory_conflicts c
+                               WHERE c.old_memory_id = m.id
+                                  OR c.new_memory_id = m.id
+                           ) AS conflict_count
+                    FROM shared_memories m
+                    LEFT JOIN shared_episodes e
+                      ON e.id = m.source_episode_id
+                    LEFT JOIN shared_observations o
+                      ON o.id = m.source_observation_id
+                    ORDER BY m.created_at DESC, m.id DESC
+                    LIMIT ?
+                    """,
+                    (max(1, limit),),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT m.*,
+                           COALESCE(e.user_content, o.content) AS source_text,
+                           COALESCE(e.assistant_content, '') AS source_reply,
+                           COALESCE(e.created_at, o.created_at)
+                               AS source_created_at,
+                           (
+                               SELECT COUNT(*) FROM memory_conflicts c
+                               WHERE c.old_memory_id = m.id
+                                  OR c.new_memory_id = m.id
+                           ) AS conflict_count
+                    FROM shared_memories m
+                    LEFT JOIN shared_episodes e
+                      ON e.id = m.source_episode_id
+                    LEFT JOIN shared_observations o
+                      ON o.id = m.source_observation_id
+                    WHERE m.subject_user_id = ?
+                    ORDER BY m.created_at DESC, m.id DESC
+                    LIMIT ?
+                    """,
+                    (user_id, max(1, limit)),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_conflicts(
+        self,
+        *,
+        user_id: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE c.subject_user_id = ?" if user_id is not None else ""
+        parameters: list[Any] = [user_id] if user_id is not None else []
+        parameters.append(max(1, limit))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT c.id, c.subject_user_id, c.old_memory_id,
+                       c.new_memory_id, c.reason, c.resolution,
+                       c.created_at, p.display_name,
+                       old.content AS old_content,
+                       new.content AS new_content,
+                       old.fact_key AS fact_key
+                FROM memory_conflicts c
+                LEFT JOIN shared_people p ON p.user_id = c.subject_user_id
+                LEFT JOIN shared_memories old ON old.id = c.old_memory_id
+                LEFT JOIN shared_memories new ON new.id = c.new_memory_id
+                {where}
+                ORDER BY c.id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def superseded_ids_for(self, memory_id: int) -> list[int]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT old_memory_id FROM memory_conflicts
+                WHERE new_memory_id = ?
+                ORDER BY id ASC
+                """,
+                (memory_id,),
+            ).fetchall()
+        return [int(row["old_memory_id"]) for row in rows]
+
+    def update_memory(
+        self,
+        memory_id: int,
+        *,
+        user_id: int | None = None,
+        content: str | None = None,
+        visibility: str | None = None,
+        category: str | None = None,
+        fact_key: str | None = None,
+    ) -> bool:
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            parameters: list[Any] = [memory_id]
+            owner_clause = ""
+            if user_id is not None:
+                owner_clause = " AND subject_user_id = ?"
+                parameters.append(user_id)
+            row = connection.execute(
+                f"""
+                SELECT * FROM shared_memories
+                WHERE id = ?{owner_clause}
+                """,
+                parameters,
+            ).fetchone()
+            if row is None:
+                return False
+            updated_content = (
+                content.strip() if content is not None else str(row["content"])
+            )
+            if not updated_content:
+                return False
+            normalized_visibility = (
+                "private"
+                if visibility == "private"
+                else (
+                    "shareable"
+                    if visibility == "shareable"
+                    else str(row["visibility"])
+                )
+            )
+            connection.execute(
+                """
+                UPDATE shared_memories
+                SET content = ?, visibility = ?, category = ?, fact_key = ?,
+                    updated_at = ?, status = 'active'
+                WHERE id = ?
+                """,
+                (
+                    updated_content,
+                    normalized_visibility,
+                    (
+                        _normalize_label(category, str(row["category"]))
+                        if category is not None
+                        else str(row["category"])
+                    ),
+                    (
+                        _normalize_label(fact_key, "")
+                        if fact_key is not None
+                        else str(row["fact_key"])
+                    ),
+                    now,
+                    memory_id,
+                ),
+            )
+            if updated_content != str(row["content"]):
+                self._record_memory_event(
+                    connection,
+                    memory_id=memory_id,
+                    subject_user_id=int(row["subject_user_id"]),
+                    event_type="edited",
+                    old_content=str(row["content"]),
+                    new_content=updated_content,
+                    details="管理员手动编辑",
+                    created_at=now,
+                )
+            return True
+
+    def merge_memories(
+        self,
+        *,
+        user_id: int,
+        primary_memory_id: int,
+        secondary_memory_id: int,
+        content: str = "",
+    ) -> int | None:
+        if primary_memory_id == secondary_memory_id:
+            return None
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM shared_memories
+                WHERE subject_user_id = ? AND id IN (?, ?)
+                """,
+                (user_id, primary_memory_id, secondary_memory_id),
+            ).fetchall()
+            by_id = {int(row["id"]): row for row in rows}
+            primary = by_id.get(primary_memory_id)
+            secondary = by_id.get(secondary_memory_id)
+            if primary is None or secondary is None:
+                return None
+            merged_content = content.strip() or (
+                f"{str(primary['content']).rstrip('。')}；"
+                f"{str(secondary['content']).lstrip('。')}"
+            )
+            connection.execute(
+                """
+                UPDATE shared_memories
+                SET content = ?, updated_at = ?, status = 'active'
+                WHERE id = ?
+                """,
+                (merged_content, now, primary_memory_id),
+            )
+            connection.execute(
+                """
+                UPDATE shared_memories
+                SET status = 'merged', superseded_by = ?,
+                    superseded_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    primary_memory_id,
+                    now,
+                    now,
+                    secondary_memory_id,
+                ),
+            )
+            self._record_memory_event(
+                connection,
+                memory_id=primary_memory_id,
+                subject_user_id=user_id,
+                event_type="merged",
+                old_content=str(primary["content"]),
+                new_content=merged_content,
+                details=f"合并记忆 #{secondary_memory_id}",
+                created_at=now,
+            )
+            self._record_memory_event(
+                connection,
+                memory_id=secondary_memory_id,
+                subject_user_id=user_id,
+                event_type="merged_into",
+                old_content=str(secondary["content"]),
+                new_content=merged_content,
+                details=f"并入记忆 #{primary_memory_id}",
+                created_at=now,
+            )
+        return primary_memory_id
 
     def add_episode(
         self,
@@ -479,6 +1018,7 @@ class SharedMemoryStore:
         speaker_name: str,
         user_content: str,
         assistant_content: str,
+        processed: bool = False,
     ) -> int:
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
@@ -487,9 +1027,9 @@ class SharedMemoryStore:
                     (
                         conversation_id, message_type, group_id,
                         speaker_user_id, speaker_name, user_content,
-                        assistant_content, created_at
+                        assistant_content, created_at, processed
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation_id,
@@ -500,9 +1040,90 @@ class SharedMemoryStore:
                     user_content.strip(),
                     assistant_content.strip(),
                     _utc_now(),
+                    1 if processed else 0,
                 ),
             )
             return int(cursor.lastrowid)
+
+    def observe_message(
+        self,
+        *,
+        conversation_id: str,
+        message_type: str,
+        group_id: int | None,
+        speaker_user_id: int,
+        speaker_name: str,
+        content: str,
+    ) -> int:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO shared_observations
+                    (
+                        conversation_id, message_type, group_id,
+                        speaker_user_id, speaker_name, content, created_at
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    message_type,
+                    group_id,
+                    speaker_user_id,
+                    speaker_name,
+                    content.strip(),
+                    _utc_now(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def observations_since(
+        self,
+        observation_id: int,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, conversation_id, message_type, group_id,
+                       speaker_user_id, speaker_name, content, created_at
+                FROM shared_observations
+                WHERE id > ? AND processed = 0
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (observation_id, max(1, limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_observation(
+        self,
+        observation_id: int,
+        *,
+        processed: bool,
+        replied: bool,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE shared_observations
+                SET processed = MAX(processed, ?), replied = MAX(replied, ?)
+                WHERE id = ?
+                """,
+                (
+                    1 if processed else 0,
+                    1 if replied else 0,
+                    observation_id,
+                ),
+            )
+
+    def mark_episode_processed(self, episode_id: int) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE shared_episodes SET processed = 1 WHERE id = ?",
+                (episode_id,),
+            )
 
     def add_reflection(
         self,
@@ -510,6 +1131,8 @@ class SharedMemoryStore:
         content: str,
         visibility: str,
         confidence: float,
+        source_memory_ids: list[int] | None = None,
+        supersedes_id: int | None = None,
     ) -> int | None:
         fact = content.strip()
         if not fact:
@@ -518,7 +1141,33 @@ class SharedMemoryStore:
             "private" if visibility == "private" else "shareable"
         )
         score = min(1.0, max(0.0, float(confidence)))
+        now = _utc_now()
+        source_json = json.dumps(
+            sorted(set(source_memory_ids or [])),
+            ensure_ascii=False,
+        )
         with self._lock, self._connect() as connection:
+            if supersedes_id is not None:
+                updated = connection.execute(
+                    """
+                    UPDATE shared_reflections
+                    SET content = ?, confidence = ?, visibility = ?,
+                        updated_at = ?, source_memory_ids = ?,
+                        evidence_count = evidence_count + 1,
+                        status = 'active'
+                    WHERE id = ?
+                    """,
+                    (
+                        fact,
+                        score,
+                        normalized_visibility,
+                        now,
+                        source_json,
+                        supersedes_id,
+                    ),
+                )
+                if updated.rowcount:
+                    return supersedes_id
             existing = connection.execute(
                 "SELECT id FROM shared_reflections WHERE content = ? LIMIT 1",
                 (fact,),
@@ -527,19 +1176,38 @@ class SharedMemoryStore:
                 connection.execute(
                     """
                     UPDATE shared_reflections
-                    SET confidence = MAX(confidence, ?), visibility = ?
+                    SET confidence = MAX(confidence, ?), visibility = ?,
+                        updated_at = ?, source_memory_ids = ?,
+                        evidence_count = evidence_count + 1,
+                        status = 'active'
                     WHERE id = ?
                     """,
-                    (score, normalized_visibility, int(existing["id"])),
+                    (
+                        score,
+                        normalized_visibility,
+                        now,
+                        source_json,
+                        int(existing["id"]),
+                    ),
                 )
                 return int(existing["id"])
             cursor = connection.execute(
                 """
                 INSERT INTO shared_reflections
-                    (content, visibility, confidence, created_at)
-                VALUES (?, ?, ?, ?)
+                    (
+                        content, visibility, confidence, created_at,
+                        updated_at, source_memory_ids, evidence_count, status
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, 1, 'active')
                 """,
-                (fact, normalized_visibility, score, _utc_now()),
+                (
+                    fact,
+                    normalized_visibility,
+                    score,
+                    now,
+                    now,
+                    source_json,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -549,6 +1217,8 @@ class SharedMemoryStore:
         aspect: str,
         content: str,
         visibility: str,
+        source_memory_ids: list[int] | None = None,
+        supersedes_id: int | None = None,
     ) -> int | None:
         value = content.strip()
         if not value:
@@ -558,33 +1228,78 @@ class SharedMemoryStore:
         )
         normalized_aspect = aspect.strip() or "general"
         now = _utc_now()
+        source_json = json.dumps(
+            sorted(set(source_memory_ids or [])),
+            ensure_ascii=False,
+        )
         with self._lock, self._connect() as connection:
+            if supersedes_id is not None:
+                updated = connection.execute(
+                    """
+                    UPDATE shared_growth
+                    SET aspect = ?, content = ?, visibility = ?,
+                        updated_at = ?, source_memory_ids = ?,
+                        evidence_count = evidence_count + 1
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized_aspect,
+                        value,
+                        normalized_visibility,
+                        now,
+                        source_json,
+                        supersedes_id,
+                    ),
+                )
+                if updated.rowcount:
+                    return supersedes_id
             existing = connection.execute(
                 """
-                SELECT id FROM shared_growth
-                WHERE aspect = ? AND content = ?
+                SELECT id, content FROM shared_growth
+                WHERE aspect = ?
+                  AND (content = ? OR content LIKE ?)
                 LIMIT 1
                 """,
-                (normalized_aspect, value),
+                (
+                    normalized_aspect,
+                    value,
+                    f"%{value[:min(24, len(value))]}%",
+                ),
             ).fetchone()
             if existing:
                 connection.execute(
                     """
                     UPDATE shared_growth
-                    SET evidence_count = evidence_count + 1,
-                        visibility = ?, updated_at = ?
+                    SET content = ?, evidence_count = evidence_count + 1,
+                        visibility = ?, source_memory_ids = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (normalized_visibility, now, int(existing["id"])),
+                    (
+                        value,
+                        normalized_visibility,
+                        source_json,
+                        now,
+                        int(existing["id"]),
+                    ),
                 )
                 return int(existing["id"])
             cursor = connection.execute(
                 """
                 INSERT INTO shared_growth
-                    (aspect, content, visibility, evidence_count, updated_at)
-                VALUES (?, ?, ?, 1, ?)
+                    (
+                        aspect, content, visibility, evidence_count,
+                        created_at, updated_at, source_memory_ids
+                    )
+                VALUES (?, ?, ?, 1, ?, ?, ?)
                 """,
-                (normalized_aspect, value, normalized_visibility, now),
+                (
+                    normalized_aspect,
+                    value,
+                    normalized_visibility,
+                    now,
+                    now,
+                    source_json,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -596,9 +1311,11 @@ class SharedMemoryStore:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT content, confidence, created_at
+                SELECT id, content, visibility, confidence, created_at,
+                       updated_at, evidence_count, status, source_memory_ids
                 FROM shared_reflections
-                WHERE visibility = 'shareable' OR ? = 1
+                WHERE status = 'active'
+                  AND (visibility = 'shareable' OR ? = 1)
                 ORDER BY confidence DESC, created_at DESC
                 LIMIT ?
                 """,
@@ -614,7 +1331,8 @@ class SharedMemoryStore:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT aspect, content, evidence_count, updated_at
+                SELECT id, aspect, content, visibility, evidence_count,
+                       created_at, updated_at, source_memory_ids
                 FROM shared_growth
                 WHERE visibility = 'shareable' OR ? = 1
                 ORDER BY evidence_count DESC, updated_at DESC
@@ -623,6 +1341,94 @@ class SharedMemoryStore:
                 (1 if include_private else 0, max(1, limit)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def update_reflection(
+        self,
+        reflection_id: int,
+        *,
+        content: str,
+        visibility: str,
+        confidence: float | None = None,
+    ) -> bool:
+        value = content.strip()
+        if not value:
+            return False
+        with self._lock, self._connect() as connection:
+            if confidence is None:
+                cursor = connection.execute(
+                    """
+                    UPDATE shared_reflections
+                    SET content = ?, visibility = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        value,
+                        "private" if visibility == "private" else "shareable",
+                        _utc_now(),
+                        reflection_id,
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE shared_reflections
+                    SET content = ?, visibility = ?, confidence = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        value,
+                        "private" if visibility == "private" else "shareable",
+                        min(1.0, max(0.0, float(confidence))),
+                        _utc_now(),
+                        reflection_id,
+                    ),
+                )
+            return cursor.rowcount > 0
+
+    def update_growth(
+        self,
+        growth_id: int,
+        *,
+        aspect: str,
+        content: str,
+        visibility: str,
+    ) -> bool:
+        value = content.strip()
+        if not value:
+            return False
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE shared_growth
+                SET aspect = ?, content = ?, visibility = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    aspect.strip() or "general",
+                    value,
+                    "private" if visibility == "private" else "shareable",
+                    _utc_now(),
+                    growth_id,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def delete_reflection(self, reflection_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM shared_reflections WHERE id = ?",
+                (reflection_id,),
+            )
+            return cursor.rowcount > 0
+
+    def delete_growth(self, growth_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM shared_growth WHERE id = ?",
+                (growth_id,),
+            )
+            return cursor.rowcount > 0
 
     def get_state(self, key: str, default: str = "") -> str:
         with self._lock, self._connect() as connection:
@@ -647,6 +1453,25 @@ class SharedMemoryStore:
 
     def delete_memory(self, user_id: int, memory_id: int) -> bool:
         with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT content FROM shared_memories
+                WHERE id = ? AND subject_user_id = ?
+                """,
+                (memory_id, user_id),
+            ).fetchone()
+            if row is None:
+                return False
+            self._record_memory_event(
+                connection,
+                memory_id=memory_id,
+                subject_user_id=user_id,
+                event_type="deleted",
+                old_content=str(row["content"]),
+                new_content="",
+                details="管理员或用户删除",
+                created_at=_utc_now(),
+            )
             cursor = connection.execute(
                 """
                 DELETE FROM shared_memories
@@ -666,6 +1491,14 @@ class SharedMemoryStore:
                 "DELETE FROM shared_people WHERE user_id = ?",
                 (user_id,),
             )
+            connection.execute(
+                "DELETE FROM memory_conflicts WHERE subject_user_id = ?",
+                (user_id,),
+            )
+            connection.execute(
+                "DELETE FROM memory_events WHERE subject_user_id = ?",
+                (user_id,),
+            )
             return cursor.rowcount
 
     def stats(self) -> dict[str, int]:
@@ -677,12 +1510,45 @@ class SharedMemoryStore:
                 ("episodes", "shared_episodes"),
                 ("reflections", "shared_reflections"),
                 ("growth", "shared_growth"),
+                ("conflicts", "memory_conflicts"),
             ):
                 row = connection.execute(
                     f"SELECT COUNT(*) AS total FROM {table}"
                 ).fetchone()
                 counts[name] = int(row["total"]) if row else 0
         return counts
+
+    @staticmethod
+    def _record_memory_event(
+        connection: sqlite3.Connection,
+        *,
+        memory_id: int,
+        subject_user_id: int,
+        event_type: str,
+        old_content: str,
+        new_content: str,
+        details: str,
+        created_at: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO memory_events
+                (
+                    memory_id, subject_user_id, event_type, old_content,
+                    new_content, details, created_at
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory_id,
+                subject_user_id,
+                event_type,
+                old_content,
+                new_content,
+                details,
+                created_at,
+            ),
+        )
 
 
 class MemoryChatClient(Protocol):
@@ -699,6 +1565,9 @@ class MemoryChatClient(Protocol):
 class MemoryCandidate:
     content: str
     visibility: str
+    category: str = "general"
+    fact_key: str = ""
+    confidence: float = 0.7
 
 
 @dataclass(frozen=True)
@@ -712,6 +1581,7 @@ class ReflectionCandidate:
     content: str
     visibility: str
     confidence: float
+    supersedes_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -719,6 +1589,7 @@ class GrowthCandidate:
     aspect: str
     content: str
     visibility: str
+    supersedes_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -784,11 +1655,22 @@ async def extract_memory_candidates(
 ) -> list[MemoryCandidate]:
     prompt = (
         "你是长期记忆整理器。只从当前发言中提取以后仍有用、且不是临时闲聊的事实。"
-        "最多三条，每条独立、简短、不得推测。"
+        "最多五条，每条独立、简短、不得推测。"
+        "必须判断事实类型 category，仅使用以下值："
+        "preference（偏好）、commitment（承诺或约定）、relationship（关系变化）、"
+        "project（长期项目）、profile（稳定个人信息）、event（重要事件）、"
+        "general（其他长期事实）。"
+        "fact_key 是同一主题的稳定中文名，例如“居住城市”“正在做的项目”"
+        "“周末安排”“对某人的关系”；同一主题以后发生变化时必须沿用相同 fact_key。"
         "偏好、长期计划、关系、重要事件可记为 shareable；"
         "健康、财务、秘密、私人冲突、敏感身份信息记为 private。"
+        "不要仅凭“我是某明星/某球员”、玩笑、角色扮演、假设、反问、"
+        "玩梗或临时称呼提取稳定身份；必须结合明确语境。"
+        "承诺必须是明确答应或计划执行的事情，不能把客套话当成承诺。"
         "证据不足时返回空数组。\n"
-        '只返回 JSON：{"memories":[{"content":"事实","visibility":"shareable"}]}\n'
+        "只返回 JSON："
+        '{"memories":[{"content":"事实","visibility":"shareable",'
+        '"category":"preference","fact_key":"主题","confidence":0.8}]}\n'
         f"发言人：{speaker_name}（QQ {speaker_id}）\n"
         f"发言：{user_message}"
     )
@@ -815,6 +1697,7 @@ async def reflect_on_memories(
     model: str,
     memories: list[dict[str, Any]],
     existing_growth: list[dict[str, Any]],
+    existing_reflections: list[dict[str, Any]] | None = None,
     allow_private_sharing: bool = False,
 ) -> ReflectionResult:
     common_terms = detect_common_terms(memories)
@@ -827,7 +1710,18 @@ async def reflect_on_memories(
         for item in memories
     ]
     growth_lines = [
-        f"- {item.get('content', '')}" for item in existing_growth
+        (
+            f"- 编号 {item.get('id', '?')}；方面：{item.get('aspect', '')}；"
+            f"内容：{item.get('content', '')}"
+        )
+        for item in existing_growth
+    ]
+    reflection_lines = [
+        (
+            f"- 编号 {item.get('id', '?')}；"
+            f"内容：{item.get('content', '')}"
+        )
+        for item in (existing_reflections or [])
     ]
     sharing_rule = (
         "当前是完整共享模式：private 材料也可以整理为 shareable 关联和成长笔记，"
@@ -847,6 +1741,9 @@ async def reflect_on_memories(
         "只要两条或更多 shareable 记忆共同提到同一地点、项目、兴趣或事件，"
         "就必须输出至少一条关联，并用“可能”“看起来”表达推测，不能返回空数组。"
         "如果关联只是短期巧合，降低置信度，但不要因为它不完美而完全回避。"
+        "如果新证据推翻了某条旧反思，沿用旧反思的编号并在输出项写 "
+        "supersedes_id；如果旧成长笔记已经过时，也写对应的 supersedes_id。"
+        "不要创建与已有内容仅措辞不同的重复项。"
         "严禁无依据猜测；不要把推测写成已确认事实。"
         "系统已经从可共享记忆中检测到以下共同主题候选，"
         "请优先判断它们是否构成有意义的关联："
@@ -857,11 +1754,14 @@ async def reflect_on_memories(
         "输出对象必须包含 reflections 和 growth 两个数组。"
         "reflections 项使用 content、visibility、confidence 字段；"
         "growth 项使用 aspect、content、visibility 字段。"
+        "可选的 supersedes_id 必须是下面已有记录的真实编号。"
         "字段值必须来自本次真实分析，不能使用占位符。\n\n"
         "新记忆：\n"
         + ("\n".join(memory_lines) or "无")
         + "\n\n已有成长笔记：\n"
         + ("\n".join(growth_lines) or "无")
+        + "\n\n已有反思：\n"
+        + ("\n".join(reflection_lines) or "无")
     )
     reply = await chat_client.chat(
         [
@@ -980,7 +1880,10 @@ def _parse_memory_candidates(reply: str) -> list[MemoryCandidate]:
     if not isinstance(memories, list):
         return []
     result: list[MemoryCandidate] = []
-    for item in memories[:3]:
+    for item in memories[:5]:
+        category = "general"
+        fact_key = ""
+        confidence = 0.7
         if isinstance(item, str):
             content = item
             visibility = "private"
@@ -989,11 +1892,25 @@ def _parse_memory_candidates(reply: str) -> list[MemoryCandidate]:
             visibility = (
                 "private" if item.get("visibility") == "private" else "shareable"
             )
+            category = str(item.get("category") or "general").strip()
+            fact_key = str(item.get("fact_key") or "").strip()
+            try:
+                confidence = float(item.get("confidence", 0.7))
+            except (TypeError, ValueError):
+                confidence = 0.7
         else:
             continue
         if not isinstance(content, str) or not content.strip():
             continue
-        result.append(MemoryCandidate(content.strip(), visibility))
+        result.append(
+            MemoryCandidate(
+                content.strip(),
+                visibility,
+                category,
+                fact_key,
+                min(1.0, max(0.0, confidence)),
+            )
+        )
     return result
 
 
@@ -1057,6 +1974,7 @@ def _parse_reflection_result(reply: str) -> ReflectionResult:
                 confidence = float(item.get("confidence", 0.5))
             except (TypeError, ValueError):
                 confidence = 0.5
+            supersedes_id = _parse_optional_id(item.get("supersedes_id"))
             reflections.append(
                 ReflectionCandidate(
                     content=content.strip(),
@@ -1066,6 +1984,7 @@ def _parse_reflection_result(reply: str) -> ReflectionResult:
                         else "shareable"
                     ),
                     confidence=min(1.0, max(0.0, confidence)),
+                    supersedes_id=supersedes_id,
                 )
             )
 
@@ -1087,9 +2006,25 @@ def _parse_reflection_result(reply: str) -> ReflectionResult:
                         if item.get("visibility") == "private"
                         else "shareable"
                     ),
+                    supersedes_id=_parse_optional_id(
+                        item.get("supersedes_id")
+                    ),
                 )
             )
     return ReflectionResult(reflections, growth)
+
+
+def _normalize_label(value: str, default: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return normalized[:80] or default
+
+
+def _parse_optional_id(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _utc_now() -> str:
