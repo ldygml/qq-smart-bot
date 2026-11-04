@@ -11,11 +11,14 @@ from pydantic import SecretStr
 from qq_ai_bot.app import create_app
 from qq_ai_bot.audio import LoadedAudio
 from qq_ai_bot.config import Settings
-from qq_ai_bot.files import ParsedDocument
+from qq_ai_bot.files import DocumentSection, ParsedDocument
 from qq_ai_bot.memory import ChatMemory
-from qq_ai_bot.onebot import ReplyTarget
+from qq_ai_bot.onebot import ReplyTarget, StickerSource
 from qq_ai_bot.productivity import ProductivityStore
 from qq_ai_bot.shared_memory import SharedMemoryStore
+from qq_ai_bot.stickers import StickerStore
+from qq_ai_bot.vector_memory import VectorMemoryStore
+from qq_ai_bot.web_reader import WebArticle
 
 
 class FakeChatClient:
@@ -46,6 +49,10 @@ class FakeOneBotClient:
         self.sent: list[tuple[ReplyTarget, str]] = []
         self.poked: list[ReplyTarget] = []
         self.quoted_sender_id: int | None = 999
+        self.images: list[tuple[ReplyTarget, str]] = []
+        self.records: list[tuple[ReplyTarget, str]] = []
+        self.stickers: list[tuple[ReplyTarget, StickerSource]] = []
+        self.files: list[tuple[ReplyTarget, str, str]] = []
 
     async def send_text(self, target: ReplyTarget, text: str) -> None:
         self.sent.append((target, text))
@@ -55,6 +62,28 @@ class FakeOneBotClient:
 
     async def get_msg_sender_id(self, message_id: int | str) -> int | None:
         return self.quoted_sender_id
+
+    async def send_image(self, target: ReplyTarget, image: str) -> None:
+        self.images.append((target, image))
+
+    async def send_record(self, target: ReplyTarget, record: str) -> None:
+        self.records.append((target, record))
+
+    async def send_sticker(
+        self,
+        target: ReplyTarget,
+        sticker: StickerSource,
+    ) -> None:
+        self.stickers.append((target, sticker))
+
+    async def upload_file(
+        self,
+        target: ReplyTarget,
+        *,
+        path: str,
+        name: str,
+    ) -> None:
+        self.files.append((target, path, name))
 
     async def close(self) -> None:
         return None
@@ -97,6 +126,34 @@ class FakeAudioLoader:
         return None
 
 
+class FakeTTS:
+    async def synthesize(self, text: str) -> str:
+        return "https://example.com/tts.wav"
+
+    async def close(self) -> None:
+        return None
+
+
+class FakeWebReader:
+    async def read(self, url: str) -> WebArticle:
+        return WebArticle(
+            url=url,
+            title="测试文章",
+            text="这是网页正文。核心观点是测试网页阅读功能。",
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+class FakeEmbeddingClient:
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0, 0.0] for _ in texts]
+
+    async def close(self) -> None:
+        return None
+
+
 class VerboseThenConciseChatClient(FakeChatClient):
     async def chat(
         self,
@@ -124,6 +181,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
         "database_path": tmp_path / "bot.db",
         "private_allowlist": "",
         "enable_group": False,
+        "vector_memory_enabled": False,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -945,6 +1003,221 @@ async def test_group_can_remember_what_was_said_in_another_group(tmp_path) -> No
     assert any(
         "我周末去看利物浦的比赛" in prompt for prompt in system_prompts
     )
+
+
+@pytest.mark.asyncio
+async def test_web_article_reader_command(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path, web_reader_enabled=True),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        web_reader=FakeWebReader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2600,
+                "message": "/网页 https://example.com/article",
+            },
+        )
+        await _wait_for_condition(lambda: len(sender.sent) >= 2)
+
+    assert any(
+        "网页正文" in call[-1]["content"]
+        for call in llm.calls
+        if isinstance(call[-1]["content"], str)
+    )
+
+
+@pytest.mark.asyncio
+async def test_media_commands_send_voice_image_file_and_sticker(tmp_path) -> None:
+    sender = FakeOneBotClient()
+    sticker_store = StickerStore(tmp_path / "stickers.db")
+    sticker_store.record(
+        StickerSource(
+            summary="开心",
+            emoji_id="1",
+            emoji_package_id="2",
+            key="key",
+        )
+    )
+    file_path = tmp_path / "sample.txt"
+    file_path.write_text("sample", encoding="utf-8")
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            owner_qq=123,
+            media_send_enabled=True,
+            tts_enabled=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        tts_client=FakeTTS(),
+        sticker_store=sticker_store,
+    )
+    transport = httpx.ASGITransport(app=app)
+    commands = [
+        "/发语音 你好",
+        "/发图 https://example.com/a.png",
+        f"/发文件 {file_path}",
+        "/发表情",
+    ]
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        for index, command in enumerate(commands, start=1):
+            await client.post(
+                "/onebot",
+                headers={"Authorization": "Bearer test-secret"},
+                json={
+                    "post_type": "message",
+                    "message_type": "private",
+                    "self_id": 999,
+                    "user_id": 123,
+                    "message_id": 2700 + index,
+                    "message": command,
+                },
+            )
+        await _wait_for_condition(
+            lambda: bool(sender.records and sender.images and sender.files and sender.stickers)
+        )
+
+    assert sender.records[0][1] == "https://example.com/tts.wav"
+    assert sender.images[0][1].endswith("a.png")
+    assert sender.files[0][2] == "sample.txt"
+    assert sender.stickers[0][1].summary == "开心"
+
+
+@pytest.mark.asyncio
+async def test_document_chunks_can_be_questioned_with_citation(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    vector_store = VectorMemoryStore(tmp_path / "vectors.db")
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            vector_memory_enabled=True,
+            shared_memory_enabled=False,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(
+            ParsedDocument(
+                "week-report.docx",
+                "本周完成接口联调。下周准备上线。",
+                sections=(
+                    DocumentSection(
+                        "第 1 页",
+                        "本周完成接口联调。下周准备上线。",
+                    ),
+                ),
+            )
+        ),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        embedding_client=FakeEmbeddingClient(),
+        vector_store=vector_store,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2800,
+                "message": [
+                    {
+                        "type": "file",
+                        "data": {
+                            "file": "week-report.docx",
+                            "file_id": "doc-id",
+                        },
+                    }
+                ],
+            },
+        )
+        await _wait_for_condition(lambda: len(sender.sent) >= 2)
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2801,
+                "message": "/问文件 行动项是什么",
+            },
+        )
+        await _wait_for_condition(lambda: len(sender.sent) >= 3)
+
+    prompts = [call[0]["content"] for call in llm.calls]
+    assert any(
+        "知识库检索结果" in prompt and "week-report.docx" in prompt
+        for prompt in prompts
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_page_and_api(tmp_path) -> None:
+    shared = SharedMemoryStore(tmp_path / "shared.db")
+    shared.record_person(123, "test-user")
+    shared.update_person_profile(
+        123,
+        style_profile="直接、简短",
+        relationship_note="测试朋友",
+    )
+    app = create_app(
+        settings=make_settings(tmp_path, admin_web_enabled=True),
+        chat_client=FakeChatClient(),
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        shared_memory_store=shared,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        page = await client.get("/admin")
+        people = await client.get("/api/admin/people")
+        detail = await client.get("/api/admin/people/123")
+    assert page.status_code == 200
+    assert "给她爱控制台" in page.text
+    assert people.json()["people"][0]["display_name"] == "test-user"
+    assert detail.json()["person"]["style_profile"] == "直接、简短"
 
 
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:

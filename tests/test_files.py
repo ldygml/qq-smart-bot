@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from docx import Document as WordDocument
 from openpyxl import Workbook
+from PIL import Image, ImageDraw
 from pptx import Presentation
 import pytest
 
@@ -28,6 +29,11 @@ class FakeChat:
         if len(self.calls) == 1 and len(str(messages[-1]["content"])) > 15_000:
             return "分段摘要"
         return "最终总结"
+
+
+class FakeOCR:
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        return "手写题目：1 + 1 = ?"
 
 
 @pytest.mark.asyncio
@@ -101,3 +107,26 @@ def test_split_document_text_preserves_content() -> None:
     chunks = split_document_text(text, 12_000)
     assert len(chunks) == 3
     assert "".join(chunks) == text
+
+
+@pytest.mark.asyncio
+async def test_scanned_pdf_uses_ocr_fallback(tmp_path) -> None:
+    pdf_path = tmp_path / "scanned.pdf"
+    image = Image.new("RGB", (480, 240), "white")
+    ImageDraw.Draw(image).text((30, 90), "1 + 1 = ?", fill="black")
+    image.save(pdf_path, "PDF")
+    loader = DocumentLoader(
+        ocr_client=FakeOCR(),
+        vision_model="fake-vision",
+        ocr_enabled=True,
+    )
+    try:
+        document = await loader.load(
+            FileSource(pdf_path.name, str(pdf_path)),
+            NoopResolver(),
+        )
+    finally:
+        await loader.close()
+    assert "OCR" in document.detail
+    assert document.sections[0].location == "第 1 页（OCR）"
+    assert "1 + 1" in document.text

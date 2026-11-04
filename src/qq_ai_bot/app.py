@@ -6,22 +6,25 @@ import re
 from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
 from .audio import AudioLoader, AudioLoaderProtocol, AudioLoadError
 from .config import Settings
 from .files import (
     DocumentLoader,
+    DocumentSection,
     FileParseError,
     FileParserProtocol,
     ParsedDocument,
+    split_document_text,
     summarize_documents,
 )
 from .images import ImageLoader, ImageLoaderProtocol, ImageLoadError
@@ -54,6 +57,14 @@ from .shared_memory import (
     extract_person_profile,
     reflect_on_memories,
 )
+from .vector_memory import (
+    EmbeddingClient,
+    VectorChunk,
+    VectorMemoryStore,
+)
+from .stickers import StickerStore
+from .tts import TTSClient, TTSError
+from .web_reader import WebArticleReader, WebReadError
 
 logger = logging.getLogger(__name__)
 MAX_WEBHOOK_BYTES = 1_048_576
@@ -66,6 +77,7 @@ AI_COMMAND_PROMPTS = {
     "/润色": "请在不改变事实和含义的前提下润色下面的文字，使其清晰、专业、自然：",
     "/解释": "请用容易理解的方式解释下面的概念，给出例子，并指出常见误区：",
     "/搜": "请联网搜索并核实下面的问题，优先使用最新的可靠来源，并说明信息日期：",
+    "/问文件": "请根据知识库中的文档回答问题，并标明文件名和页码、工作表或章节来源：",
 }
 TASK_HINTS = (
     "总结",
@@ -96,6 +108,9 @@ TASK_HINTS = (
     "转会",
     "伤病",
     "政策",
+    "文件",
+    "文档",
+    "资料",
 )
 
 
@@ -110,6 +125,11 @@ def create_app(
     document_loader: FileParserProtocol | None = None,
     audio_loader: AudioLoaderProtocol | None = None,
     shared_memory_store: SharedMemoryStore | None = None,
+    tts_client: TTSClient | None = None,
+    sticker_store: StickerStore | None = None,
+    web_reader: WebArticleReader | None = None,
+    embedding_client: EmbeddingClient | None = None,
+    vector_store: VectorMemoryStore | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -136,12 +156,44 @@ def create_app(
     )
     productivity = productivity_store or ProductivityStore(config.database_path)
     documents = document_loader or DocumentLoader(
-        timeout_seconds=config.document_timeout_seconds
+        timeout_seconds=config.document_timeout_seconds,
+        ocr_client=llm,
+        vision_model=config.vision_model,
+        ocr_enabled=config.ocr_enabled,
     )
     audio = audio_loader or AudioLoader(
         timeout_seconds=config.audio_timeout_seconds
     )
     shared_memory = shared_memory_store or SharedMemoryStore(config.database_path)
+    embeddings = embedding_client or (
+        EmbeddingClient(
+            base_url=config.llm_base_url,
+            api_key=config.effective_llm_api_key,
+            model=config.embedding_model,
+            timeout_seconds=config.llm_timeout_seconds,
+            trust_env=config.llm_trust_env,
+        )
+        if config.vector_memory_enabled
+        else None
+    )
+    vectors = vector_store or (
+        VectorMemoryStore(config.database_path)
+        if config.vector_memory_enabled
+        else None
+    )
+    tts = tts_client or TTSClient(
+        compatible_base_url=config.llm_base_url,
+        api_key=config.effective_llm_api_key,
+        model=config.tts_model,
+        voice=config.tts_voice,
+        timeout_seconds=config.llm_timeout_seconds,
+        trust_env=config.llm_trust_env,
+    )
+    stickers = sticker_store or StickerStore(config.database_path)
+    web_articles = web_reader or WebArticleReader(
+        timeout_seconds=config.web_reader_timeout_seconds,
+        trust_env=config.llm_trust_env,
+    )
 
     limiter = SlidingWindowRateLimiter(config.rate_limit_per_minute, 60.0)
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
@@ -168,6 +220,10 @@ def create_app(
             await images.close()
             await documents.close()
             await audio.close()
+            if embeddings is not None:
+                await embeddings.close()
+            await tts.close()
+            await web_articles.close()
 
     app = FastAPI(
         title="QQ Smart Bot",
@@ -191,12 +247,20 @@ def create_app(
             "model": config.llm_model,
             "casual_model": config.casual_model,
             "web_search_enabled": config.web_search_enabled,
+            "web_reader_enabled": config.web_reader_enabled,
+            "vector_memory_enabled": config.vector_memory_enabled,
+            "embedding_model": config.embedding_model,
+            "knowledge_chunks": vectors.count() if vectors else 0,
             "vision_enabled": config.vision_enabled,
             "vision_model": config.vision_model,
             "max_image_bytes": config.max_image_bytes,
             "max_files_per_message": config.max_files_per_message,
             "audio_enabled": config.audio_enabled,
             "audio_model": config.audio_model,
+            "tts_enabled": config.tts_enabled,
+            "tts_model": config.tts_model,
+            "media_send_enabled": config.media_send_enabled,
+            "sticker_count": stickers.count(),
             "shared_memory_enabled": config.shared_memory_enabled,
             "memory_model": config.memory_model,
             "memory_privacy_protection": config.memory_privacy_protection,
@@ -211,6 +275,109 @@ def create_app(
             "max_history_rows_per_chat": config.max_history_rows_per_chat,
             **store.stats(),
         }
+
+    @app.get("/admin")
+    async def admin_page() -> Response:
+        if not config.admin_web_enabled:
+            return JSONResponse({"detail": "admin disabled"}, status_code=404)
+        path = Path.cwd() / "web" / "admin.html"
+        if not path.is_file():
+            return JSONResponse({"detail": "admin page missing"}, status_code=404)
+        return FileResponse(path)
+
+    @app.get("/admin/admin.css")
+    async def admin_css() -> FileResponse:
+        return FileResponse(Path.cwd() / "web" / "admin.css")
+
+    @app.get("/admin/admin.js")
+    async def admin_js() -> FileResponse:
+        return FileResponse(Path.cwd() / "web" / "admin.js")
+
+    @app.get("/api/admin/overview")
+    async def admin_overview() -> dict[str, Any]:
+        return {
+            "models": {
+                "chat": config.llm_model,
+                "casual": config.casual_model,
+                "vision": config.vision_model,
+                "audio": config.audio_model,
+                "embedding": config.embedding_model,
+            },
+            "memory": shared_memory.stats(),
+            "vector_chunks": vectors.count() if vectors else 0,
+            "stickers": stickers.count(),
+            "group_enabled": config.enable_group,
+            "group_require_mention": config.group_require_mention,
+            "web_search_enabled": config.web_search_enabled,
+            "memory_privacy_protection": config.memory_privacy_protection,
+        }
+
+    @app.get("/api/admin/people")
+    async def admin_people() -> dict[str, Any]:
+        return {"people": shared_memory.list_people()}
+
+    @app.get("/api/admin/people/{user_id}")
+    async def admin_person(user_id: int) -> JSONResponse:
+        person = shared_memory.get_person(user_id)
+        if person is None:
+            return JSONResponse({"detail": "person not found"}, status_code=404)
+        return JSONResponse(
+            {
+                "person": person,
+                "memories": shared_memory.list_memories(user_id),
+                "episodes": shared_memory.episodes_for_speaker(
+                    user_id,
+                    limit=30,
+                ),
+                "notes": [
+                    asdict(item)
+                    for item in productivity.list_notes(user_id, limit=20)
+                ],
+                "todos": [
+                    asdict(item) for item in productivity.list_todos(user_id)
+                ],
+                "reminders": [
+                    asdict(item)
+                    for item in productivity.list_reminders(user_id, limit=20)
+                ],
+            }
+        )
+
+    @app.post("/api/admin/people/{user_id}/profile")
+    async def admin_update_profile(
+        user_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        display_name = str(payload.get("display_name") or user_id)
+        shared_memory.record_person(user_id, display_name)
+        updated = shared_memory.update_person_profile(
+            user_id,
+            style_profile=str(payload.get("style_profile") or ""),
+            relationship_note=str(payload.get("relationship_note") or ""),
+        )
+        return JSONResponse(
+            {
+                "ok": updated,
+                "person": shared_memory.get_person(user_id),
+            }
+        )
+
+    @app.get("/api/admin/growth")
+    async def admin_growth() -> dict[str, Any]:
+        return {
+            "reflections": shared_memory.reflection_summary(
+                limit=50,
+                include_private=True,
+            ),
+            "growth": shared_memory.growth_summary(
+                limit=50,
+                include_private=True,
+            ),
+        }
+
+    @app.get("/api/admin/stickers")
+    async def admin_stickers() -> dict[str, Any]:
+        return {"stickers": stickers.list_recent(limit=100)}
 
     @app.post("/onebot")
     async def receive_onebot_event(request: Request) -> Response:
@@ -392,6 +559,8 @@ def create_app(
         file_sources = content.file_sources[: max(0, config.max_files_per_message)]
         audio_sources = content.audio_sources[:1]
         sticker_summaries = content.sticker_summaries[:3]
+        for sticker in content.sticker_sources[:3]:
+            stickers.record(sticker)
         if sticker_summaries:
             sticker_text = "、".join(dict.fromkeys(sticker_summaries))
             text = f"[对方发了一个表情包：{sticker_text}] {text}".strip()
@@ -440,6 +609,12 @@ def create_app(
                 await _safe_send(target, "戳不动，NapCat 可能没有启用这个互动接口。")
             return
 
+        if await _handle_web_request(target, text):
+            return
+
+        if await _handle_media_command(event, target, text):
+            return
+
         command_reply = _handle_command(event, target, text)
         if command_reply is not None:
             await _safe_send(target, command_reply)
@@ -469,6 +644,7 @@ def create_app(
             return
 
         is_task_request = _looks_like_task_request(text)
+        use_doc_lookup = _needs_doc_lookup(text)
         text, command_error = _expand_ai_command(text)
         if command_error is not None:
             await _safe_send(target, command_error)
@@ -510,6 +686,20 @@ def create_app(
                     include_private=not config.memory_privacy_protection,
                     current_conversation_id=conversation_id,
                 )
+            semantic_matches = await _vector_context(
+                text,
+                namespaces=("memory", "episode"),
+                limit=4,
+            )
+            knowledge_matches = (
+                await _vector_context(
+                    text,
+                    namespaces=("document",),
+                    limit=config.knowledge_top_k,
+                )
+                if use_doc_lookup
+                else []
+            )
             history_text = (
                 f"[用户发送了 {len(loaded_images)} 张图片] {text}"
                 if loaded_images
@@ -558,6 +748,28 @@ def create_app(
                     "也不要机械复述共享记忆。\n"
                     f"{memory_context}"
                 )
+            if semantic_matches:
+                semantic_lines = [
+                    "语义相关的长期记忆：",
+                    *(
+                        f"- {match.title}：{match.content}"
+                        for match in semantic_matches
+                    ),
+                ]
+                system_prompt += "\n" + "\n".join(semantic_lines)
+            if knowledge_matches:
+                knowledge_lines = [
+                    "知识库检索结果（回答时必须标注文件名和页码/章节）：",
+                    *(
+                        f"- 来源：{match.title}，{match.location}\n"
+                        f"  内容：{match.content}"
+                        for match in knowledge_matches
+                    ),
+                ]
+                system_prompt += "\n" + "\n".join(knowledge_lines)
+            elif use_doc_lookup and vectors is not None and vectors.count("document") == 0:
+                await _safe_send(target, "知识库里还没有可检索的文件，请先发送文件。")
+                return
             messages = [
                 {
                     "role": "system",
@@ -661,6 +873,39 @@ def create_app(
                     logger.exception("Unexpected document parsing failure")
                     await _safe_send(target, "文件解析时出现意外错误，请重新发送附件。")
                     return
+
+            for document_index, document in enumerate(parsed_documents):
+                sections = document.sections or [
+                    DocumentSection("全文", document.text)
+                ]
+                chunks: list[VectorChunk] = []
+                for section in sections:
+                    for part_index, part in enumerate(
+                        split_document_text(section.content, 2500),
+                        start=1,
+                    ):
+                        location = section.location
+                        if part_index > 1:
+                            location += f" 第 {part_index} 段"
+                        chunks.append(
+                            VectorChunk(
+                                namespace="document",
+                                source_id=(
+                                    f"doc:{event.message_id or 'upload'}:"
+                                    f"{document_index}"
+                                ),
+                                title=document.name,
+                                location=location,
+                                content=part,
+                            )
+                        )
+                await _index_vector_chunks(
+                    chunks,
+                    metadata={
+                        "conversation_id": target.conversation_id,
+                        "file_name": document.name,
+                    },
+                )
 
             instruction = _file_instruction(text)
             try:
@@ -793,6 +1038,46 @@ def create_app(
             return False
         return sender_id == self_id
 
+    async def _index_vector_chunks(
+        chunks: list[VectorChunk],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not chunks or embeddings is None or vectors is None:
+            return
+        try:
+            texts = [chunk.content for chunk in chunks]
+            stored_embeddings = await embeddings.embed(texts)
+            vectors.upsert_chunks(
+                chunks,
+                stored_embeddings,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.warning("Vector indexing failed", exc_info=True)
+
+    async def _vector_context(
+        query: str,
+        *,
+        namespaces: tuple[str, ...],
+        limit: int,
+    ) -> list[Any]:
+        if embeddings is None or vectors is None:
+            return []
+        if not any(vectors.count(namespace) for namespace in namespaces):
+            return []
+        try:
+            query_embedding = (await embeddings.embed([query]))[0]
+        except Exception:
+            logger.warning("Query embedding failed", exc_info=True)
+            return []
+        return vectors.search(
+            query_embedding,
+            namespaces=namespaces,
+            limit=limit,
+            min_score=0.25,
+        )
+
     async def _remember_exchange(
         *,
         event: OneBotEvent,
@@ -804,7 +1089,7 @@ def create_app(
         if not config.shared_memory_enabled or event.user_id is None:
             return
         try:
-            shared_memory.add_episode(
+            episode_id = shared_memory.add_episode(
                 conversation_id=target.conversation_id,
                 message_type=target.message_type,
                 group_id=target.group_id,
@@ -813,6 +1098,24 @@ def create_app(
                 user_content=user_text,
                 assistant_content=assistant_text,
             )
+            await _index_vector_chunks(
+                [
+                    VectorChunk(
+                        namespace="episode",
+                        source_id=f"episode:{episode_id}",
+                        title=f"{display_name} 的对话",
+                        location=target.conversation_id,
+                        content=(
+                            f"用户：{user_text}\n"
+                            f"给她爱：{assistant_text}"
+                        )[:3500],
+                    )
+                ],
+                metadata={
+                    "conversation_id": target.conversation_id,
+                    "user_id": event.user_id,
+                },
+            )
             candidates = await extract_memory_candidates(
                 llm,
                 model=config.memory_model,
@@ -820,14 +1123,32 @@ def create_app(
                 speaker_id=event.user_id,
                 user_message=user_text,
             )
+            memory_chunks: list[VectorChunk] = []
             for memory in candidates:
-                shared_memory.add_memory(
+                memory_id = shared_memory.add_memory(
                     subject_user_id=event.user_id,
                     subject_name=display_name,
                     content=memory.content,
                     visibility=memory.visibility,
                     source_conversation=target.conversation_id,
                 )
+                if memory_id is not None:
+                    memory_chunks.append(
+                        VectorChunk(
+                            namespace="memory",
+                            source_id=f"memory:{memory_id}",
+                            title=display_name,
+                            location="长期记忆",
+                            content=memory.content,
+                        )
+                    )
+            await _index_vector_chunks(
+                memory_chunks,
+                metadata={
+                    "conversation_id": target.conversation_id,
+                    "user_id": event.user_id,
+                },
+            )
             if config.profile_learning_enabled:
                 await _refresh_person_profile(
                     user_id=event.user_id,
@@ -881,11 +1202,185 @@ def create_app(
             str(max(int(item["id"]) for item in samples)),
         )
 
+    async def _handle_media_command(
+        event: OneBotEvent,
+        target: ReplyTarget,
+        text: str,
+    ) -> bool:
+        value = text.strip()
+        command = ""
+        argument = ""
+        for prefix in ("/发语音", "/发图", "/发文件", "/发表情"):
+            if value == prefix or value.startswith(prefix + " "):
+                command = prefix
+                argument = value[len(prefix) :].strip()
+                break
+        if not command and value.startswith("用语音说"):
+            command = "/发语音"
+            argument = value[len("用语音说") :].lstrip("：:，, ")
+        if not command and value in {"发个表情包", "来个表情包"}:
+            command = "/发表情"
+
+        if not command:
+            return False
+        if event.user_id != config.owner_qq:
+            await _safe_send(target, "媒体发送命令仅限管理员使用。")
+            return True
+        if not config.media_send_enabled:
+            await _safe_send(target, "媒体发送功能目前没有开启。")
+            return True
+
+        if command == "/发语音":
+            if not config.tts_enabled:
+                await _safe_send(target, "语音合成功能目前没有开启。")
+                return True
+            if not argument:
+                await _safe_send(target, "用法：/发语音 想让机器人说的话")
+                return True
+            if len(argument) > config.max_tts_chars:
+                await _safe_send(
+                    target,
+                    f"语音文本不能超过 {config.max_tts_chars} 个字符。",
+                )
+                return True
+            try:
+                audio_url = await tts.synthesize(argument)
+                await sender.send_record(target, audio_url)
+            except (TTSError, OneBotError) as exc:
+                await _safe_send(target, f"语音发送失败：{exc}")
+            except Exception:
+                logger.exception("Unexpected TTS send failure")
+                await _safe_send(target, "语音发送失败，请稍后再试。")
+            return True
+
+        if command == "/发图":
+            if not argument:
+                await _safe_send(target, "用法：/发图 图片URL或本机绝对路径")
+                return True
+            if not (
+                argument.startswith(("http://", "https://"))
+                or Path(argument).is_absolute()
+            ):
+                await _safe_send(target, "图片必须是 URL 或本机绝对路径。")
+                return True
+            try:
+                await sender.send_image(target, argument)
+            except OneBotError as exc:
+                await _safe_send(target, f"图片发送失败：{exc}")
+            return True
+
+        if command == "/发文件":
+            path = Path(argument) if argument else None
+            if path is None or not path.is_absolute() or not path.is_file():
+                await _safe_send(target, "用法：/发文件 本机绝对路径")
+                return True
+            try:
+                await sender.upload_file(
+                    target,
+                    path=str(path),
+                    name=path.name,
+                )
+            except OneBotError as exc:
+                await _safe_send(target, f"文件发送失败：{exc}")
+            return True
+
+        if command == "/发表情":
+            sticker = stickers.random_sticker(argument)
+            if sticker is None:
+                await _safe_send(
+                    target,
+                    "表情包库里还没有可发送的表情。先让别人发几个表情包给我。",
+                )
+                return True
+            try:
+                await sender.send_sticker(target, sticker)
+            except OneBotError as exc:
+                await _safe_send(target, f"表情包发送失败：{exc}")
+            return True
+        return False
+
+    async def _handle_web_request(
+        target: ReplyTarget,
+        text: str,
+    ) -> bool:
+        if not config.web_reader_enabled:
+            return False
+        url = _find_url(text)
+        if not url:
+            if text.strip().startswith(("/网页", "/读网页")):
+                await _safe_send(target, "用法：/网页 https://example.com")
+                return True
+            return False
+        if not (
+            text.strip() == url
+            or text.strip().startswith(("/网页", "/读网页"))
+            or any(
+                marker in text
+                for marker in ("看下这个链接", "总结网页", "读一下", "看看这篇")
+            )
+        ):
+            return False
+
+        conversation_id = target.conversation_id
+        lock = get_conversation_lock(conversation_id)
+        await _safe_send(target, "正在读取网页正文…")
+        async with semaphore, lock:
+            try:
+                article = await web_articles.read(url)
+            except WebReadError as exc:
+                await _safe_send(target, str(exc))
+                return True
+            instruction = text.replace(url, "").strip()
+            instruction = (
+                instruction
+                or "请总结网页正文，列出主要观点、事实和结论。"
+            )
+            document = ParsedDocument(
+                article.title,
+                article.text,
+                sections=(DocumentSection("网页正文", article.text),),
+            )
+            chunks = [
+                VectorChunk(
+                    namespace="web",
+                    source_id=f"web:{url}",
+                    title=article.title,
+                    location=url,
+                    content=part,
+                )
+                for part in split_document_text(article.text, 2500)
+            ]
+            await _index_vector_chunks(
+                chunks,
+                metadata={"url": url},
+            )
+            try:
+                reply = await summarize_documents(
+                    llm,
+                    model=config.llm_model,
+                    documents=[document],
+                    instruction=instruction,
+                )
+            except LLMError as exc:
+                await _safe_send(target, str(exc))
+                return True
+            reply = format_qq_text(reply.strip())
+            store.append_exchange(
+                conversation_id,
+                f"[网页] {url} {instruction}",
+                reply,
+                max_rows=config.max_history_rows_per_chat,
+            )
+        await _send_long_reply(target, reply)
+        return True
+
     def _handle_command(
         event: OneBotEvent,
         target: ReplyTarget,
         text: str,
     ) -> str | None:
+        if not text.strip():
+            return None
         command = text.split(maxsplit=1)[0].lower()
         if command in {"/help", "/帮助"}:
             group_hint = (
@@ -897,6 +1392,7 @@ def create_app(
                 f"{group_hint}\n"
                 "图片：直接发送题目截图，可附带你的要求\n"
                 "语音：直接发送语音，默认转写；也可以附上总结或回答要求\n"
+                "文件问答：先发送文件，再用“/问文件 具体问题”追问来源\n"
                 "笔记：/记 标题 | 内容；/笔记；/查 关键词；/删笔记 编号\n"
                 "长期记忆：/记忆；/删记忆 编号；/忘记我\n"
                 "成长：/成长，查看机器人整理出的长期观察\n"
@@ -904,7 +1400,9 @@ def create_app(
                 "提醒：/提醒 2026-10-28 09:00 内容；/提醒；/取消提醒 编号\n"
                 "学习工作：/计划、/总结、/出题、/翻译、/润色、/解释\n"
                 "搜索：/搜 最新问题，机器人会联网核实\n"
+                "网页：直接发链接，或使用 /网页 URL 总结正文\n"
                 "互动：/戳，或者私聊直接说“戳一戳”\n"
+                "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情\n"
                 "引用：机器人会引用你的原消息；引用机器人消息可以直接追问\n"
                 "/重置：忘记当前聊天上下文\n"
                 "/id：查看 QQ、群号和会话标识\n"
@@ -1194,6 +1692,29 @@ def _needs_web_search(text: str) -> bool:
             r"(最近|今天|现在|本周|本月).{0,16}"
             r"(发生|消息|动态|新闻|比赛|天气|价格|政策|情况|结果)",
             value,
+        )
+    )
+
+
+def _find_url(text: str) -> str:
+    match = re.search(r"https?://[^\s<>]+", text)
+    if not match:
+        return ""
+    return match.group(0).rstrip(".,;:!?，。；：！？)")
+
+
+def _needs_doc_lookup(text: str) -> bool:
+    value = text.strip()
+    if value.startswith(("/问文件", "/问文档", "/文件问答")):
+        return True
+    if re.search(r"第\s*\d+\s*(页|章|节|部分)", value):
+        return True
+    return bool(
+        re.search(
+            r"(文件|文档|资料|材料|PDF|表格|工作表|章节).{0,12}"
+            r"(什么|讲|说|内容|含义|结论|数据|怎么|如何|为什么|哪|找)",
+            value,
+            re.IGNORECASE,
         )
     )
 

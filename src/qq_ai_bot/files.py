@@ -15,6 +15,7 @@ import httpx
 from docx import Document as WordDocument
 from openpyxl import load_workbook
 from pypdf import PdfReader
+import pypdfium2 as pdfium
 from pptx import Presentation
 
 from .onebot import FileSource
@@ -39,10 +40,17 @@ class FileParseError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class DocumentSection:
+    location: str
+    content: str
+
+
+@dataclass(frozen=True)
 class ParsedDocument:
     name: str
     text: str
     detail: str = ""
+    sections: tuple[DocumentSection, ...] = ()
 
 
 TEXT_EXTENSIONS = {
@@ -68,8 +76,18 @@ TEXT_EXTENSIONS = {
 
 
 class DocumentLoader:
-    def __init__(self, *, timeout_seconds: float = 120.0) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 120.0,
+        ocr_client: Any = None,
+        vision_model: str = "qwen3-vl-plus",
+        ocr_enabled: bool = True,
+    ) -> None:
         timeout = httpx.Timeout(timeout_seconds)
+        self.ocr_client = ocr_client
+        self.vision_model = vision_model
+        self.ocr_enabled = ocr_enabled
         self._local_client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
@@ -118,7 +136,91 @@ class DocumentLoader:
             )
 
         data = await self._read_source(file_source)
-        return await asyncio.to_thread(_parse_document, file_name, suffix, data)
+        try:
+            return await asyncio.to_thread(
+                _parse_document,
+                file_name,
+                suffix,
+                data,
+            )
+        except FileParseError as exc:
+            if (
+                suffix == ".pdf"
+                and self.ocr_enabled
+                and self.ocr_client is not None
+                and "没有可提取的文字" in str(exc)
+            ):
+                return await self._ocr_pdf(file_name, data)
+            raise
+
+    async def _ocr_pdf(self, file_name: str, data: bytes) -> ParsedDocument:
+        try:
+            document = pdfium.PdfDocument(data)
+        except Exception as exc:
+            raise FileParseError("扫描版 PDF 无法打开。") from exc
+        sections: list[DocumentSection] = []
+        try:
+            for index in range(len(document)):
+                page = document[index]
+                bitmap = page.render(scale=2.0)
+                image = bitmap.to_pil().convert("RGB")
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=90)
+                encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+                reply = await self.ocr_client.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "你是 OCR 转写器。只转写页面上的可见文字、"
+                                "公式和表格内容，保留原始顺序。看不清就标注。"
+                                "不要解题，不要补充页面中没有的内容。"
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        f"请转写第 {index + 1} 页的全部内容，"
+                                        "包括手写文字和数学公式。"
+                                    ),
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": (
+                                            "data:image/jpeg;base64,"
+                                            + encoded
+                                        )
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                    model=self.vision_model,
+                    extra_payload={"reasoning_effort": "none"},
+                )
+                text = reply.strip()
+                if text:
+                    sections.append(
+                        DocumentSection(f"第 {index + 1} 页（OCR）", text)
+                    )
+        finally:
+            document.close()
+        if not sections:
+            raise FileParseError("扫描版 PDF 的 OCR 没有识别出文字。")
+        text = "\n\n".join(
+            f"--- {section.location} ---\n{section.content}"
+            for section in sections
+        )
+        return ParsedDocument(
+            file_name,
+            text,
+            f"（{len(sections)} 页，OCR）",
+            tuple(sections),
+        )
 
     async def _read_source(self, source: str) -> bytes:
         if not source:
@@ -310,18 +412,30 @@ def _parse_document(file_name: str, suffix: str, data: bytes) -> ParsedDocument:
         text = _decode_text(data)
         rows = list(csv.reader(io.StringIO(text)))
         content = "\n".join("\t".join(row) for row in rows)
-        return ParsedDocument(file_name, content, f"（{len(rows)} 行）")
-    return ParsedDocument(file_name, _decode_text(data))
+        return ParsedDocument(
+            file_name,
+            content,
+            f"（{len(rows)} 行）",
+            (DocumentSection("全文", content),),
+        )
+    text = _decode_text(data)
+    return ParsedDocument(
+        file_name,
+        text,
+        sections=(DocumentSection("全文", text),),
+    )
 
 
 def _parse_pdf(file_name: str, data: bytes) -> ParsedDocument:
     try:
         reader = PdfReader(io.BytesIO(data))
         pages = []
+        sections: list[DocumentSection] = []
         for index, page in enumerate(reader.pages, start=1):
             text = (page.extract_text() or "").strip()
             if text:
                 pages.append(f"--- 第 {index} 页 ---\n{text}")
+                sections.append(DocumentSection(f"第 {index} 页", text))
     except Exception as exc:
         raise FileParseError("PDF 解析失败，文件可能已损坏或加密。") from exc
     if not pages:
@@ -332,6 +446,7 @@ def _parse_pdf(file_name: str, data: bytes) -> ParsedDocument:
         file_name,
         "\n\n".join(pages),
         f"（{len(reader.pages)} 页）",
+        tuple(sections),
     )
 
 
@@ -347,13 +462,18 @@ def _parse_docx(file_name: str, data: bytes) -> ParsedDocument:
     text = "\n".join(part for part in parts if part)
     if not text:
         raise FileParseError("Word 文档中没有可提取的文字。")
-    return ParsedDocument(file_name, text)
+    return ParsedDocument(
+        file_name,
+        text,
+        sections=(DocumentSection("正文", text),),
+    )
 
 
 def _parse_pptx(file_name: str, data: bytes) -> ParsedDocument:
     try:
         presentation = Presentation(io.BytesIO(data))
         slides: list[str] = []
+        sections: list[DocumentSection] = []
         for index, slide in enumerate(presentation.slides, start=1):
             texts = [
                 shape.text.strip()
@@ -361,7 +481,11 @@ def _parse_pptx(file_name: str, data: bytes) -> ParsedDocument:
                 if hasattr(shape, "text") and shape.text.strip()
             ]
             if texts:
-                slides.append(f"--- 第 {index} 页幻灯片 ---\n" + "\n".join(texts))
+                slide_text = "\n".join(texts)
+                slides.append(f"--- 第 {index} 页幻灯片 ---\n{slide_text}")
+                sections.append(
+                    DocumentSection(f"第 {index} 页幻灯片", slide_text)
+                )
     except Exception as exc:
         raise FileParseError("PPT 解析失败，请确认文件是 .pptx 格式。") from exc
     if not slides:
@@ -370,6 +494,7 @@ def _parse_pptx(file_name: str, data: bytes) -> ParsedDocument:
         file_name,
         "\n\n".join(slides),
         f"（{len(presentation.slides)} 页）",
+        tuple(sections),
     )
 
 
@@ -377,6 +502,7 @@ def _parse_xlsx(file_name: str, data: bytes) -> ParsedDocument:
     try:
         workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
         sheets: list[str] = []
+        sections: list[DocumentSection] = []
         for worksheet in workbook.worksheets:
             rows = [
                 "\t".join("" if value is None else str(value) for value in row)
@@ -384,7 +510,13 @@ def _parse_xlsx(file_name: str, data: bytes) -> ParsedDocument:
             ]
             rows = [row for row in rows if row.strip("\t")]
             if rows:
-                sheets.append(f"--- 工作表：{worksheet.title} ---\n" + "\n".join(rows))
+                sheet_text = "\n".join(rows)
+                sheets.append(
+                    f"--- 工作表：{worksheet.title} ---\n{sheet_text}"
+                )
+                sections.append(
+                    DocumentSection(f"工作表：{worksheet.title}", sheet_text)
+                )
     except Exception as exc:
         raise FileParseError("Excel 解析失败，请确认文件是 .xlsx 格式。") from exc
     if not sheets:
@@ -393,6 +525,7 @@ def _parse_xlsx(file_name: str, data: bytes) -> ParsedDocument:
         file_name,
         "\n\n".join(sheets),
         f"（{len(workbook.worksheets)} 个工作表）",
+        tuple(sections),
     )
 
 

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>给她爱 · 机器人控制台</title>
+  <link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">QQ SMART BOT</p>
+      <h1>给她爱控制台</h1>
+    </div>
+    <span class="status"><i></i> 本地运行</span>
+  </header>
+
+  <nav>
+    <button class="active" data-tab="overview">概览</button>
+    <button data-tab="people">联系人</button>
+    <button data-tab="growth">反思与成长</button>
+    <button data-tab="stickers">表情包</button>
+  </nav>
+
+  <main>
+    <section id="overview" class="tab active">
+      <div id="overview-cards" class="cards"></div>
+      <article class="panel">
+        <h2>运行配置</h2>
+        <div id="overview-config"></div>
+      </article>
+    </section>
+
+    <section id="people" class="tab">
+      <div class="split">
+        <aside class="panel person-list">
+          <h2>联系人</h2>
+          <div id="people-list"></div>
+        </aside>
+        <article class="panel person-detail">
+          <div id="person-empty" class="empty">选择一个联系人查看画像和记忆。</div>
+          <div id="person-content" hidden>
+            <div class="detail-head">
+              <div>
+                <p class="eyebrow" id="person-id"></p>
+                <h2 id="person-name"></h2>
+              </div>
+              <button id="save-profile" class="primary">保存画像</button>
+            </div>
+            <label>互动画像
+              <textarea id="style-profile" rows="5" placeholder="回复长度、语气、直接程度、幽默感……"></textarea>
+            </label>
+            <label>关系备注
+              <textarea id="relationship-note" rows="3" placeholder="陌生人、朋友、熟人、工作关系……"></textarea>
+            </label>
+            <div id="person-sections"></div>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="growth" class="tab">
+      <article class="panel">
+        <h2>长期反思</h2>
+        <div id="reflections"></div>
+      </article>
+      <article class="panel">
+        <h2>成长笔记</h2>
+        <div id="growth-list"></div>
+      </article>
+    </section>
+
+    <section id="stickers" class="tab">
+      <article class="panel">
+        <h2>已收集表情包</h2>
+        <p class="muted">机器人收到表情包后会保存可复用元数据，可用 /发表情 发送。</p>
+        <div id="sticker-list" class="sticker-grid"></div>
+      </article>
+    </section>
+  </main>
+
+  <script src="/admin/admin.js"></script>
+</body>
+</html>

@@ -55,6 +55,14 @@ class AudioSource:
 
 
 @dataclass(frozen=True)
+class StickerSource:
+    summary: str
+    emoji_id: str = ""
+    emoji_package_id: str = ""
+    key: str = ""
+
+
+@dataclass(frozen=True)
 class MessageContent:
     text: str
     mentioned: bool
@@ -63,6 +71,7 @@ class MessageContent:
     audio_sources: tuple[AudioSource, ...] = ()
     reply_id: str = ""
     sticker_summaries: tuple[str, ...] = ()
+    sticker_sources: tuple[StickerSource, ...] = ()
 
 
 class OneBotError(RuntimeError):
@@ -141,6 +150,98 @@ class OneBotClient:
             ) from exc
         if response.is_error or data.get("status") != "ok":
             retcode = data.get("retcode")
+            raise OneBotError(
+                f"OneBot {action} failed (HTTP {response.status_code}, retcode={retcode})"
+            )
+
+    async def send_image(self, target: ReplyTarget, image: str) -> None:
+        await self._send_segment(target, "image", {"file": image})
+
+    async def send_record(self, target: ReplyTarget, record: str) -> None:
+        await self._send_segment(target, "record", {"file": record})
+
+    async def send_sticker(
+        self,
+        target: ReplyTarget,
+        sticker: StickerSource,
+    ) -> None:
+        data: dict[str, Any] = {"summary": sticker.summary}
+        if sticker.emoji_id:
+            data["emoji_id"] = sticker.emoji_id
+        if sticker.emoji_package_id:
+            data["emoji_package_id"] = sticker.emoji_package_id
+        if sticker.key:
+            data["key"] = sticker.key
+        await self._send_segment(target, "mface", data)
+
+    async def upload_file(
+        self,
+        target: ReplyTarget,
+        *,
+        path: str,
+        name: str,
+    ) -> None:
+        if target.message_type == "group":
+            if target.group_id is None:
+                raise OneBotError("Group file target has no group_id")
+            action = "upload_group_file"
+            payload = {
+                "group_id": target.group_id,
+                "file": path,
+                "name": name,
+                "upload_file": True,
+            }
+        else:
+            action = "upload_private_file"
+            payload = {
+                "user_id": target.user_id,
+                "file": path,
+                "name": name,
+                "upload_file": True,
+            }
+        response = await self._client.post(action, json=payload, timeout=120.0)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                f"OneBot returned a non-JSON response (HTTP {response.status_code})"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            retcode = data.get("retcode")
+            raise OneBotError(
+                f"OneBot {action} failed (HTTP {response.status_code}, retcode={retcode})"
+            )
+
+    async def _send_segment(
+        self,
+        target: ReplyTarget,
+        segment_type: str,
+        data: dict[str, Any],
+    ) -> None:
+        if target.message_type == "group":
+            if target.group_id is None:
+                raise OneBotError("Group target has no group_id")
+            action = "send_group_msg"
+            payload = {"group_id": target.group_id}
+        else:
+            action = "send_private_msg"
+            payload = {"user_id": target.user_id}
+        message: list[dict[str, Any]] = []
+        if target.message_id is not None:
+            message.append(
+                {"type": "reply", "data": {"id": str(target.message_id)}}
+            )
+        message.append({"type": segment_type, "data": data})
+        payload["message"] = message
+        response = await self._client.post(action, json=payload)
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                f"OneBot returned a non-JSON response (HTTP {response.status_code})"
+            ) from exc
+        if response.is_error or result.get("status") != "ok":
+            retcode = result.get("retcode")
             raise OneBotError(
                 f"OneBot {action} failed (HTTP {response.status_code}, retcode={retcode})"
             )
@@ -272,6 +373,7 @@ def extract_message_content(
         audio_sources: list[AudioSource] = []
         reply_id = ""
         sticker_summaries: list[str] = []
+        sticker_sources: list[StickerSource] = []
         mentioned = False
         for segment in message:
             if not isinstance(segment, dict):
@@ -295,6 +397,16 @@ def extract_message_content(
                 if is_sticker:
                     summary = str(data.get("summary") or "表情包")
                     sticker_summaries.append(summary)
+                    sticker_sources.append(
+                        StickerSource(
+                            summary=summary,
+                            emoji_id=str(data.get("emoji_id") or ""),
+                            emoji_package_id=str(
+                                data.get("emoji_package_id") or ""
+                            ),
+                            key=str(data.get("key") or ""),
+                        )
+                    )
                     parts.append("[表情包]")
                 else:
                     parts.append("[图片]")
@@ -304,6 +416,16 @@ def extract_message_content(
             elif segment_type == "mface":
                 summary = str(data.get("summary") or "表情包")
                 sticker_summaries.append(summary)
+                sticker_sources.append(
+                    StickerSource(
+                        summary=summary,
+                        emoji_id=str(data.get("emoji_id") or ""),
+                        emoji_package_id=str(
+                            data.get("emoji_package_id") or ""
+                        ),
+                        key=str(data.get("key") or ""),
+                    )
+                )
                 parts.append("[表情包]")
             elif segment_type == "file":
                 name = str(data.get("name") or data.get("file") or "文件")
@@ -357,6 +479,7 @@ def extract_message_content(
             audio_sources=tuple(audio_sources),
             reply_id=reply_id,
             sticker_summaries=tuple(sticker_summaries),
+            sticker_sources=tuple(sticker_sources),
         )
 
     if isinstance(message, str):
@@ -369,6 +492,7 @@ def extract_message_content(
     file_sources: list[FileSource] = []
     audio_sources: list[AudioSource] = []
     sticker_summaries: list[str] = []
+    sticker_sources: list[StickerSource] = []
 
     def replace_image(match: re.Match[str]) -> str:
         parameters = _cq_parameters(match.group(1))
@@ -377,7 +501,19 @@ def extract_message_content(
             for key in ("emoji_id", "emoji_package_id", "key")
         ) or parameters.get("sub_type") == "1"
         if is_sticker:
-            sticker_summaries.append(parameters.get("summary") or "表情包")
+            summary = parameters.get("summary") or "表情包"
+            sticker_summaries.append(summary)
+            sticker_sources.append(
+                StickerSource(
+                    summary=summary,
+                    emoji_id=parameters.get("emoji_id", ""),
+                    emoji_package_id=parameters.get(
+                        "emoji_package_id",
+                        "",
+                    ),
+                    key=parameters.get("key", ""),
+                )
+            )
             return "[表情包]"
         source = parameters.get("url") or parameters.get("file")
         if source:
@@ -388,7 +524,16 @@ def extract_message_content(
 
     def replace_mface(match: re.Match[str]) -> str:
         parameters = _cq_parameters(match.group(1))
-        sticker_summaries.append(parameters.get("summary") or "表情包")
+        summary = parameters.get("summary") or "表情包"
+        sticker_summaries.append(summary)
+        sticker_sources.append(
+            StickerSource(
+                summary=summary,
+                emoji_id=parameters.get("emoji_id", ""),
+                emoji_package_id=parameters.get("emoji_package_id", ""),
+                key=parameters.get("key", ""),
+            )
+        )
         return "[表情包]"
 
     source = _CQ_MFACE_PATTERN.sub(replace_mface, source)
@@ -443,6 +588,7 @@ def extract_message_content(
         audio_sources=tuple(audio_sources),
         reply_id=reply_id,
         sticker_summaries=tuple(sticker_summaries),
+        sticker_sources=tuple(sticker_sources),
     )
 
 

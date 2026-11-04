@@ -668,6 +668,22 @@ class SharedMemoryStore:
             )
             return cursor.rowcount
 
+    def stats(self) -> dict[str, int]:
+        with self._lock, self._connect() as connection:
+            counts: dict[str, int] = {}
+            for name, table in (
+                ("people", "shared_people"),
+                ("memories", "shared_memories"),
+                ("episodes", "shared_episodes"),
+                ("reflections", "shared_reflections"),
+                ("growth", "shared_growth"),
+            ):
+                row = connection.execute(
+                    f"SELECT COUNT(*) AS total FROM {table}"
+                ).fetchone()
+                counts[name] = int(row["total"]) if row else 0
+        return counts
+
 
 class MemoryChatClient(Protocol):
     async def chat(

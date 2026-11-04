@@ -32,8 +32,14 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 90.0
     llm_trust_env: bool = False
     web_search_enabled: bool = True
+    web_reader_enabled: bool = True
+    web_reader_timeout_seconds: float = 30.0
+    vector_memory_enabled: bool = True
+    embedding_model: str = "qwen3.7-text-embedding"
+    knowledge_top_k: int = 5
     vision_enabled: bool = True
     vision_model: str = "qwen3-vl-plus"
+    ocr_enabled: bool = True
     max_image_bytes: int = 0
     max_images_per_message: int = 3
     image_timeout_seconds: float = 30.0
@@ -42,6 +48,12 @@ class Settings(BaseSettings):
     audio_enabled: bool = True
     audio_model: str = "qwen3.8-omni-flash"
     audio_timeout_seconds: float = 120.0
+    tts_enabled: bool = True
+    tts_model: str = "qwen-audio-3.1-tts-flash"
+    tts_voice: str = "longanhuan_v3.1"
+    max_tts_chars: int = 800
+    media_send_enabled: bool = True
+    admin_web_enabled: bool = True
     shared_memory_enabled: bool = False
     memory_model: str = "qwen3.8-flash"
     memory_context_limit: int = 14
