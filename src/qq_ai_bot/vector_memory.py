@@ -247,6 +247,35 @@ class VectorMemoryStore:
             )
             return cursor.rowcount
 
+    def delete_namespace(self, namespace: str) -> int:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM vector_chunks WHERE namespace = ?",
+                (namespace,),
+            )
+            return cursor.rowcount
+
+    def delete_by_metadata_user(self, namespace: str, user_id: int) -> int:
+        source_ids: set[str] = set()
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT source_id, metadata
+                FROM vector_chunks
+                WHERE namespace = ?
+                """,
+                (namespace,),
+            ).fetchall()
+        for row in rows:
+            try:
+                metadata = json.loads(str(row["metadata"] or "{}"))
+                stored_user_id = int(metadata.get("user_id"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if stored_user_id == user_id:
+                source_ids.add(str(row["source_id"]))
+        return self.delete_sources(namespace, sorted(source_ids))
+
     def list_sources(
         self,
         namespace: str | None = None,

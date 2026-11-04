@@ -182,6 +182,55 @@ $("#save-profile").addEventListener("click", async () => {
   }
 });
 
+$("#purge-person-memory").addEventListener("click", async () => {
+  if (!state.selectedUser) return;
+  const name = $("#person-name").textContent;
+  if (!confirm(
+    `确定删除“${name}”的全部联系人信息、长期记忆、对话片段、观察记录和相关反思吗？\n\n笔记、待办和提醒不会被删除。此操作不可撤销。`
+  )) return;
+  try {
+    const result = await api(
+      `/api/admin/people/${state.selectedUser}/all-memory`,
+      {method:"DELETE"}
+    );
+    const deleted = result.deleted;
+    alert(
+      `已清除 ${name}：${deleted.memories} 条长期记忆、` +
+      `${deleted.episodes} 条对话片段、${deleted.observations} 条观察、` +
+      `${deleted.messages} 条短期消息、${deleted.vectors} 个向量片段。`
+    );
+    state.selectedUser = null;
+    $("#person-content").hidden = true;
+    $("#person-empty").hidden = false;
+    await loadPeople();
+    await loadOverview();
+  } catch (error) {
+    alert(`删除失败：${error.message}`);
+  }
+});
+
+$("#purge-all-memory").addEventListener("click", async () => {
+  if (!confirm(
+    "确定删除所有联系人和全部记忆吗？\n\n将清除长期记忆、对话片段、未处理观察、联系人画像、反思、成长笔记、冲突、短期聊天和记忆向量。\n\n笔记、待办、提醒、群聊设置和知识库文件不会删除。此操作不可撤销。"
+  )) return;
+  try {
+    const result = await api("/api/admin/memory/all", {method:"DELETE"});
+    const deleted = result.deleted;
+    alert(
+      `已清空全部记忆：${deleted.people} 个联系人、` +
+      `${deleted.memories} 条长期记忆、${deleted.episodes} 条对话片段、` +
+      `${deleted.messages} 条短期消息、${deleted.vectors} 个向量片段。`
+    );
+    state.selectedUser = null;
+    $("#person-content").hidden = true;
+    $("#person-empty").hidden = false;
+    await Promise.all([loadOverview(), loadPeople()]);
+    if ($("#timeline").classList.contains("active")) await loadTimeline();
+  } catch (error) {
+    alert(`清空失败：${error.message}`);
+  }
+});
+
 async function loadTimeline() {
   state.selectedMemories.clear();
   const userId = $("#timeline-person").value;

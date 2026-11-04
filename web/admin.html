@@ -49,7 +49,10 @@
                 <p class="eyebrow" id="person-id"></p>
                 <h2 id="person-name"></h2>
               </div>
-              <button id="save-profile" class="primary">保存画像</button>
+              <div class="toolbar">
+                <button id="save-profile" class="primary">保存画像</button>
+                <button id="purge-person-memory" class="danger">删除此人的全部记忆</button>
+              </div>
             </div>
             <label>互动画像
               <textarea id="style-profile" rows="5" placeholder="回复长度、语气、直接程度、幽默感……"></textarea>
@@ -71,6 +74,7 @@
             <select id="timeline-person"><option value="">全部联系人</option></select>
             <button id="merge-memories">合并所选</button>
             <button id="refresh-timeline">刷新</button>
+            <button id="purge-all-memory" class="danger">删除全部人的全部记忆</button>
           </div>
         </div>
         <p class="muted">旧说法被相同主题的新信息取代时会保留在时间线中并标记为“已取代”。选择两条记忆可以合并。</p>

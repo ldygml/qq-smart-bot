@@ -412,3 +412,90 @@ async def test_reflection_uses_grounded_fallback_for_common_terms() -> None:
     assert result.reflections
     assert "杭州" in result.reflections[0].content
     assert result.growth
+
+
+def test_purge_person_removes_related_memory_and_derived_notes(tmp_path) -> None:
+    store = SharedMemoryStore(tmp_path / "memory.db")
+    store.record_person(222, "小明")
+    store.record_person(333, "小李")
+    memory_id = store.add_memory(
+        subject_user_id=222,
+        subject_name="小明",
+        content="下周三去杭州",
+        visibility="shareable",
+        source_conversation="private:222",
+    )
+    assert memory_id
+    store.add_memory(
+        subject_user_id=333,
+        subject_name="小李",
+        content="喜欢羽毛球",
+        visibility="shareable",
+        source_conversation="private:333",
+    )
+    store.add_episode(
+        conversation_id="private:222",
+        message_type="private",
+        group_id=None,
+        speaker_user_id=222,
+        speaker_name="小明",
+        user_content="我下周三去杭州",
+        assistant_content="知道了",
+    )
+    store.observe_message(
+        conversation_id="group:1:user:222",
+        message_type="group",
+        group_id=1,
+        speaker_user_id=222,
+        speaker_name="小明",
+        content="长期项目在杭州",
+    )
+    store.add_reflection(
+        content="小明可能在准备杭州项目",
+        visibility="shareable",
+        confidence=0.7,
+        source_memory_ids=[memory_id],
+    )
+    store.add_growth(
+        aspect="project",
+        content="圈子近期在讨论杭州",
+        visibility="shareable",
+        source_memory_ids=[memory_id],
+    )
+    deleted = store.purge_person(222)
+    assert deleted["memories"] == 1
+    assert deleted["episodes"] == 1
+    assert deleted["observations"] == 1
+    assert deleted["reflections"] == 1
+    assert deleted["growth"] == 1
+    assert store.get_person(222) is None
+    assert store.get_person(333) is not None
+    assert len(store.list_memories(333)) == 1
+
+
+def test_purge_all_clears_people_and_memory_tables(tmp_path) -> None:
+    store = SharedMemoryStore(tmp_path / "memory.db")
+    store.record_person(222, "小明")
+    store.add_memory(
+        subject_user_id=222,
+        subject_name="小明",
+        content="喜欢跑步",
+        visibility="shareable",
+        source_conversation="private:222",
+    )
+    store.add_episode(
+        conversation_id="private:222",
+        message_type="private",
+        group_id=None,
+        speaker_user_id=222,
+        speaker_name="小明",
+        user_content="我喜欢跑步",
+        assistant_content="不错",
+    )
+    deleted = store.purge_all()
+    assert deleted["people"] == 1
+    assert deleted["memories"] == 1
+    assert deleted["episodes"] == 1
+    assert store.stats()["people"] == 0
+    assert store.stats()["memories"] == 0
+    assert store.stats()["episodes"] == 0

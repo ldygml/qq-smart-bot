@@ -187,6 +187,14 @@ async def test_control_plane_proxies_group_settings(tmp_path, monkeypatch) -> No
             "/api/instances/9/group-profiles/100/reset",
             headers={"X-CSRF-Token": csrf},
         )
+        purge_person = await client.delete(
+            "/api/instances/9/people/123/all-memory",
+            headers={"X-CSRF-Token": csrf},
+        )
+        purge_all = await client.delete(
+            "/api/instances/9/memory/all",
+            headers={"X-CSRF-Token": csrf},
+        )
     assert response.status_code == 200
     assert calls[0][0] == 9
     assert calls[0][2] == "/api/admin/group-settings"
@@ -198,3 +206,8 @@ async def test_control_plane_proxies_group_settings(tmp_path, monkeypatch) -> No
     assert calls[1][4] == {"require_mention": True}
     assert reset_response.status_code == 200
     assert calls[2][2] == "/api/admin/group-profiles/100/reset"
+    assert purge_person.status_code == 200
+    assert calls[3][2] == "/api/admin/people/123/all-memory"
+    assert calls[3][3] == "DELETE"
+    assert purge_all.status_code == 200
+    assert calls[4][2] == "/api/admin/memory/all"

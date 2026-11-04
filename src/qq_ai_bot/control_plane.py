@@ -1281,6 +1281,37 @@ async def instance_delete_memory(
     )
 
 
+@app.delete("/api/instances/{instance_id}/people/{user_id}/all-memory")
+async def instance_purge_person_memory(
+    instance_id: int,
+    user_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/people/{user_id}/all-memory",
+        method="DELETE",
+    )
+
+
+@app.delete("/api/instances/{instance_id}/memory/all")
+async def instance_purge_all_memory(
+    instance_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/memory/all",
+        method="DELETE",
+    )
+
+
 @app.get("/api/instances/{instance_id}/group-settings")
 async def instance_group_settings(
     instance_id: int,

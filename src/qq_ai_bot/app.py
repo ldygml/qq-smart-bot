@@ -328,6 +328,32 @@ def create_app(
     app.state.settings = config
     app.state.memory = store
 
+    def _purge_person_memory(user_id: int) -> dict[str, Any]:
+        result = shared_memory.purge_person(user_id)
+        result["messages"] = store.delete_for_user(user_id)
+        result["vectors"] = 0
+        if vectors is not None:
+            result["vectors"] += vectors.delete_by_metadata_user(
+                "memory",
+                user_id,
+            )
+            result["vectors"] += vectors.delete_by_metadata_user(
+                "episode",
+                user_id,
+            )
+        group_histories.clear()
+        return result
+
+    def _purge_all_memory() -> dict[str, Any]:
+        result = shared_memory.purge_all()
+        result["messages"] = store.delete_all()
+        result["vectors"] = 0
+        if vectors is not None:
+            result["vectors"] += vectors.delete_namespace("memory")
+            result["vectors"] += vectors.delete_namespace("episode")
+        group_histories.clear()
+        return result
+
     def get_conversation_lock(conversation_id: str) -> asyncio.Lock:
         lock = conversation_locks.get(conversation_id)
         if lock is None:
@@ -485,6 +511,21 @@ def create_app(
             {"ok": removed},
             status_code=200 if removed else 404,
         )
+
+    @app.delete("/api/admin/people/{user_id}/all-memory")
+    async def admin_purge_person_memory(user_id: int) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "user_id": user_id,
+            "deleted": _purge_person_memory(user_id),
+        }
+
+    @app.delete("/api/admin/memory/all")
+    async def admin_purge_all_memory() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "deleted": _purge_all_memory(),
+        }
 
     @app.get("/api/admin/memory/timeline")
     async def admin_memory_timeline(
@@ -2758,8 +2799,13 @@ def create_app(
                 return f"已删除关于你的记忆 #{memory_id}。"
             return f"没有找到关于你的记忆 #{memory_id}。"
         if command == "/忘记我":
-            removed = shared_memory.forget_user(event.user_id or 0)
-            return f"已删除关于你的 {removed} 条长期记忆。"
+            deleted = _purge_person_memory(event.user_id or 0)
+            return (
+                f"已删除关于你的 {deleted['memories']} 条长期记忆、"
+                f"{deleted['episodes']} 条对话片段、"
+                f"{deleted['observations']} 条待处理观察和 "
+                f"{deleted['messages']} 条短期聊天记录。"
+            )
         if command == "/成长":
             growth = shared_memory.growth_summary(
                 limit=12,

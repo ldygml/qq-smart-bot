@@ -252,6 +252,52 @@ document.querySelector("#memory-person").addEventListener("change", async (event
   if (instanceId && event.target.value) await loadMemoryPerson(instanceId, Number(event.target.value));
 });
 
+document.querySelector("#purge-person-memory").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#memory-instance").value);
+  const personSelect = document.querySelector("#memory-person");
+  const personId = Number(personSelect.value);
+  const personName = personSelect.selectedOptions[0]?.textContent || String(personId);
+  const error = document.querySelector("#memory-error");
+  const result = document.querySelector("#memory-result");
+  error.textContent = "";
+  result.textContent = "";
+  if (!instanceId || !personId) {
+    error.textContent = "请选择实例和联系人。";
+    return;
+  }
+  if (!confirm(
+    `确定删除“${personName}”的全部记忆、画像、对话片段和相关反思吗？\n\n笔记、待办和提醒不会删除。此操作不可撤销。`
+  )) return;
+  try {
+    const data = await api(`/api/instances/${instanceId}/people/${personId}/all-memory`, {method:"DELETE"});
+    const deleted = data.deleted;
+    result.textContent = `已删除 ${deleted.memories} 条长期记忆、${deleted.episodes} 条对话片段、${deleted.messages} 条短期消息。`;
+    await loadMemoryPeople(instanceId);
+  } catch (err) { error.textContent = err.message; }
+});
+
+document.querySelector("#purge-all-memory").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#memory-instance").value);
+  const error = document.querySelector("#memory-error");
+  const result = document.querySelector("#memory-result");
+  error.textContent = "";
+  result.textContent = "";
+  if (!instanceId) {
+    error.textContent = "请选择机器人实例。";
+    return;
+  }
+  if (!confirm(
+    "确定清空这个实例所有联系人和全部记忆吗？\n\n将删除联系人、长期记忆、对话片段、观察、画像、反思、成长笔记、冲突、短期聊天和记忆向量。\n\n笔记、待办、提醒、群聊设置和知识库文件不会删除。此操作不可撤销。"
+  )) return;
+  try {
+    const data = await api(`/api/instances/${instanceId}/memory/all`, {method:"DELETE"});
+    const deleted = data.deleted;
+    result.textContent = `已清空 ${deleted.people} 个联系人、${deleted.memories} 条长期记忆、${deleted.episodes} 条对话片段和 ${deleted.messages} 条短期消息。`;
+    document.querySelector("#memory-person").innerHTML = `<option value="">暂无联系人</option>`;
+    document.querySelector("#memory-list").innerHTML = `<div class="empty">这个实例的记忆已经清空。</div>`;
+  } catch (err) { error.textContent = err.message; }
+});
+
 async function openGroupSettings(instanceId) {
   const select = document.querySelector("#settings-instance");
   select.innerHTML = instances

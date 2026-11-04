@@ -101,6 +101,26 @@ class ChatMemory:
             )
             return cursor.rowcount
 
+    def delete_for_user(self, user_id: int) -> int:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM messages
+                WHERE conversation_id = ?
+                   OR conversation_id LIKE ?
+                """,
+                (
+                    f"private:{user_id}",
+                    f"group:%:user:{user_id}",
+                ),
+            )
+            return cursor.rowcount
+
+    def delete_all(self) -> int:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute("DELETE FROM messages")
+            return cursor.rowcount
+
     def count(self, conversation_id: str) -> int:
         with self._lock, self._connect() as connection:
             row = connection.execute(

@@ -136,7 +136,12 @@
       <label>机器人实例<select id="memory-instance"></select></label>
       <label>联系人<select id="memory-person"></select></label>
       <div id="memory-list" class="memory-list"></div>
+      <div class="memory-danger-actions">
+        <button id="purge-person-memory">删除此人的全部记忆</button>
+        <button id="purge-all-memory">删除全部人的全部记忆</button>
+      </div>
       <p id="memory-error" class="error"></p>
+      <p id="memory-result" class="muted"></p>
     </section>
 
     <section class="notice"><b>QQ 绑定方式</b><span>实例启动后进入对应 NapCat WebUI 扫码登录。本站不提供 QQ 密码输入框，也不会处理你的 QQ 密码。</span></section>

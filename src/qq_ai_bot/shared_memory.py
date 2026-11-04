@@ -1495,13 +1495,87 @@ class SharedMemoryStore:
             return cursor.rowcount > 0
 
     def forget_user(self, user_id: int) -> int:
+        return self.purge_person(user_id)["memories"]
+
+    def purge_person(self, user_id: int) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
-            cursor = connection.execute(
+            person_row = connection.execute(
+                "SELECT display_name FROM shared_people WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            display_name = (
+                str(person_row["display_name"]).strip()
+                if person_row
+                else ""
+            )
+            memory_rows = connection.execute(
+                """
+                SELECT id FROM shared_memories
+                WHERE subject_user_id = ?
+                """,
+                (user_id,),
+            ).fetchall()
+            memory_ids = {int(row["id"]) for row in memory_rows}
+            episode_rows = connection.execute(
+                """
+                SELECT id FROM shared_episodes
+                WHERE speaker_user_id = ?
+                """,
+                (user_id,),
+            ).fetchall()
+            episode_ids = {int(row["id"]) for row in episode_rows}
+            reflection_ids: set[int] = set()
+            for row in connection.execute(
+                """
+                SELECT id, content, source_memory_ids
+                FROM shared_reflections
+                """
+            ).fetchall():
+                if memory_ids.intersection(
+                    _source_ids(row["source_memory_ids"])
+                ) or (
+                    len(display_name) >= 2
+                    and display_name in str(row["content"])
+                ):
+                    reflection_ids.add(int(row["id"]))
+            growth_ids: set[int] = set()
+            for row in connection.execute(
+                """
+                SELECT id, content, source_memory_ids
+                FROM shared_growth
+                """
+            ).fetchall():
+                if memory_ids.intersection(
+                    _source_ids(row["source_memory_ids"])
+                ) or (
+                    len(display_name) >= 2
+                    and display_name in str(row["content"])
+                ):
+                    growth_ids.add(int(row["id"]))
+
+            counts = {
+                "memories": len(memory_ids),
+                "episodes": len(episode_ids),
+                "observations": connection.execute(
+                    """
+                    DELETE FROM shared_observations
+                    WHERE speaker_user_id = ?
+                    """,
+                    (user_id,),
+                ).rowcount,
+                "reflections": 0,
+                "growth": 0,
+                "people": connection.execute(
+                    "DELETE FROM shared_people WHERE user_id = ?",
+                    (user_id,),
+                ).rowcount,
+            }
+            connection.execute(
                 "DELETE FROM shared_memories WHERE subject_user_id = ?",
                 (user_id,),
             )
             connection.execute(
-                "DELETE FROM shared_people WHERE user_id = ?",
+                "DELETE FROM shared_episodes WHERE speaker_user_id = ?",
                 (user_id,),
             )
             connection.execute(
@@ -1512,7 +1586,66 @@ class SharedMemoryStore:
                 "DELETE FROM memory_events WHERE subject_user_id = ?",
                 (user_id,),
             )
-            return cursor.rowcount
+            if reflection_ids:
+                placeholders = ",".join("?" for _ in reflection_ids)
+                cursor = connection.execute(
+                    f"DELETE FROM shared_reflections WHERE id IN ({placeholders})",
+                    list(reflection_ids),
+                )
+                counts["reflections"] = cursor.rowcount
+            if growth_ids:
+                placeholders = ",".join("?" for _ in growth_ids)
+                cursor = connection.execute(
+                    f"DELETE FROM shared_growth WHERE id IN ({placeholders})",
+                    list(growth_ids),
+                )
+                counts["growth"] = cursor.rowcount
+            connection.execute(
+                "DELETE FROM mind_state WHERE key = ?",
+                (f"profile_episode_cursor:{user_id}",),
+            )
+        return {
+            **counts,
+            "memory_ids": sorted(memory_ids),
+            "episode_ids": sorted(episode_ids),
+        }
+
+    def purge_all(self) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            counts = {
+                "people": connection.execute(
+                    "DELETE FROM shared_people"
+                ).rowcount,
+                "memories": connection.execute(
+                    "DELETE FROM shared_memories"
+                ).rowcount,
+                "episodes": connection.execute(
+                    "DELETE FROM shared_episodes"
+                ).rowcount,
+                "observations": connection.execute(
+                    "DELETE FROM shared_observations"
+                ).rowcount,
+                "reflections": connection.execute(
+                    "DELETE FROM shared_reflections"
+                ).rowcount,
+                "growth": connection.execute(
+                    "DELETE FROM shared_growth"
+                ).rowcount,
+                "conflicts": connection.execute(
+                    "DELETE FROM memory_conflicts"
+                ).rowcount,
+            }
+            connection.execute("DELETE FROM memory_events")
+            connection.execute(
+                """
+                DELETE FROM mind_state
+                WHERE key = 'last_reflected_memory_id'
+                   OR key = 'last_harvested_episode_id'
+                   OR key = 'last_harvested_observation_id'
+                   OR key LIKE 'profile_episode_cursor:%'
+                """
+            )
+        return counts
 
     def stats(self) -> dict[str, int]:
         with self._lock, self._connect() as connection:
@@ -2038,6 +2171,24 @@ def _parse_optional_id(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _source_ids(value: Any) -> set[int]:
+    try:
+        data = json.loads(str(value or "[]"))
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(data, list):
+        return set()
+    result: set[int] = set()
+    for item in data:
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            result.add(parsed)
+    return result
 
 
 def _utc_now() -> str:

@@ -1283,6 +1283,63 @@ async def test_admin_page_and_api(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_admin_memory_bulk_purge_endpoints(tmp_path) -> None:
+    shared = SharedMemoryStore(tmp_path / "shared.db")
+    chat_memory = ChatMemory(tmp_path / "memory.db")
+    for user_id, name in ((101, "甲"), (202, "乙")):
+        shared.record_person(user_id, name)
+        shared.add_memory(
+            subject_user_id=user_id,
+            subject_name=name,
+            content=f"{name}的长期记忆",
+            visibility="shareable",
+            source_conversation=f"private:{user_id}",
+        )
+        shared.add_episode(
+            conversation_id=f"private:{user_id}",
+            message_type="private",
+            group_id=None,
+            speaker_user_id=user_id,
+            speaker_name=name,
+            user_content=f"{name}说过的话",
+            assistant_content="回复",
+        )
+        chat_memory.append_exchange(
+            f"private:{user_id}",
+            "用户消息",
+            "机器人回复",
+            max_rows=10,
+        )
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=FakeChatClient(),
+        onebot_client=FakeOneBotClient(),
+        memory=chat_memory,
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        shared_memory_store=shared,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        one = await client.delete("/api/admin/people/101/all-memory")
+        assert one.status_code == 200
+        assert shared.get_person(101) is None
+        assert shared.get_person(202) is not None
+        assert chat_memory.count("private:101") == 0
+        assert chat_memory.count("private:202") == 2
+
+        everything = await client.delete("/api/admin/memory/all")
+        assert everything.status_code == 200
+    assert shared.stats()["people"] == 0
+    assert shared.stats()["memories"] == 0
+    assert shared.stats()["episodes"] == 0
+    assert chat_memory.stats()["stored_messages"] == 0
+
+
+@pytest.mark.asyncio
 async def test_smart_group_mode_can_stay_silent(tmp_path) -> None:
     sender = FakeOneBotClient()
     decider = FakeGroupDecider(False)

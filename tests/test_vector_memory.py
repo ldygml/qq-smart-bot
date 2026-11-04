@@ -25,3 +25,26 @@ def test_vector_source_count_and_deduplication(tmp_path) -> None:
     assert store.upsert_chunks([chunk], [[1.0, 0.0]]) == 1
     assert store.upsert_chunks([chunk], [[1.0, 0.0]]) == 0
     assert store.count("document") == 1
+
+
+def test_vector_memory_can_delete_user_chunks_or_namespace(tmp_path) -> None:
+    store = VectorMemoryStore(tmp_path / "vectors.db")
+    store.upsert_chunks(
+        [
+            VectorChunk("memory", "memory:1", "甲", "长期记忆", "甲的偏好"),
+            VectorChunk("episode", "episode:1", "甲", "私聊", "甲的对话"),
+        ],
+        [[1.0, 0.0], [1.0, 0.0]],
+        metadata={"user_id": 1},
+    )
+    store.upsert_chunks(
+        [VectorChunk("memory", "memory:2", "乙", "长期记忆", "乙的偏好")],
+        [[0.0, 1.0]],
+        metadata={"user_id": 2},
+    )
+    assert store.delete_by_metadata_user("memory", 1) == 1
+    assert store.delete_by_metadata_user("episode", 1) == 1
+    assert store.count("memory") == 1
+    assert store.count("episode") == 0
+    assert store.delete_namespace("memory") == 1
+    assert store.count("memory") == 0

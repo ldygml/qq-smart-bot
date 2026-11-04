@@ -32,3 +32,17 @@ def test_memory_prunes_old_rows(tmp_path) -> None:
     assert history[0]["content"] == "user-4"
     assert history[-1]["content"] == "assistant-5"
 
+
+def test_memory_can_delete_one_user_or_everything(tmp_path) -> None:
+    memory = ChatMemory(tmp_path / "chat.db")
+    memory.append_exchange("private:1", "a", "b", max_rows=10)
+    memory.append_exchange("group:9:user:1", "c", "d", max_rows=10)
+    memory.append_exchange("private:2", "e", "f", max_rows=10)
+
+    assert memory.delete_for_user(1) == 4
+    assert memory.history("private:1", 10) == []
+    assert memory.history("group:9:user:1", 10) == []
+    assert memory.count("private:2") == 2
+    assert memory.delete_all() == 2
+    assert memory.stats()["stored_messages"] == 0
+
