@@ -10,9 +10,14 @@ import pytest
 from docx import Document as WordDocument
 from pydantic import SecretStr
 
-from qq_ai_bot.app import create_app, _detect_natural_generation
+from qq_ai_bot.app import (
+    create_app,
+    _detect_natural_generation,
+    _wants_forced_research,
+)
 from qq_ai_bot.config import Settings
 from qq_ai_bot.content_tools import (
+    ContentGenerationError,
     generate_chart,
     generate_code,
     generate_document,
@@ -128,6 +133,13 @@ class RepairCodeChat(FeatureChat):
         )
 
 
+class SearchFailureChat(FeatureChat):
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        if extra_payload and extra_payload.get("enable_search"):
+            raise RuntimeError("search unavailable")
+        return "不应继续生成"
+
+
 @pytest.mark.parametrize(
     ("text", "command"),
     [
@@ -154,6 +166,22 @@ def test_natural_language_generation_intents(
 def test_question_about_charts_does_not_trigger_generation() -> None:
     assert _detect_natural_generation("这个图表怎么做才好看") is None
     assert _detect_natural_generation("这段 Python 代码怎么写") is None
+    assert _detect_natural_generation(
+        "联网搜索后再给我内容生成"
+    ) == ("/生成文档", "联网搜索后再给我内容生成")
+    assert _wants_forced_research("先联网搜索，再整理成 Word 发我")
+
+
+@pytest.mark.asyncio
+async def test_forced_research_failure_stops_generation(tmp_path) -> None:
+    with pytest.raises(ContentGenerationError, match="联网检索失败"):
+        await generate_document(
+            SearchFailureChat(),
+            model="test",
+            prompt="写一份普通文档",
+            output_dir=tmp_path,
+            force_research=True,
+        )
 
 
 @pytest.mark.asyncio

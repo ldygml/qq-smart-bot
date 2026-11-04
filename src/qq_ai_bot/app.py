@@ -919,6 +919,7 @@ def create_app(
     ) -> JSONResponse:
         kind = str(payload.get("kind") or "").strip()
         prompt = str(payload.get("prompt") or "").strip()
+        force_research = bool(payload.get("research", False))
         if not prompt:
             return JSONResponse(
                 {"detail": "prompt is required"},
@@ -938,6 +939,7 @@ def create_app(
                     model=config.llm_model,
                     prompt=prompt,
                     output_dir=_generated_media_dir(),
+                    force_research=force_research,
                 )
             elif kind == "file":
                 artifact = await generate_file(
@@ -945,6 +947,7 @@ def create_app(
                     model=config.llm_model,
                     prompt=prompt,
                     output_dir=_generated_media_dir(),
+                    force_research=force_research,
                 )
             elif kind == "code":
                 artifact = await generate_code(
@@ -2271,11 +2274,27 @@ def create_app(
             "/生成文档",
             "/生成文件",
             "/生成代码",
+            "/联网生成文档",
+            "/搜索生成文档",
+            "/联网生成文件",
+            "/搜索生成文件",
         ):
             if value == prefix or value.startswith(prefix + " "):
                 command = prefix
                 argument = value[len(prefix) :].strip()
                 break
+        if command in {
+            "/联网生成文档",
+            "/搜索生成文档",
+        }:
+            command = "/生成文档"
+            argument = "请先联网搜索并核对来源。" + argument
+        elif command in {
+            "/联网生成文件",
+            "/搜索生成文件",
+        }:
+            command = "/生成文件"
+            argument = "请先联网搜索并核对来源。" + argument
         if not command and value.startswith("用语音说"):
             command = "/发语音"
             argument = value[len("用语音说") :].lstrip("：:，, ")
@@ -2349,7 +2368,15 @@ def create_app(
             if not limiter.allow(str(event.user_id)):
                 await _safe_send(target, "生成请求太频繁，等一分钟再试。")
                 return True
-            await _safe_send(target, "正在生成可下载文件…")
+            force_research = _wants_forced_research(argument)
+            await _safe_send(
+                target,
+                (
+                    "正在联网核对资料，然后生成文件…"
+                    if force_research
+                    else "正在生成可下载文件…"
+                ),
+            )
             try:
                 artifact = (
                     await generate_document(
@@ -2357,6 +2384,7 @@ def create_app(
                         model=config.llm_model,
                         prompt=argument,
                         output_dir=_generated_media_dir(),
+                        force_research=force_research,
                     )
                     if command == "/生成文档"
                     else await generate_file(
@@ -2364,6 +2392,7 @@ def create_app(
                         model=config.llm_model,
                         prompt=argument,
                         output_dir=_generated_media_dir(),
+                        force_research=force_research,
                     )
                 )
                 await sender.upload_file(
@@ -2641,6 +2670,7 @@ def create_app(
                 "互动：/戳，或者私聊直接说“戳一戳”\n"
                 "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情；/表情库\n"
                 "生成：/生成图表 数据；/生成文档 要求；/生成文件 要求；/生成代码 需求\n"
+                "联网生成：/联网生成文档 要求；或说“先联网搜索，再整理成Word发我”\n"
                 "自然语言：写个Python脚本发我；整理资料发Word；做图表发我；导出CSV\n"
                 "反思：/反思，管理员可立即整理长期记忆\n"
                 "引用：机器人会引用你的原消息；引用机器人消息可以直接追问\n"
@@ -3094,6 +3124,26 @@ def _audio_instruction(text: str) -> str:
     )
 
 
+def _wants_forced_research(text: str) -> bool:
+    value = text.strip().lower()
+    return any(
+        marker in value
+        for marker in (
+            "联网搜索",
+            "联网核对",
+            "先搜索",
+            "先联网",
+            "搜索后再",
+            "查证后再",
+            "核实后再",
+            "网上查",
+            "上网查",
+            "查一下再",
+            "核实一下",
+        )
+    )
+
+
 def _detect_natural_generation(
     text: str,
 ) -> tuple[str, str] | None:
@@ -3151,6 +3201,11 @@ def _detect_natural_generation(
     )
     if asks_question and not asks_for_artifact:
         return None
+    if _wants_forced_research(value) and any(
+        marker in value
+        for marker in ("内容", "资料", "总结", "报告")
+    ):
+        return "/生成文档", value
     if any(
         marker in lowered
         for marker in ("图表", "柱状图", "折线图", "饼图", "可视化")

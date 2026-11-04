@@ -48,6 +48,10 @@ _RESEARCH_MARKERS = (
     "事实",
     "比赛",
     "最新",
+    "联网",
+    "搜索",
+    "查证",
+    "核实",
 )
 
 
@@ -56,8 +60,11 @@ async def _research_context(
     *,
     model: str,
     prompt: str,
+    required: bool = False,
 ) -> str:
-    if not any(marker in prompt for marker in _RESEARCH_MARKERS):
+    if not required and not any(
+        marker in prompt for marker in _RESEARCH_MARKERS
+    ):
         return ""
     try:
         reply = await chat_client.chat(
@@ -93,11 +100,19 @@ async def _research_context(
                 },
             },
         )
-    except Exception:
+    except Exception as exc:
+        if required:
+            raise ContentGenerationError(
+                "联网检索失败，已停止生成，避免发送没有来源核对的文档。"
+            ) from exc
         return ""
     try:
         data = _parse_json(reply)
-    except ContentGenerationError:
+    except ContentGenerationError as exc:
+        if required and "https://" not in reply and "http://" not in reply:
+            raise ContentGenerationError(
+                "联网检索没有返回可核实的来源，已停止生成。"
+            ) from exc
         return reply.strip()[:16_000]
     facts = data.get("facts")
     lines: list[str] = []
@@ -120,7 +135,12 @@ async def _research_context(
             value = str(item).strip()
             if value:
                 lines.append(f"- 未确认：{value}")
-    return "\n".join(lines)[:16_000]
+    context = "\n".join(lines)[:16_000]
+    if required and not context:
+        raise ContentGenerationError(
+            "联网检索没有返回可核实的事实，已停止生成。"
+        )
+    return context
 
 
 async def _audit_document(
@@ -234,11 +254,13 @@ async def generate_document(
     model: str,
     prompt: str,
     output_dir: Path,
+    force_research: bool = False,
 ) -> GeneratedArtifact:
     research = await _research_context(
         chat_client,
         model=model,
         prompt=prompt,
+        required=force_research,
     )
     lyrics_requested = "歌词" in prompt and any(
         marker in prompt for marker in ("完整", "全文", "收集", "整理", "生成")
@@ -356,11 +378,13 @@ async def generate_file(
     model: str,
     prompt: str,
     output_dir: Path,
+    force_research: bool = False,
 ) -> GeneratedArtifact:
     research = await _research_context(
         chat_client,
         model=model,
         prompt=prompt,
+        required=force_research,
     )
     reply = await chat_client.chat(
         [

@@ -665,6 +665,7 @@ $("#generate-submit").addEventListener("click", async () => {
     const result = await jsonRequest("/api/admin/generate", "POST", {
       kind: $("#generate-kind").value,
       prompt: $("#generate-prompt").value,
+      research: $("#generate-research").checked,
     });
     resultBox.innerHTML = `<div class="generated-result"><strong>${esc(result.summary)}</strong><br><a href="${esc(result.download_url)}">下载 ${esc(result.name)}</a>${result.kind === "image" ? `<br><img src="${esc(result.download_url)}" alt="${esc(result.name)}">` : ""}</div>`;
   } catch (error) {
