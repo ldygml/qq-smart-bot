@@ -885,6 +885,68 @@ async def test_current_news_request_enables_web_search(tmp_path) -> None:
     assert "当前时间" in llm.calls[0][0]["content"]
 
 
+@pytest.mark.asyncio
+async def test_group_can_remember_what_was_said_in_another_group(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    shared = SharedMemoryStore(tmp_path / "shared.db")
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=False,
+            shared_memory_enabled=True,
+            memory_privacy_protection=False,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        shared_memory_store=shared,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        for message_id, user_id, group_id, name, message in (
+            (2500, 111, 100, "小明", "我周末去看利物浦的比赛"),
+            (2501, 222, 200, "小李", "另一个群有人提到了利物浦吗"),
+        ):
+            await client.post(
+                "/onebot",
+                headers={"Authorization": "Bearer test-secret"},
+                json={
+                    "post_type": "message",
+                    "message_type": "group",
+                    "self_id": 999,
+                    "user_id": user_id,
+                    "group_id": group_id,
+                    "message_id": message_id,
+                    "message": message,
+                    "sender": {"nickname": name},
+                },
+            )
+            await _wait_for_condition(
+                lambda: shared.context_for(
+                    current_user_id=user_id,
+                    current_user_name=name,
+                    query=message,
+                    include_private=True,
+                        current_conversation_id="group:999:user:999",
+                ).find("最近其他会话片段") >= 0
+                if group_id == 100
+                else len(sender.sent) >= 2
+            )
+
+    system_prompts = [call[0]["content"] for call in llm.calls]
+    assert any(
+        "我周末去看利物浦的比赛" in prompt for prompt in system_prompts
+    )
+
+
 async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():

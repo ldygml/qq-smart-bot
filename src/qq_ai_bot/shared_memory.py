@@ -101,6 +101,22 @@ class SharedMemoryStore:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS shared_episodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    group_id INTEGER,
+                    speaker_user_id INTEGER NOT NULL,
+                    speaker_name TEXT NOT NULL,
+                    user_content TEXT NOT NULL,
+                    assistant_content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_shared_episodes_created
+                ON shared_episodes (id DESC);
+                CREATE INDEX IF NOT EXISTS idx_shared_episodes_speaker
+                ON shared_episodes (speaker_user_id, id DESC);
                 """
             )
 
@@ -201,6 +217,7 @@ class SharedMemoryStore:
         query: str,
         limit: int = 14,
         include_private: bool = False,
+        current_conversation_id: str = "",
     ) -> str:
         mentioned = self.mentioned_people(query)
         selected: dict[int, sqlite3.Row] = {}
@@ -249,18 +266,6 @@ class SharedMemoryStore:
                 selected[int(row["id"])] = row
 
         rows = list(selected.values())[: max(1, limit)]
-        if (
-            not rows
-            and not self.reflection_summary(
-                limit=1,
-                include_private=include_private,
-            )
-            and not self.growth_summary(
-                limit=1,
-                include_private=include_private,
-            )
-        ):
-            return ""
         lines = [
             "跨会话长期共享记忆：",
             f"当前联系人：{current_user_name}（QQ {current_user_id}）",
@@ -289,6 +294,39 @@ class SharedMemoryStore:
             lines.append("你的成长笔记（保持克制，不要刻意表现）：")
             for item in growth:
                 lines.append(f"- {item['content']}")
+
+        with self._lock, self._connect() as connection:
+            episode_rows = connection.execute(
+                """
+                SELECT conversation_id, message_type, group_id,
+                       speaker_user_id, speaker_name,
+                       user_content, assistant_content
+                FROM shared_episodes
+                WHERE conversation_id != ?
+                  AND (speaker_user_id = ? OR ? = 1)
+                ORDER BY id DESC
+                LIMIT 8
+                """,
+                (
+                    current_conversation_id,
+                    current_user_id,
+                    1 if include_private else 0,
+                ),
+            ).fetchall()
+        if episode_rows:
+            lines.append("最近其他会话片段（只在相关时自然引用）：")
+            for row in episode_rows:
+                context_label = (
+                    f"群 {row['group_id']}"
+                    if row["message_type"] == "group"
+                    else "私聊"
+                )
+                user_preview = str(row["user_content"]).replace("\n", " ")[:240]
+                bot_preview = str(row["assistant_content"]).replace("\n", " ")[:240]
+                lines.append(
+                    f"- [{context_label}] {row['speaker_name']}：{user_preview}；"
+                    f"你当时回复：{bot_preview}"
+                )
         return "\n".join(lines)
 
     def list_memories(self, user_id: int) -> list[dict[str, Any]]:
@@ -318,6 +356,41 @@ class SharedMemoryStore:
                 (memory_id, max(1, limit)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def add_episode(
+        self,
+        *,
+        conversation_id: str,
+        message_type: str,
+        group_id: int | None,
+        speaker_user_id: int,
+        speaker_name: str,
+        user_content: str,
+        assistant_content: str,
+    ) -> int:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO shared_episodes
+                    (
+                        conversation_id, message_type, group_id,
+                        speaker_user_id, speaker_name, user_content,
+                        assistant_content, created_at
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    message_type,
+                    group_id,
+                    speaker_user_id,
+                    speaker_name,
+                    user_content.strip(),
+                    assistant_content.strip(),
+                    _utc_now(),
+                ),
+            )
+            return int(cursor.lastrowid)
 
     def add_reflection(
         self,

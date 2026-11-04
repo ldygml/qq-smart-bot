@@ -506,6 +506,7 @@ def create_app(
                     query=text,
                     limit=config.memory_context_limit,
                     include_private=not config.memory_privacy_protection,
+                    current_conversation_id=conversation_id,
                 )
             history_text = (
                 f"[用户发送了 {len(loaded_images)} 张图片] {text}"
@@ -628,6 +629,7 @@ def create_app(
             target=target,
             display_name=display_name,
             user_text=text,
+            assistant_text=reply,
         )
 
     async def _process_file_request(
@@ -795,10 +797,20 @@ def create_app(
         target: ReplyTarget,
         display_name: str,
         user_text: str,
+        assistant_text: str,
     ) -> None:
         if not config.shared_memory_enabled or event.user_id is None:
             return
         try:
+            shared_memory.add_episode(
+                conversation_id=target.conversation_id,
+                message_type=target.message_type,
+                group_id=target.group_id,
+                speaker_user_id=event.user_id,
+                speaker_name=display_name,
+                user_content=user_text,
+                assistant_content=assistant_text,
+            )
             candidates = await extract_memory_candidates(
                 llm,
                 model=config.memory_model,

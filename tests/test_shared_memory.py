@@ -120,6 +120,29 @@ def test_forget_user_removes_all_personal_memories(tmp_path) -> None:
     assert store.list_memories(222) == []
 
 
+def test_cross_conversation_episode_is_visible_to_other_contact(tmp_path) -> None:
+    store = SharedMemoryStore(tmp_path / "memory.db")
+    store.record_person(222, "小明")
+    store.add_episode(
+        conversation_id="group:100:user:222",
+        message_type="group",
+        group_id=100,
+        speaker_user_id=222,
+        speaker_name="小明",
+        user_content="我周末去看利物浦的比赛",
+        assistant_content="行，别又看完骂中场。",
+    )
+    context = store.context_for(
+        current_user_id=333,
+        current_user_name="小李",
+        query="另一个群有人说了什么",
+        include_private=True,
+        current_conversation_id="group:200:user:333",
+    )
+    assert "我周末去看利物浦的比赛" in context
+    assert "别又看完骂中场" in context
+
+
 @pytest.mark.asyncio
 async def test_reflection_discovers_shareable_associations() -> None:
     memories = [
