@@ -23,6 +23,7 @@
     <button data-tab="stickers">表情包</button>
     <button data-tab="knowledge">知识来源</button>
     <button data-tab="operations">群聊与成本</button>
+    <button data-tab="evolution">自适应与状态</button>
     <button data-tab="generate">内容生成</button>
   </nav>
 
@@ -239,11 +240,14 @@
           <div class="field-row">
             <input id="group-member-id" inputmode="numeric" placeholder="QQ 号">
             <input id="group-member-name" placeholder="群昵称">
+            <input id="group-member-role" placeholder="群角色：owner/admin/member">
             <label class="check"><input id="group-member-no-jokes" type="checkbox"> 不要开玩笑</label>
             <input id="group-member-notes" placeholder="称呼、禁忌、偏好">
             <button id="save-group-member">保存成员偏好</button>
           </div>
           <div id="group-member-list" class="source-list"></div>
+          <h3>群成员关系图</h3>
+          <div id="group-relationship-list" class="source-list"></div>
         </div>
       </article>
       <article class="panel">
@@ -284,6 +288,33 @@
         </div>
         <p class="muted">机器人会根据各群中“普通消息被跳过”的比例提高沉默倾向，并在刚发言后进入冷却。艾特、引用机器人或明确命令不受影响。</p>
         <div id="group-list" class="source-list"></div>
+      </article>
+    </section>
+
+    <section id="evolution" class="tab">
+      <article class="panel">
+        <div class="detail-head">
+          <div><p class="eyebrow">ADAPTIVE BEHAVIOUR</p><h2>回复策略与在线状态</h2></div>
+          <button id="refresh-evolution">刷新</button>
+        </div>
+        <div class="field-row settings-row">
+          <label class="check"><input id="presence-busy" type="checkbox"> 当前忙碌</label>
+          <label>原因<input id="presence-reason" placeholder="开会、写作业、睡觉"></label>
+          <label>勿扰开始<input id="presence-quiet-start" placeholder="23:00"></label>
+          <label>勿扰结束<input id="presence-quiet-end" placeholder="07:00"></label>
+          <button id="save-presence" class="primary">保存状态</button>
+        </div>
+        <p id="presence-summary" class="muted"></p>
+        <h3>按联系人/群灰度中的表达策略</h3>
+        <div id="adaptive-rollouts" class="source-list"></div>
+        <h3>最近影子回复对比</h3>
+        <div id="adaptive-experiments" class="source-list"></div>
+        <h3>话题轨迹查询</h3>
+        <div class="field-row">
+          <input id="topic-scope-key" placeholder="user:123 或 group:456:user:123">
+          <button id="load-topics">查询</button>
+        </div>
+        <div id="topic-list" class="source-list"></div>
       </article>
     </section>
 

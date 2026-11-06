@@ -120,6 +120,13 @@ class Settings(BaseSettings):
     quality_review_enabled: bool = True
     quality_review_interval_seconds: float = 1800.0
     quality_review_batch_size: int = 8
+    adaptive_reply_enabled: bool = False
+    adaptive_reply_sample_rate: float = 0.15
+    contact_policy_enabled: bool = True
+    topic_state_enabled: bool = False
+    topic_update_after_messages: int = 3
+    topic_stale_after_hours: int = 12
+    presence_enabled: bool = True
     database_path: Path = Path("data/bot.db")
     owner_qq: int = 0
     timezone: str = "Asia/Shanghai"

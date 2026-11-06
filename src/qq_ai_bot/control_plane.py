@@ -1558,6 +1558,64 @@ async def instance_update_group_settings(
     )
 
 
+@app.get("/api/instances/{instance_id}/adaptive")
+async def instance_adaptive(
+    instance_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/adaptive",
+    )
+
+
+@app.get("/api/instances/{instance_id}/presence")
+async def instance_presence(
+    instance_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/presence",
+    )
+
+
+@app.post("/api/instances/{instance_id}/presence")
+async def instance_update_presence(
+    instance_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/presence",
+        method="PATCH",
+        json_body=payload,
+    )
+
+
+@app.get("/api/instances/{instance_id}/topics")
+async def instance_topics(
+    instance_id: int,
+    request: Request,
+    scope_key: str = "",
+) -> Any:
+    user = _request_user(request)
+    suffix = f"?scope_key={quote(scope_key)}" if scope_key else ""
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/topics{suffix}",
+    )
+
+
 @app.get("/api/instances/{instance_id}/group-profiles")
 async def instance_group_profiles(
     instance_id: int,

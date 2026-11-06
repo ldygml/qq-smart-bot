@@ -22,6 +22,7 @@ from qq_ai_bot.productivity import ProductivityStore
 from qq_ai_bot.quality import QualityStore
 from qq_ai_bot.shared_memory import SharedMemoryStore
 from qq_ai_bot.stickers import StickerStore
+from qq_ai_bot.topics import TopicCandidate, TopicStore
 from qq_ai_bot.vector_memory import VectorMemoryStore
 from qq_ai_bot.web_reader import WebArticle
 
@@ -373,6 +374,113 @@ async def test_recent_quality_feedback_guides_next_reply(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_adaptive_rollout_can_guide_a_reply(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    quality = QualityStore(tmp_path / "quality.db")
+    for _ in range(6):
+        quality.record_experiment(
+            quality_id=None,
+            user_id=123,
+            group_id=None,
+            challenger_name="warm_concise",
+            baseline_reply="你应该反思一下。",
+            challenger_reply="先缓缓，别急着逼自己。",
+            winner="challenger",
+            baseline_score=0.3,
+            challenger_score=0.8,
+        )
+    monkeypatch.setattr("qq_ai_bot.app.random.random", lambda: 0.0)
+    llm = FakeChatClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            adaptive_reply_enabled=True,
+            adaptive_reply_sample_rate=0,
+        ),
+        chat_client=llm,
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        quality_store=quality,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 804,
+                "message": "今天有点累",
+            },
+        )
+        await _wait_for_condition(lambda: bool(llm.calls))
+
+    assert "更自然、温和、精简" in llm.calls[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_active_topic_is_injected_into_conversation(tmp_path) -> None:
+    topic_store = TopicStore(tmp_path / "topics.db")
+    topic_store.upsert(
+        scope_key="user:123",
+        candidate=TopicCandidate(
+            title="课程展示",
+            summary="下周要做课程展示",
+            status="waiting",
+            pending_question="展示日期确认了吗？",
+        ),
+        user_id=123,
+        group_id=None,
+    )
+    llm = FakeChatClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            topic_state_enabled=True,
+            topic_update_after_messages=10,
+        ),
+        chat_client=llm,
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        topic_store=topic_store,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 805,
+                "message": "那个展示有点麻烦",
+            },
+        )
+        await _wait_for_condition(lambda: bool(llm.calls))
+
+    system_prompt = llm.calls[0][0]["content"]
+    assert "课程展示" in system_prompt
+    assert "展示日期确认了吗" in system_prompt
+
+
+@pytest.mark.asyncio
 async def test_private_message_gets_ai_reply(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()
@@ -606,6 +714,72 @@ async def test_group_can_reply_without_mention(tmp_path) -> None:
 
     assert sender.sent[0][0].group_id == 456
     assert sender.sent[0][1] == "测试回复"
+
+
+@pytest.mark.asyncio
+async def test_busy_state_queues_private_messages_until_resumed(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            owner_qq=123,
+            presence_enabled=True,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 1802,
+                "message": "/忙 写作业",
+            },
+        )
+        await _wait_for_condition(lambda: len(sender.sent) == 1)
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 1803,
+                "message": "在吗",
+            },
+        )
+        await asyncio.sleep(0.1)
+        assert llm.calls == []
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 1804,
+                "message": "/空闲",
+            },
+        )
+        await _wait_for_condition(lambda: len(sender.sent) == 2)
+
+    assert "1 条" in sender.sent[1][1]
+    assert "/忙" in sender.sent[0][1] or "不接话" in sender.sent[0][1]
 
 
 @pytest.mark.asyncio
@@ -1327,13 +1501,11 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
                 ],
             },
         )
-        await _wait_for_condition(lambda: bool(sender.sent))
+        await _wait_for_condition(lambda: bool(sender.stickers))
 
-    assert llm.models
     assert all(model == "qwen3.8-flash" for model in llm.models)
     assert all(model != "qwen3-vl-plus" for model in llm.models)
-    assert "表情包" in llm.calls[0][-1]["content"]
-    assert sender.sent[0][0].message_id is None
+    assert sender.sent == []
     assert sticker_store.count() == 1
     assert sender.stickers[0][1].summary == "奶龙"
     assert "QQ：123" in str(sticker_decider.last_kwargs["contact_context"])
@@ -1876,6 +2048,54 @@ async def test_group_profiles_use_original_names_and_keep_custom_names(
             if item["group_id"] == 93001
         )
         assert profile["name"] == "我的自定义群名"
+
+
+@pytest.mark.asyncio
+async def test_group_messages_learn_roles_and_member_relations(tmp_path) -> None:
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 999,
+                "group_id": 93010,
+                "user_id": 123,
+                "message_id": 2960,
+                "message": [
+                    {"type": "at", "data": {"qq": "456"}},
+                    {"type": "text", "data": {"text": " 你觉得呢"}},
+                ],
+                "sender": {"nickname": "小明", "role": "admin"},
+            },
+        )
+        await asyncio.sleep(0.1)
+        details = await client.get(
+            "/api/admin/group-profiles/93010/details"
+        )
+
+    members = details.json()["members"]
+    member = next(item for item in members if item["user_id"] == 123)
+    assert member["role"] == "admin"
+    assert details.json()["relationships"][0]["mention_count"] == 1
 
 
 @pytest.mark.asyncio

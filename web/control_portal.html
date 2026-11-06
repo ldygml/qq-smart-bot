@@ -129,17 +129,44 @@
       <div class="group-add-row">
         <input id="group-member-id" inputmode="numeric" placeholder="QQ 号">
         <input id="group-member-name" placeholder="群昵称">
+        <input id="group-member-role" placeholder="角色 owner/admin/member">
       </div>
       <input id="group-member-notes" placeholder="称呼、禁忌、偏好">
       <label class="check-row"><input id="group-member-no-jokes" type="checkbox"> 不要开玩笑</label>
       <button id="save-group-member">保存成员偏好</button>
       <div id="group-member-list" class="source-list"></div>
+      <p class="eyebrow">MEMBER RELATIONSHIPS</p>
+      <div id="group-relationship-list" class="source-list"></div>
       <div class="profile-actions">
         <button id="save-group-profile" class="primary">保存本群设置</button>
         <button id="reset-group-profile">恢复默认</button>
       </div>
       <p id="profile-error" class="error"></p>
       <p id="profile-result" class="muted"></p>
+    </section>
+
+    <section id="evolution-panel" class="form-panel" hidden>
+      <div class="panel-head"><div><p class="eyebrow">ADAPTIVE BEHAVIOUR</p><h2>自适应策略与在线状态</h2></div><button class="close" data-close="evolution-panel">×</button></div>
+      <label>机器人实例<select id="evolution-instance"></select></label>
+      <div class="settings-checks">
+        <label class="check-row"><input id="evolution-busy" type="checkbox"> 当前忙碌</label>
+      </div>
+      <div class="settings-fields">
+        <label>原因<input id="evolution-reason" placeholder="开会、睡觉"></label>
+        <label>勿扰开始<input id="evolution-quiet-start" placeholder="23:00"></label>
+        <label>勿扰结束<input id="evolution-quiet-end" placeholder="07:00"></label>
+      </div>
+      <button id="save-evolution-presence" class="primary">保存在线状态</button>
+      <p id="evolution-presence" class="muted"></p>
+      <p class="eyebrow">GRAY ROLLOUTS</p>
+      <div id="evolution-rollouts" class="source-list"></div>
+      <p class="eyebrow">TOPIC STATE</p>
+      <div class="group-add-row">
+        <input id="evolution-topic-scope" placeholder="user:123 或 group:456:user:123">
+        <button id="load-evolution-topics">查询话题</button>
+      </div>
+      <div id="evolution-topics" class="source-list"></div>
+      <p id="evolution-error" class="error"></p>
     </section>
 
     <section id="model-routes-panel" class="form-panel" hidden>

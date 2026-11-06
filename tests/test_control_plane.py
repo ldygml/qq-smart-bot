@@ -250,6 +250,64 @@ async def test_control_plane_proxies_group_settings(tmp_path, monkeypatch) -> No
     assert calls[5][2] == "/api/admin/memory/all"
 
 
+@pytest.mark.asyncio
+async def test_control_plane_proxies_evolution_endpoints(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = ControlStore(tmp_path / "control.db")
+    monkeypatch.setattr(control_plane, "store", store)
+    monkeypatch.setattr(control_plane, "secrets_box", SecretBox())
+    calls = []
+
+    async def fake_instance_admin_json(
+        instance_id,
+        user_id,
+        path,
+        *,
+        method="GET",
+        json_body=None,
+    ):
+        calls.append((instance_id, user_id, path, method, json_body))
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        control_plane,
+        "_instance_admin_json",
+        fake_instance_admin_json,
+    )
+    transport = httpx.ASGITransport(app=control_plane.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1:8090",
+    ) as client:
+        setup = await client.post(
+            "/api/auth/setup",
+            json={"username": "owner", "password": "secure-password"},
+        )
+        csrf = setup.json()["csrf_token"]
+        adaptive = await client.get("/api/instances/9/adaptive")
+        presence = await client.get("/api/instances/9/presence")
+        updated = await client.post(
+            "/api/instances/9/presence",
+            headers={"X-CSRF-Token": csrf},
+            json={"scope_key": "global", "busy": True},
+        )
+        topics = await client.get(
+            "/api/instances/9/topics",
+            params={"scope_key": "user:123"},
+        )
+    assert adaptive.status_code == 200
+    assert presence.status_code == 200
+    assert updated.status_code == 200
+    assert topics.status_code == 200
+    assert calls[0][2] == "/api/admin/adaptive"
+    assert calls[1][2] == "/api/admin/presence"
+    assert calls[2][2] == "/api/admin/presence"
+    assert calls[2][3] == "PATCH"
+    assert calls[3][2] == "/api/admin/topics?scope_key=user%3A123"
+
+
 def test_stop_instance_handles_stored_pid_and_listening_port(
     tmp_path,
     monkeypatch,

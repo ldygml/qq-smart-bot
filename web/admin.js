@@ -5,6 +5,7 @@ const state = {
   groupProfiles: [],
   groupKnowledge: [],
   groupMembers: [],
+  groupRelationships: [],
   groupFiles: [],
 };
 
@@ -65,6 +66,7 @@ document.querySelectorAll("nav button").forEach((button) => {
       stickers: loadStickers,
       knowledge: loadKnowledge,
       operations: loadOperations,
+      evolution: loadEvolution,
     };
     loaders[button.dataset.tab]?.().catch((error) => alert(error.message));
   });
@@ -778,9 +780,11 @@ async function loadGroupDetails(groupId) {
   const data = await api(`/api/admin/group-profiles/${groupId}/details`);
   state.groupKnowledge = data.knowledge;
   state.groupMembers = data.members;
+  state.groupRelationships = data.relationships || [];
   state.groupFiles = [];
   renderGroupKnowledge();
   renderGroupMembers();
+  renderGroupRelationships();
   renderGroupFiles();
 }
 
@@ -806,9 +810,23 @@ function renderGroupMembers() {
   $("#group-member-list").innerHTML = state.groupMembers.length
     ? state.groupMembers.map((item) => `
       <div class="row"><strong>${esc(item.nickname || item.user_id)}</strong> · QQ ${esc(item.user_id)}
+      ${item.role ? `<span class="tag">${esc(item.role)}</span>` : ""}
       ${item.no_jokes ? `<span class="tag">不要开玩笑</span>` : ""}
       <div class="row-meta">${esc(item.notes || "无额外偏好")}</div></div>`).join("")
     : `<div class="muted">暂无成员偏好</div>`;
+}
+
+function renderGroupRelationships() {
+  $("#group-relationship-list").innerHTML = state.groupRelationships.length
+    ? state.groupRelationships.map((item) => {
+      const nameA = item.name_a || item.user_a;
+      const nameB = item.name_b || item.user_b;
+      return `<div class="row"><strong>${esc(nameA)}</strong> ↔
+        <strong>${esc(nameB)}</strong>
+        <div class="row-meta">提及 ${esc(item.mention_count)} ·
+        回复 ${esc(item.reply_count)} · 戳一戳 ${esc(item.poke_count)}</div></div>`;
+    }).join("")
+    : `<div class="muted">还没有形成稳定的成员互动关系。</div>`;
 }
 
 function renderGroupFiles(data = null) {
@@ -940,11 +958,13 @@ $("#save-group-member").addEventListener("click", async () => {
     await jsonRequest(`/api/admin/group-profiles/${groupId}/members`, "POST", {
       user_id: memberId,
       nickname: $("#group-member-name").value.trim(),
+      role: $("#group-member-role").value.trim(),
       notes: $("#group-member-notes").value.trim(),
       no_jokes: $("#group-member-no-jokes").checked,
     });
     $("#group-member-id").value = "";
     $("#group-member-name").value = "";
+    $("#group-member-role").value = "";
     $("#group-member-notes").value = "";
     $("#group-member-no-jokes").checked = false;
     await loadGroupDetails(groupId);
@@ -1037,6 +1057,81 @@ $("#save-pricing").addEventListener("click", async () => {
     });
     await loadOperations();
   } catch (error) { alert(error.message); }
+});
+
+async function loadEvolution() {
+  const [adaptive, presenceData] = await Promise.all([
+    api("/api/admin/adaptive"),
+    api("/api/admin/presence"),
+  ]);
+  const global = presenceData.global || {};
+  $("#presence-busy").checked = Boolean(global.busy);
+  $("#presence-reason").value = global.reason || "";
+  $("#presence-quiet-start").value = global.quiet_start || "";
+  $("#presence-quiet-end").value = global.quiet_end || "";
+  $("#presence-summary").textContent =
+    `当前${global.busy ? "忙碌" : global.in_quiet_hours ? "处于勿扰时段" : "可以聊天"}，`
+    + `未接消息 ${presenceData.backlog?.length || 0} 条。`;
+  $("#adaptive-rollouts").innerHTML = adaptive.rollouts?.length
+    ? adaptive.rollouts.map((item) => `
+      <div class="row"><strong>${esc(item.scope_key)}</strong>
+      <span class="tag">${esc(item.challenger_name)} ${Math.round(Number(item.weight) * 100)}%</span>
+      <div class="row-meta">胜 ${esc(item.wins)} / 负 ${esc(item.losses)} · 样本 ${esc(item.samples)}</div></div>`).join("")
+    : `<div class="muted">还没有达到启用阈值的自适应策略。</div>`;
+  $("#adaptive-experiments").innerHTML = adaptive.experiments?.length
+    ? adaptive.experiments.map((item) => `
+      <article class="source-row">
+        <div><strong>${esc(item.scope_key)}</strong>
+        <span class="tag">${item.winner === "challenger" ? "候选更好" : "保留原版"}</span>
+        ${item.observed_outcome ? `<span class="tag">后续：${esc(item.observed_outcome)}</span>` : ""}</div>
+        <div class="row-meta">候选：${esc(item.challenger_reply)}</div>
+        <div class="row-meta">原版：${esc(item.baseline_reply)}</div>
+      </article>`).join("")
+    : `<div class="muted">还没有影子回复对比记录。</div>`;
+}
+
+$("#refresh-evolution").addEventListener("click", () => {
+  loadEvolution().catch((error) => alert(error.message));
+});
+
+$("#save-presence").addEventListener("click", async () => {
+  try {
+    await jsonRequest("/api/admin/presence", "PATCH", {
+      scope_key: "global",
+      busy: $("#presence-busy").checked,
+      reason: $("#presence-reason").value.trim(),
+      quiet_start: $("#presence-quiet-start").value.trim(),
+      quiet_end: $("#presence-quiet-end").value.trim(),
+    });
+    await loadEvolution();
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+$("#load-topics").addEventListener("click", async () => {
+  const scopeKey = $("#topic-scope-key").value.trim();
+  if (!scopeKey) return;
+  try {
+    const data = await api(`/api/admin/topics?scope_key=${encodeURIComponent(scopeKey)}`);
+    $("#topic-list").innerHTML = data.topics?.length
+      ? data.topics.map((item) => `
+        <article class="source-row">
+          <div><span class="tag">${esc(item.status)}</span> <strong>${esc(item.title)}</strong></div>
+          <div class="row-meta">${esc(item.summary)}</div>
+          ${item.pending_question ? `<div class="row-meta">等待回应：${esc(item.pending_question)}</div>` : ""}
+          <button data-resolve-topic="${item.id}">标记完成</button>
+        </article>`).join("")
+      : `<div class="muted">这个范围没有进行中的话题。</div>`;
+    document.querySelectorAll("[data-resolve-topic]").forEach((button) => {
+      button.onclick = async () => {
+        await api(`/api/admin/topics/${button.dataset.resolveTopic}/resolve`, {method:"POST"});
+        $("#load-topics").click();
+      };
+    });
+  } catch (error) {
+    alert(error.message);
+  }
 });
 
 $("#generate-submit").addEventListener("click", async () => {

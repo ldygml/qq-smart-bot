@@ -1,7 +1,7 @@
 let csrf = "";
 let providers = [];
 let instances = [];
-let groupDetails = {knowledge: [], members: []};
+let groupDetails = {knowledge: [], members: [], relationships: []};
 let groupFiles = [];
 
 async function api(path, options = {}) {
@@ -60,7 +60,7 @@ async function loadInstances() {
       <div class="item-head"><b>${esc(item.name)}</b><span class="status ${item.status === "online" ? "online" : ""}"><i></i>${esc(item.status)}</span></div>
       <div class="item-meta">127.0.0.1:${item.port} · ${esc(item.provider_name || "未知供应商")}<br>${esc(item.onebot_api_base)}</div>
       <div class="item-actions">
-        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-group-settings="${item.id}">群聊设置</button><button data-model-routes="${item.id}">模型路由</button><a href="${esc(item.dashboard_url)}" target="_blank">打开实例后台</a>` : `<button data-start="${item.id}">启动</button>`}
+        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-group-settings="${item.id}">群聊设置</button><button data-evolution="${item.id}">自适应与状态</button><button data-model-routes="${item.id}">模型路由</button><a href="${esc(item.dashboard_url)}" target="_blank">打开实例后台</a>` : `<button data-start="${item.id}">启动</button>`}
         <button data-edit-instance="${item.id}">编辑</button><button data-delete-instance="${item.id}">删除</button>
       </div>
     </article>`).join("") : `<div class="empty">还没有机器人实例</div>`;
@@ -73,6 +73,7 @@ function bindInstanceActions() {
   document.querySelectorAll("[data-restart]").forEach((b) => b.onclick = () => instanceAction(b.dataset.restart, "restart"));
   document.querySelectorAll("[data-memory]").forEach((b) => b.onclick = () => openMemory(Number(b.dataset.memory)));
   document.querySelectorAll("[data-group-settings]").forEach((b) => b.onclick = () => openGroupSettings(Number(b.dataset.groupSettings)));
+  document.querySelectorAll("[data-evolution]").forEach((b) => b.onclick = () => openEvolution(Number(b.dataset.evolution)));
   document.querySelectorAll("[data-model-routes]").forEach((b) => b.onclick = () => openModelRoutes(Number(b.dataset.modelRoutes)));
   document.querySelectorAll("[data-edit-instance]").forEach((b) => b.onclick = () => editInstance(Number(b.dataset.editInstance)));
   document.querySelectorAll("[data-delete-instance]").forEach((b) => b.onclick = () => deleteInstance(Number(b.dataset.deleteInstance)));
@@ -314,6 +315,39 @@ async function openGroupSettings(instanceId) {
   await loadGroupSettings(instanceId);
 }
 
+async function openEvolution(instanceId) {
+  const select = document.querySelector("#evolution-instance");
+  select.innerHTML = instances
+    .filter((item) => item.status === "online")
+    .map((item) => `<option value="${item.id}">${esc(item.name)} · :${item.port}</option>`)
+    .join("");
+  select.value = String(instanceId);
+  document.querySelector("#evolution-error").textContent = "";
+  openPanel("evolution-panel");
+  await loadEvolution(instanceId);
+}
+
+async function loadEvolution(instanceId) {
+  const [adaptive, presenceData] = await Promise.all([
+    api(`/api/instances/${instanceId}/adaptive`),
+    api(`/api/instances/${instanceId}/presence`),
+  ]);
+  const global = presenceData.global || {};
+  document.querySelector("#evolution-busy").checked = Boolean(global.busy);
+  document.querySelector("#evolution-reason").value = global.reason || "";
+  document.querySelector("#evolution-quiet-start").value = global.quiet_start || "";
+  document.querySelector("#evolution-quiet-end").value = global.quiet_end || "";
+  document.querySelector("#evolution-presence").textContent =
+    `当前${global.busy ? "忙碌" : global.in_quiet_hours ? "处于勿扰时段" : "可聊天"}，`
+    + `未接消息 ${presenceData.backlog?.length || 0} 条。`;
+  document.querySelector("#evolution-rollouts").innerHTML = adaptive.rollouts?.length
+    ? adaptive.rollouts.map((item) => `
+      <div class="row"><strong>${esc(item.scope_key)}</strong>
+      <span class="tag">${esc(item.challenger_name)} ${Math.round(Number(item.weight) * 100)}%</span>
+      <div class="row-meta">胜 ${esc(item.wins)} / 负 ${esc(item.losses)} · 样本 ${esc(item.samples)}</div></div>`).join("")
+    : `<div class="empty">还没有达到灰度阈值的策略</div>`;
+}
+
 async function loadGroupSettings(instanceId) {
   const error = document.querySelector("#settings-error");
   error.textContent = "";
@@ -400,6 +434,7 @@ async function loadGroupDetails(instanceId, groupId) {
   groupFiles = [];
   renderGroupKnowledge();
   renderGroupMembers();
+  renderGroupRelationships();
   renderGroupFiles();
 }
 
@@ -428,9 +463,21 @@ function renderGroupMembers() {
   list.innerHTML = groupDetails.members.length
     ? groupDetails.members.map((item) => `
       <div class="row"><strong>${esc(item.nickname || item.user_id)}</strong> · QQ ${esc(item.user_id)}
+      ${item.role ? `<span class="tag">${esc(item.role)}</span>` : ""}
       ${item.no_jokes ? `<span class="tag">不要开玩笑</span>` : ""}
       <div class="row-meta">${esc(item.notes || "无额外偏好")}</div></div>`).join("")
     : `<div class="empty">暂无成员偏好</div>`;
+}
+
+function renderGroupRelationships() {
+  const relationships = groupDetails.relationships || [];
+  document.querySelector("#group-relationship-list").innerHTML = relationships.length
+    ? relationships.map((item) => `
+      <div class="row"><strong>${esc(item.name_a || item.user_a)}</strong> ↔
+      <strong>${esc(item.name_b || item.user_b)}</strong>
+      <div class="row-meta">提及 ${esc(item.mention_count)} ·
+      回复 ${esc(item.reply_count)} · 戳 ${esc(item.poke_count)}</div></div>`).join("")
+    : `<div class="empty">还没有足够的成员互动记录</div>`;
 }
 
 function renderGroupFiles() {
@@ -549,12 +596,14 @@ document.querySelector("#save-group-member").addEventListener("click", async () 
       body:JSON.stringify({
         user_id:memberId,
         nickname:document.querySelector("#group-member-name").value.trim(),
+        role:document.querySelector("#group-member-role").value.trim(),
         notes:document.querySelector("#group-member-notes").value.trim(),
         no_jokes:document.querySelector("#group-member-no-jokes").checked,
       }),
     });
     document.querySelector("#group-member-id").value = "";
     document.querySelector("#group-member-name").value = "";
+    document.querySelector("#group-member-role").value = "";
     document.querySelector("#group-member-notes").value = "";
     document.querySelector("#group-member-no-jokes").checked = false;
     await loadGroupDetails(instanceId, groupId);
@@ -806,6 +855,57 @@ document.querySelector("#restore-backup").addEventListener("click", async () => 
   } finally {
     button.disabled = false;
     button.textContent = "停止实例并恢复";
+  }
+});
+
+document.querySelector("#evolution-instance").addEventListener("change", (event) => {
+  loadEvolution(Number(event.target.value)).catch((err) => {
+    document.querySelector("#evolution-error").textContent = err.message;
+  });
+});
+
+document.querySelector("#save-evolution-presence").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#evolution-instance").value);
+  const error = document.querySelector("#evolution-error");
+  error.textContent = "";
+  if (!instanceId) return;
+  try {
+    await api(`/api/instances/${instanceId}/presence`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        scope_key:"global",
+        busy:document.querySelector("#evolution-busy").checked,
+        reason:document.querySelector("#evolution-reason").value.trim(),
+        quiet_start:document.querySelector("#evolution-quiet-start").value.trim(),
+        quiet_end:document.querySelector("#evolution-quiet-end").value.trim(),
+      }),
+    });
+    await loadEvolution(instanceId);
+  } catch (err) {
+    error.textContent = err.message;
+  }
+});
+
+document.querySelector("#load-evolution-topics").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#evolution-instance").value);
+  const scopeKey = document.querySelector("#evolution-topic-scope").value.trim();
+  const error = document.querySelector("#evolution-error");
+  error.textContent = "";
+  if (!instanceId || !scopeKey) return;
+  try {
+    const data = await api(
+      `/api/instances/${instanceId}/topics?scope_key=${encodeURIComponent(scopeKey)}`
+    );
+    document.querySelector("#evolution-topics").innerHTML = data.topics?.length
+      ? data.topics.map((item) => `
+        <article class="source-row">
+          <div><span class="tag">${esc(item.status)}</span> <strong>${esc(item.title)}</strong></div>
+          <div class="row-meta">${esc(item.summary)}</div>
+        </article>`).join("")
+      : `<div class="empty">没有进行中的话题</div>`;
+  } catch (err) {
+    error.textContent = err.message;
   }
 });
 

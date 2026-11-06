@@ -613,54 +613,73 @@ class SharedMemoryStore:
         current_conversation_id: str = "",
     ) -> str:
         mentioned = self.mentioned_people(query)
-        selected: dict[int, sqlite3.Row] = {}
+        selected: dict[int, tuple[float, sqlite3.Row]] = {}
         with self._lock, self._connect() as connection:
             own_rows = connection.execute(
                 """
-                SELECT id, subject_user_id, subject_name, content, visibility
+                SELECT id, subject_user_id, subject_name, content, visibility,
+                       category, confidence, updated_at
                 FROM shared_memories
                 WHERE subject_user_id = ? AND status = 'active'
                 ORDER BY updated_at DESC, id DESC
-                LIMIT 6
+                LIMIT 24
                 """,
                 (current_user_id,),
             ).fetchall()
             for row in own_rows:
-                selected[int(row["id"])] = row
+                selected[int(row["id"])] = (
+                    _memory_effective_score(row, query) + 0.12,
+                    row,
+                )
 
             if mentioned:
                 placeholders = ",".join("?" for _ in mentioned)
                 mentioned_ids = [user_id for user_id, _ in mentioned]
                 mentioned_rows = connection.execute(
                     f"""
-                    SELECT id, subject_user_id, subject_name, content, visibility
+                    SELECT id, subject_user_id, subject_name, content,
+                           visibility, category, confidence, updated_at
                     FROM shared_memories
                     WHERE subject_user_id IN ({placeholders})
                       AND status = 'active'
                       AND (visibility = 'shareable' OR ? = 1)
                     ORDER BY updated_at DESC, id DESC
-                    LIMIT 8
+                    LIMIT 32
                     """,
                     [*mentioned_ids, 1 if include_private else 0],
                 ).fetchall()
                 for row in mentioned_rows:
-                    selected[int(row["id"])] = row
+                    selected[int(row["id"])] = (
+                        _memory_effective_score(row, query) + 0.08,
+                        row,
+                    )
 
             recent_rows = connection.execute(
                 """
-                SELECT id, subject_user_id, subject_name, content, visibility
+                SELECT id, subject_user_id, subject_name, content, visibility,
+                       category, confidence, updated_at
                 FROM shared_memories
                 WHERE status = 'active'
                   AND (visibility = 'shareable' OR ? = 1)
                 ORDER BY updated_at DESC, id DESC
-                LIMIT 6
+                LIMIT 24
                 """,
                 (1 if include_private else 0,),
             ).fetchall()
             for row in recent_rows:
-                selected[int(row["id"])] = row
+                selected[int(row["id"])] = (
+                    _memory_effective_score(row, query),
+                    row,
+                )
 
-        rows = list(selected.values())[: max(1, limit)]
+        rows = [
+            row
+            for _, row in sorted(
+                selected.values(),
+                key=lambda pair: (pair[0], str(pair[1]["updated_at"])),
+                reverse=True,
+            )[: max(1, limit)]
+        ]
         lines = [
             "跨会话长期共享记忆：",
             f"当前联系人：{current_user_name}（QQ {current_user_id}）",
@@ -683,8 +702,19 @@ class SharedMemoryStore:
             subject_name = str(row["subject_name"])
             if int(row["subject_user_id"]) == current_user_id:
                 subject_name = f"当前联系人 {subject_name}"
+            age_days = _memory_age_days(str(row["updated_at"]))
+            confidence = float(row["confidence"])
+            reliability = confidence * (
+                0.5 ** (age_days / _memory_half_life(str(row["category"])))
+            )
+            caution = (
+                "；旧信息，未经确认不要当成确定事实"
+                if reliability < 0.45
+                else ""
+            )
             lines.append(
-                f"- {subject_name}（{row['visibility']}）：{row['content']}"
+                f"- {subject_name}（{row['visibility']}，"
+                f"可靠度 {reliability:.2f}{caution}）：{row['content']}"
             )
         reflections = self.reflection_summary(limit=4)
         growth = self.growth_summary(limit=4)
@@ -2527,6 +2557,53 @@ def _parse_reflection_result(reply: str) -> ReflectionResult:
                 )
             )
     return ReflectionResult(reflections, growth)
+
+
+def _memory_age_days(value: str) -> float:
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            (datetime.now(timezone.utc) - parsed).total_seconds() / 86400,
+        )
+    except (TypeError, ValueError):
+        return 365.0
+
+
+def _memory_half_life(category: str) -> float:
+    return {
+        "commitment": 60.0,
+        "project": 90.0,
+        "event": 90.0,
+        "relationship": 180.0,
+        "preference": 240.0,
+        "profile": 365.0,
+    }.get(category, 120.0)
+
+
+def _memory_effective_score(row: sqlite3.Row, query: str) -> float:
+    confidence = min(1.0, max(0.0, float(row["confidence"] or 0.0)))
+    age_days = _memory_age_days(str(row["updated_at"] or ""))
+    decayed = confidence * (
+        0.5 ** (age_days / _memory_half_life(str(row["category"] or "")))
+    )
+    compact = re.sub(
+        r"[^\u4e00-\u9fffA-Za-z0-9]",
+        "",
+        query.lower(),
+    )
+    content = str(row["content"] or "").lower()
+    if not compact or not content:
+        return decayed
+    terms = {
+        compact[index : index + 2]
+        for index in range(max(0, len(compact) - 1))
+        if compact[index : index + 2] not in _COMMON_TERM_STOPS
+    }
+    matches = sum(1 for term in terms if term in content)
+    return decayed + min(0.2, matches * 0.025)
 
 
 def _normalize_label(value: str, default: str) -> str:

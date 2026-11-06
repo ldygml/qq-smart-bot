@@ -75,7 +75,13 @@ from .productivity import (
     parse_reminder_time,
     split_reminder_argument,
 )
-from .quality import QualityStore, evaluate_quality
+from .presence import PresenceError, PresenceStore
+from .quality import (
+    QualityStore,
+    compare_replies,
+    evaluate_quality,
+    reply_scope_key,
+)
 from .qq_format import format_qq_text
 from .ratelimit import SlidingWindowRateLimiter
 from .security import request_is_authorized
@@ -96,6 +102,7 @@ from .sticker_policy import (
     LLMStickerOrganizer,
     StickerChoiceDecider,
 )
+from .topics import TopicStore, infer_topics
 from .tts import TTSClient, TTSError
 from .usage import MeteredChatClient, UsageStore
 from .web_reader import WebArticleReader, WebReadError
@@ -210,6 +217,8 @@ def create_app(
     sticker_choice_decider: StickerChoiceDecider | None = None,
     sticker_organizer: LLMStickerOrganizer | None = None,
     quality_store: QualityStore | None = None,
+    topic_store: TopicStore | None = None,
+    presence_store: PresenceStore | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -232,6 +241,8 @@ def create_app(
     store = memory or ChatMemory(config.database_path)
     usage = UsageStore(config.database_path)
     quality = quality_store or QualityStore(config.database_path)
+    topics = topic_store or TopicStore(config.database_path)
+    presence = presence_store or PresenceStore(config.database_path)
     model_routes = parse_model_routes(
         config.model_routes_json.get_secret_value()
     )
@@ -388,6 +399,8 @@ def create_app(
         int,
         deque[tuple[str, float]],
     ] = {}
+    topic_message_counts: dict[str, int] = {}
+    strategy_comparison_inflight: set[str] = set()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -1227,6 +1240,63 @@ def create_app(
                 )
         return {"ok": True, "results": results}
 
+    @app.get("/api/admin/adaptive")
+    async def admin_adaptive() -> dict[str, Any]:
+        return quality.adaptive_snapshot()
+
+    @app.get("/api/admin/presence")
+    async def admin_presence() -> dict[str, Any]:
+        return {
+            "states": presence.snapshot(),
+            "backlog": presence.backlog(scope_key="global", limit=50),
+            "global": presence.status("global"),
+        }
+
+    @app.patch("/api/admin/presence")
+    async def admin_update_presence(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        scope_key = str(payload.get("scope_key") or "global").strip()
+        try:
+            if "busy" in payload:
+                presence.set_busy(
+                    scope_key,
+                    busy=bool(payload.get("busy")),
+                    reason=str(payload.get("reason") or ""),
+                )
+            if "quiet_start" in payload or "quiet_end" in payload:
+                presence.set_quiet_hours(
+                    scope_key,
+                    start=str(payload.get("quiet_start") or ""),
+                    end=str(payload.get("quiet_end") or ""),
+                    reason=str(payload.get("reason") or ""),
+                )
+        except PresenceError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        return JSONResponse(
+            {
+                "ok": True,
+                "state": presence.status(scope_key),
+            }
+        )
+
+    @app.get("/api/admin/topics")
+    async def admin_topics(scope_key: str = "") -> dict[str, Any]:
+        if not scope_key:
+            return {"topics": []}
+        return {
+            "scope_key": scope_key,
+            "topics": topics.active(
+                scope_key,
+                limit=20,
+                mark_stale_after_hours=config.topic_stale_after_hours,
+            ),
+        }
+
+    @app.post("/api/admin/topics/{topic_id}/resolve")
+    async def admin_resolve_topic(topic_id: int) -> dict[str, Any]:
+        return {"ok": topics.resolve(topic_id)}
+
     @app.get("/api/admin/group-behavior")
     async def admin_group_behavior() -> dict[str, Any]:
         return {"groups": group_behavior.list_policies()}
@@ -1459,6 +1529,7 @@ def create_app(
             },
             "knowledge": group_profiles.knowledge(group_id),
             "members": group_profiles.member_preferences(group_id),
+            "relationships": group_profiles.relationships(group_id),
         }
 
     @app.get("/api/admin/group-profiles/{group_id}/files")
@@ -1551,6 +1622,7 @@ def create_app(
             nickname=str(payload.get("nickname") or ""),
             notes=str(payload.get("notes") or ""),
             no_jokes=bool(payload.get("no_jokes", False)),
+            role=str(payload.get("role") or ""),
         )
         return {
             "ok": True,
@@ -1938,6 +2010,12 @@ def create_app(
 
         if target_id != event.self_id:
             if message_type == "group" and event.group_id is not None:
+                group_profiles.record_relation(
+                    event.group_id,
+                    poker_id,
+                    target_id,
+                    kind="poke",
+                )
                 content = (
                     f"{poker_name} 戳了 "
                     f"{target_name or f'QQ {target_id}'} 一下"
@@ -2415,6 +2493,204 @@ def create_app(
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
+    async def _handle_presence_command(
+        target: ReplyTarget,
+        user_id: int,
+        text: str,
+    ) -> bool:
+        if not config.presence_enabled:
+            return False
+        value = text.strip()
+        if value not in {
+            "/忙",
+            "/忙碌",
+            "/空闲",
+            "/勿扰",
+            "/取消勿扰",
+            "/未接消息",
+        } and not value.startswith(("/忙 ", "/忙碌 ", "/勿扰 ")):
+            return False
+        allowed = user_id == config.owner_qq or (
+            not config.owner_qq and target.message_type == "private"
+        )
+        if not allowed:
+            await _safe_send(target, "这个状态只有管理员能改。")
+            return True
+        if value in {"/忙", "/忙碌"} or value.startswith(("/忙 ", "/忙碌 ")):
+            reason = value.partition(" ")[2].strip()
+            state = presence.set_busy(
+                "global",
+                busy=True,
+                reason=reason,
+            )
+            suffix = f"：{state['reason']}" if state["reason"] else ""
+            await _safe_send(target, f"行，我先不接话{suffix}。")
+            return True
+        if value == "/空闲":
+            presence.set_busy("global", busy=False, reason="")
+            backlog = presence.backlog(scope_key="global", limit=30)
+            await _safe_send(
+                target,
+                (
+                    f"我回来了，刚才有 {len(backlog)} 条没接。"
+                    if backlog
+                    else "我回来了。"
+                ),
+            )
+            return True
+        if value.startswith("/勿扰"):
+            argument = value.partition(" ")[2].strip()
+            match = re.fullmatch(
+                r"((?:[01]?\d|2[0-3]):[0-5]\d)-((?:[01]?\d|2[0-3]):[0-5]\d)",
+                argument,
+            )
+            if not match:
+                await _safe_send(target, "用法：/勿扰 23:00-07:00")
+                return True
+            try:
+                presence.set_quiet_hours(
+                    "global",
+                    start=match.group(1),
+                    end=match.group(2),
+                )
+            except PresenceError as exc:
+                await _safe_send(target, str(exc))
+                return True
+            await _safe_send(
+                target,
+                f"好，{match.group(1)} 到 {match.group(2)} 我安静点。",
+            )
+            return True
+        if value == "/取消勿扰":
+            presence.set_quiet_hours("global", start="", end="")
+            await _safe_send(target, "勿扰时段取消了。")
+            return True
+        backlog = presence.backlog(scope_key="global", limit=30)
+        if not backlog:
+            await _safe_send(target, "没有漏下的消息。")
+        else:
+            lines = [f"刚才没接的有 {len(backlog)} 条："]
+            lines.extend(
+                f"- {item['content'][:160]}" for item in reversed(backlog)
+            )
+            await _safe_send(target, "\n".join(lines))
+        return True
+
+    def _queue_topic_update(
+        *,
+        target: ReplyTarget,
+        user_id: int,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        if not config.topic_state_enabled:
+            return
+        scope_key = reply_scope_key(user_id, target.group_id)
+        count = topic_message_counts.get(scope_key, 0) + 1
+        threshold = max(1, config.topic_update_after_messages)
+        if count < threshold:
+            topic_message_counts[scope_key] = count
+            return
+        topic_message_counts[scope_key] = 0
+        existing = topics.active(
+            scope_key,
+            limit=6,
+            mark_stale_after_hours=config.topic_stale_after_hours,
+        )
+
+        async def update() -> None:
+            try:
+                candidates = await infer_topics(
+                    client_for("reflection"),
+                    model=config.reflection_model,
+                    user_message=user_text,
+                    assistant_reply=assistant_text,
+                    existing_topics=existing,
+                )
+                for candidate in candidates:
+                    topics.upsert(
+                        scope_key=scope_key,
+                        candidate=candidate,
+                        user_id=user_id,
+                        group_id=target.group_id,
+                    )
+            except Exception:
+                logger.warning("Topic state update failed", exc_info=True)
+
+        task = asyncio.create_task(update())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+    def _queue_strategy_comparison(
+        *,
+        target: ReplyTarget,
+        quality_id: int | None,
+        user_text: str,
+        baseline_reply: str,
+        is_task: bool,
+    ) -> None:
+        if (
+            not config.adaptive_reply_enabled
+            or is_task
+            or not user_text.strip()
+            or len(baseline_reply) > 3000
+        ):
+            return
+        inflight_key = reply_scope_key(target.user_id, target.group_id)
+        if inflight_key in strategy_comparison_inflight:
+            return
+        if random.random() > min(
+            1.0,
+            max(0.0, config.adaptive_reply_sample_rate),
+        ):
+            return
+        strategy_comparison_inflight.add(inflight_key)
+
+        async def compare() -> None:
+            try:
+                challenger = await _rewrite_casual_reply(
+                    client_for("chat"),
+                    model=config.casual_model,
+                    draft=baseline_reply,
+                    user_text=user_text,
+                    variety_hint=(
+                        "改成更自然、温和、精简的熟人聊天方式。"
+                        "保留原回复的事实，不额外说教，不为了显得有性格而冷嘲。"
+                    ),
+                )
+                if (
+                    not challenger.strip()
+                    or challenger.strip() == baseline_reply.strip()
+                ):
+                    return
+                comparison = await compare_replies(
+                    client_for("reflection"),
+                    model=config.reflection_model,
+                    user_text=user_text,
+                    baseline=baseline_reply,
+                    challenger=challenger,
+                    contact_context=_sticker_contact_context(target),
+                )
+                quality.record_experiment(
+                    quality_id=quality_id,
+                    user_id=target.user_id,
+                    group_id=target.group_id,
+                    challenger_name="warm_concise",
+                    baseline_reply=baseline_reply,
+                    challenger_reply=challenger,
+                    winner=str(comparison["winner"]),
+                    baseline_score=float(comparison["baseline_score"]),
+                    challenger_score=float(comparison["challenger_score"]),
+                )
+            except Exception:
+                logger.warning("Reply strategy comparison failed", exc_info=True)
+            finally:
+                strategy_comparison_inflight.discard(inflight_key)
+
+        task = asyncio.create_task(compare())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
     async def _process_event(event: OneBotEvent) -> None:
         assert event.user_id is not None
         sender_info = event.sender or {}
@@ -2425,6 +2701,13 @@ def create_app(
         ).strip()
         if config.shared_memory_enabled:
             shared_memory.record_person(event.user_id, display_name)
+        if event.message_type == "group" and event.group_id is not None:
+            group_profiles.touch_member(
+                event.group_id,
+                event.user_id,
+                nickname=display_name,
+                role=str(sender_info.get("role") or ""),
+            )
 
         group_profile: GroupPolicy | None = None
         if event.message_type == "private":
@@ -2480,11 +2763,70 @@ def create_app(
         )
         text = re.sub(r"\[文件:[^\]]+\]", "", content.text)
         text = text.replace("[图片]", "").replace("[语音]", "").strip()
+        raw_user_text = re.sub(
+            r"\[(?:图片|语音|表情包)\]",
+            "",
+            content.text,
+        ).strip()
+        if await _handle_presence_command(
+            target,
+            event.user_id,
+            raw_user_text,
+        ):
+            return
+        if config.contact_policy_enabled:
+            quality.observe_style_request(
+                user_id=event.user_id,
+                group_id=event.group_id,
+                text=raw_user_text,
+            )
+        if (
+            config.presence_enabled
+            and target.message_type == "private"
+            and presence.is_quiet("global", config.timezone)
+            and not raw_user_text.startswith("/")
+        ):
+            presence.queue_message(
+                scope_key="global",
+                user_id=event.user_id,
+                group_id=event.group_id,
+                message_type=target.message_type,
+                content=raw_user_text or content.text,
+            )
+            return
         image_sources = content.image_sources[: max(0, config.max_images_per_message)]
         file_sources = content.file_sources[: max(0, config.max_files_per_message)]
         audio_sources = content.audio_sources
         sticker_summaries = content.sticker_summaries[:3]
         sticker_sources = content.sticker_sources[:3]
+        sticker_only = bool(sticker_sources) and not (
+            raw_user_text
+            or image_sources
+            or file_sources
+            or audio_sources
+        )
+        if event.group_id is not None:
+            for mentioned_id in content.mentioned_user_ids:
+                group_profiles.record_relation(
+                    event.group_id,
+                    event.user_id,
+                    mentioned_id,
+                    kind="mention",
+                )
+            if content.reply_id:
+                try:
+                    replied_user_id = await sender.get_msg_sender_id(
+                        content.reply_id
+                    )
+                except Exception:
+                    replied_user_id = None
+                if replied_user_id and replied_user_id != event.self_id:
+                    group_profiles.record_relation(
+                        event.group_id,
+                        event.user_id,
+                        replied_user_id,
+                        kind="reply",
+                    )
         for sticker in sticker_sources:
             sticker_id = stickers.record(sticker)
             if sticker_id is not None:
@@ -2632,6 +2974,20 @@ def create_app(
                 )
             )
             if (
+                config.presence_enabled
+                and presence.is_quiet("global", config.timezone)
+            ):
+                if directly_addressed and not text.startswith("/"):
+                    presence.queue_message(
+                        scope_key="global",
+                        user_id=event.user_id,
+                        group_id=event.group_id,
+                        message_type="group",
+                        content=text,
+                    )
+                group_behavior.record_ordinary_ignored(group_id)
+                return
+            if (
                 group_profile.require_mention
                 and not directly_addressed
             ):
@@ -2684,7 +3040,25 @@ def create_app(
         if not text and not image_sources and not file_sources and not audio_sources:
             text = "你好"
         if not text and image_sources:
-            text = "请分析这张图片。如果是题目，请给出解题步骤和最终答案。"
+            text = (
+                "看看这张图。先准确说出你注意到的关键内容，再像聊天一样自然回应；"
+                "只有明显是题目时才解答，不要主动展开成长篇分析。"
+            )
+
+        if sticker_only:
+            auto_sticker = (
+                group_profile.auto_sticker_enabled
+                if group_profile is not None
+                else config.auto_sticker_enabled
+            )
+            if auto_sticker and stickers.count() > 0:
+                await _maybe_send_sticker(
+                    target=target,
+                    user_text="对方只发了一个表情包",
+                    assistant_text="",
+                    explicit_request=False,
+                )
+            return
 
         poke_text = text.strip()
         if _is_poke_command_text(poke_text):
@@ -2897,6 +3271,38 @@ def create_app(
             variety_hint = _reply_variety_hint(history)
             if variety_hint:
                 system_prompt += "\n\n" + variety_hint
+            style_scope_key = reply_scope_key(
+                event.user_id,
+                event.group_id,
+            )
+            if config.contact_policy_enabled:
+                contact_policy = quality.contact_policy(
+                    user_id=event.user_id,
+                    group_id=event.group_id,
+                )
+                directives = contact_policy.get("directives") or []
+                if directives:
+                    system_prompt += (
+                        "\n\n根据这个联系人过去的真实反馈，调整表达：\n"
+                        + "\n".join(f"- {item}" for item in directives)
+                    )
+            if config.adaptive_reply_enabled:
+                rollout = quality.adaptive_style(
+                    user_id=event.user_id,
+                    group_id=event.group_id,
+                )
+                if (
+                    rollout is not None
+                    and random.random() < float(rollout["weight"])
+                ):
+                    system_prompt += (
+                        "\n\n本次采用“更自然、温和、精简”的表达策略："
+                        "先回应具体内容，少给建议，不复述，不为了显得有性格而怼人。"
+                    )
+            if config.topic_state_enabled:
+                topic_context = topics.context(style_scope_key, limit=5)
+                if topic_context:
+                    system_prompt += "\n\n" + topic_context
             if (
                 group_profile is not None
                 and group_profile.custom_prompt.strip()
@@ -2919,6 +3325,10 @@ def create_app(
                         f"\n当前群成员称呼："
                         f"{member_preference.get('nickname') or safe_display_name}。"
                     )
+                    if member_preference.get("role"):
+                        preference_text += (
+                            f"群内角色：{member_preference['role']}。"
+                        )
                     if member_preference.get("no_jokes"):
                         preference_text += "对方明确不喜欢玩笑，不要调侃。"
                     if member_preference.get("notes"):
@@ -2926,6 +3336,12 @@ def create_app(
                             f"成员偏好：{member_preference['notes']}"
                         )
                     system_prompt += preference_text
+                relationship_context = group_profiles.relationship_context(
+                    target.group_id,
+                    event.user_id,
+                )
+                if relationship_context:
+                    system_prompt += "\n\n" + relationship_context
                 group_context = group_profiles.knowledge_context(
                     target.group_id,
                     query=text,
@@ -3082,7 +3498,7 @@ def create_app(
                 except LLMError:
                     logger.warning("Casual reply rewrite failed; using original reply.")
             reply = format_qq_text(reply)
-            quality.record(
+            quality_id = quality.record(
                 conversation_id=conversation_id,
                 user_id=event.user_id,
                 group_id=event.group_id,
@@ -3098,6 +3514,19 @@ def create_app(
             )
 
         await _send_long_reply(target, reply)
+        _queue_topic_update(
+            target=target,
+            user_id=event.user_id,
+            user_text=text,
+            assistant_text=reply,
+        )
+        _queue_strategy_comparison(
+            target=target,
+            quality_id=quality_id,
+            user_text=text,
+            baseline_reply=reply,
+            is_task=is_task_request,
+        )
         if (
             (
                 group_profile.auto_sticker_enabled
@@ -4211,6 +4640,7 @@ def create_app(
                 "网页收藏：/收藏网页 URL，会写入知识库来源并参与后续检索\n"
                 "群知识：/群规则；/群公告；/群收藏 标题 | 重要内容；/加群资料 类型 | 标题 | 内容\n"
                 "互动：/戳；/戳 @群友；/戳 QQ号；也会回应别人对机器人的戳一戳\n"
+                "状态：/忙 开会；/空闲；/勿扰 23:00-07:00；/未接消息\n"
                 "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情；/表情库\n"
                 "生成：/生成图表 数据；/生成文档 要求；/生成文件 要求；/生成代码 需求\n"
                 "联网生成：/联网生成文档 要求；或说“先联网搜索，再整理成Word发我”\n"
@@ -4454,10 +4884,20 @@ def create_app(
         if command in {"/status", "/状态"}:
             if not config.owner_qq or event.user_id != config.owner_qq:
                 return "这个命令仅限管理员使用。"
+            presence_state = presence.status("global")
+            quiet_label = (
+                "忙碌"
+                if presence_state["busy"]
+                else "勿扰时段"
+                if presence_state["in_quiet_hours"]
+                else "可聊天"
+            )
             return (
                 f"模型：{config.llm_model}\n"
                 f"当前会话记录：{store.count(target.conversation_id)} 条\n"
                 f"群聊：{'开启' if config.enable_group else '关闭'}\n"
+                f"当前状态：{quiet_label}\n"
+                f"未接消息：{len(presence.backlog(scope_key='global', limit=50))} 条\n"
                 f"限流：{config.rate_limit_per_minute} 次/分钟\n"
                 f"视觉模型：{config.vision_model}"
             )

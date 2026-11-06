@@ -145,6 +145,36 @@ class GroupProfileStore:
                 )
                 """
             )
+            member_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(group_member_preferences)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("role", "TEXT NOT NULL DEFAULT ''"),
+                ("last_active_at", "TEXT"),
+                ("interaction_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in member_columns:
+                    connection.execute(
+                        f"ALTER TABLE group_member_preferences "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS group_member_relations (
+                    group_id INTEGER NOT NULL,
+                    user_a INTEGER NOT NULL,
+                    user_b INTEGER NOT NULL,
+                    mention_count INTEGER NOT NULL DEFAULT 0,
+                    reply_count INTEGER NOT NULL DEFAULT 0,
+                    poke_count INTEGER NOT NULL DEFAULT 0,
+                    last_at TEXT NOT NULL,
+                    PRIMARY KEY (group_id, user_a, user_b)
+                )
+                """
+            )
 
     def ensure(
         self,
@@ -431,7 +461,8 @@ class GroupProfileStore:
             row = connection.execute(
                 """
                 SELECT group_id, user_id, nickname, notes,
-                       no_jokes, updated_at
+                       no_jokes, role, last_active_at,
+                       interaction_count, updated_at
                 FROM group_member_preferences
                 WHERE group_id = ? AND user_id = ?
                 """,
@@ -447,7 +478,8 @@ class GroupProfileStore:
             rows = connection.execute(
                 """
                 SELECT group_id, user_id, nickname, notes,
-                       no_jokes, updated_at
+                       no_jokes, role, last_active_at,
+                       interaction_count, updated_at
                 FROM group_member_preferences
                 WHERE group_id = ?
                 ORDER BY updated_at DESC
@@ -464,6 +496,7 @@ class GroupProfileStore:
         nickname: str,
         notes: str,
         no_jokes: bool,
+        role: str = "",
     ) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -471,13 +504,17 @@ class GroupProfileStore:
                 INSERT INTO group_member_preferences
                     (
                         group_id, user_id, nickname, notes,
-                        no_jokes, updated_at
+                        no_jokes, role, updated_at
                     )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(group_id, user_id) DO UPDATE SET
                     nickname = excluded.nickname,
                     notes = excluded.notes,
                     no_jokes = excluded.no_jokes,
+                    role = CASE
+                        WHEN excluded.role != '' THEN excluded.role
+                        ELSE group_member_preferences.role
+                    END,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -486,9 +523,165 @@ class GroupProfileStore:
                     nickname.strip()[:120],
                     notes.strip()[:2000],
                     1 if no_jokes else 0,
+                    role.strip()[:40],
                     _utc_now(),
                 ),
             )
+
+    def touch_member(
+        self,
+        group_id: int,
+        user_id: int,
+        *,
+        nickname: str = "",
+        role: str = "",
+    ) -> None:
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO group_member_preferences
+                    (
+                        group_id, user_id, nickname, notes, no_jokes,
+                        role, last_active_at, interaction_count, updated_at
+                    )
+                VALUES (?, ?, ?, '', 0, ?, ?, 1, ?)
+                ON CONFLICT(group_id, user_id) DO UPDATE SET
+                    nickname = CASE
+                        WHEN excluded.nickname != ''
+                        THEN excluded.nickname
+                        ELSE group_member_preferences.nickname
+                    END,
+                    role = CASE
+                        WHEN excluded.role != ''
+                        THEN excluded.role
+                        ELSE group_member_preferences.role
+                    END,
+                    last_active_at = excluded.last_active_at,
+                    interaction_count =
+                        group_member_preferences.interaction_count + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    group_id,
+                    user_id,
+                    nickname.strip()[:120],
+                    role.strip()[:40],
+                    now,
+                    now,
+                ),
+            )
+
+    def record_relation(
+        self,
+        group_id: int,
+        source_user_id: int,
+        target_user_id: int,
+        *,
+        kind: str,
+    ) -> None:
+        if source_user_id <= 0 or target_user_id <= 0:
+            return
+        if source_user_id == target_user_id:
+            return
+        user_a, user_b = sorted((source_user_id, target_user_id))
+        column = {
+            "mention": "mention_count",
+            "reply": "reply_count",
+            "poke": "poke_count",
+        }.get(kind)
+        if column is None:
+            return
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                f"""
+                INSERT INTO group_member_relations
+                    (
+                        group_id, user_a, user_b,
+                        {column}, last_at
+                    )
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(group_id, user_a, user_b) DO UPDATE SET
+                    {column} = group_member_relations.{column} + 1,
+                    last_at = excluded.last_at
+                """,
+                (group_id, user_a, user_b, now),
+            )
+
+    def relationship_context(
+        self,
+        group_id: int,
+        user_id: int,
+        *,
+        limit: int = 5,
+    ) -> str:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    r.user_a, r.user_b, r.mention_count,
+                    r.reply_count, r.poke_count, r.last_at,
+                    COALESCE(pa.nickname, '') AS name_a,
+                    COALESCE(pb.nickname, '') AS name_b
+                FROM group_member_relations r
+                LEFT JOIN group_member_preferences pa
+                  ON pa.group_id = r.group_id AND pa.user_id = r.user_a
+                LEFT JOIN group_member_preferences pb
+                  ON pb.group_id = r.group_id AND pb.user_id = r.user_b
+                WHERE r.group_id = ?
+                  AND (r.user_a = ? OR r.user_b = ?)
+                ORDER BY
+                    (r.mention_count + r.reply_count + r.poke_count) DESC,
+                    r.last_at DESC
+                LIMIT ?
+                """,
+                (group_id, user_id, user_id, max(1, limit)),
+            ).fetchall()
+        if not rows:
+            return ""
+        lines = ["与该成员近期互动较多的人（只作关系参考，不要过度推断）："]
+        for row in rows:
+            target_id = (
+                int(row["user_b"])
+                if int(row["user_a"]) == user_id
+                else int(row["user_a"])
+            )
+            target_name = (
+                row["name_b"]
+                if int(row["user_a"]) == user_id
+                else row["name_a"]
+            ) or str(target_id)
+            counts = (
+                f"提及 {int(row['mention_count'])} 次、"
+                f"回复 {int(row['reply_count'])} 次、"
+                f"戳一戳 {int(row['poke_count'])} 次"
+            )
+            lines.append(f"- {target_name}（{target_id}）：{counts}")
+        return "\n".join(lines)
+
+    def relationships(self, group_id: int) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    r.user_a, r.user_b, r.mention_count,
+                    r.reply_count, r.poke_count, r.last_at,
+                    COALESCE(pa.nickname, '') AS name_a,
+                    COALESCE(pb.nickname, '') AS name_b
+                FROM group_member_relations r
+                LEFT JOIN group_member_preferences pa
+                  ON pa.group_id = r.group_id AND pa.user_id = r.user_a
+                LEFT JOIN group_member_preferences pb
+                  ON pb.group_id = r.group_id AND pb.user_id = r.user_b
+                WHERE r.group_id = ?
+                ORDER BY
+                    (r.mention_count + r.reply_count + r.poke_count) DESC,
+                    r.last_at DESC
+                """,
+                (group_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def _policy(row: sqlite3.Row) -> GroupPolicy:
