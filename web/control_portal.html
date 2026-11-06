@@ -169,6 +169,49 @@
       <p id="evolution-error" class="error"></p>
     </section>
 
+    <section id="unified-panel" class="form-panel" hidden>
+      <div class="panel-head"><div><p class="eyebrow">INSTANCE WORKSPACE</p><h2>实例内容管理</h2></div><button class="close" data-close="unified-panel">×</button></div>
+      <label>机器人实例<select id="unified-instance"></select></label>
+      <div class="panel-head"><h2>回复质量</h2><button id="review-instance-quality">评测最近回复</button></div>
+      <div id="unified-quality-list" class="source-list"></div>
+      <div class="settings-divider"></div>
+      <div class="panel-head"><h2>表情包</h2><button id="organize-instance-stickers">自动整理未分类</button></div>
+      <div id="unified-sticker-list" class="source-list"></div>
+      <div class="settings-divider"></div>
+      <div class="panel-head"><h2>知识来源</h2><button id="refresh-instance-knowledge">刷新</button></div>
+      <div id="unified-knowledge-list" class="source-list"></div>
+      <div class="settings-divider"></div>
+      <div class="panel-head"><h2>安全审计</h2><button id="refresh-audit">刷新</button></div>
+      <div id="audit-list" class="source-list"></div>
+      <p id="unified-error" class="error"></p>
+    </section>
+
+    <section id="chat-test-panel" class="form-panel" hidden>
+      <div class="panel-head"><div><p class="eyebrow">CONVERSATION SANDBOX</p><h2>网页聊天测试器</h2></div><button class="close" data-close="chat-test-panel">×</button></div>
+      <label>机器人实例<select id="test-instance"></select></label>
+      <div class="settings-fields">
+        <label>会话类型<select id="test-message-type"><option value="private">私聊</option><option value="group">群聊</option></select></label>
+        <label>用户 QQ<input id="test-user-id" value="10001"></label>
+        <label>群号<input id="test-group-id" placeholder="群聊时填写"></label>
+        <label>显示名<input id="test-display-name" value="测试用户"></label>
+      </div>
+      <label class="check-row"><input id="test-mentioned" type="checkbox"> 视为已 @ 机器人</label>
+      <label class="check-row"><input id="test-memory" type="checkbox" checked> 使用已有长期记忆</label>
+      <label>测试消息<textarea id="test-message" rows="4" placeholder="不会发送到 QQ"></textarea></label>
+      <button id="run-chat-test" class="primary">运行测试</button>
+      <p id="test-error" class="error"></p>
+      <article id="test-result" class="source-row" hidden></article>
+    </section>
+
+    <section id="trace-panel" class="form-panel" hidden>
+      <div class="panel-head"><div><p class="eyebrow">MESSAGE TRACE</p><h2>消息处理追踪</h2></div><button class="close" data-close="trace-panel">×</button></div>
+      <label>机器人实例<select id="trace-instance"></select></label>
+      <label class="check-row"><input id="trace-skipped-only" type="checkbox"> 只看未回复</label>
+      <button id="refresh-traces">刷新追踪</button>
+      <div id="trace-list" class="source-list"></div>
+      <p id="trace-error" class="error"></p>
+    </section>
+
     <section id="model-routes-panel" class="form-panel" hidden>
       <div class="panel-head"><div><p class="eyebrow">MODEL ROUTING</p><h2>全能力模型路由</h2></div><button class="close" data-close="model-routes-panel">×</button></div>
       <label>机器人实例<select id="routes-instance"></select></label>

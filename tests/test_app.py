@@ -23,6 +23,7 @@ from qq_ai_bot.quality import QualityStore
 from qq_ai_bot.shared_memory import SharedMemoryStore
 from qq_ai_bot.stickers import StickerStore
 from qq_ai_bot.topics import TopicCandidate, TopicStore
+from qq_ai_bot.tracing import MessageTraceStore
 from qq_ai_bot.vector_memory import VectorMemoryStore
 from qq_ai_bot.web_reader import WebArticle
 
@@ -278,6 +279,109 @@ def test_reply_variety_hint_detects_repeated_openings() -> None:
     hint = _reply_variety_hint(history)
     assert "最近重复较多的开头" in hint
     assert "行，" in hint
+
+
+@pytest.mark.asyncio
+async def test_admin_routes_require_owner_token_when_enabled(tmp_path) -> None:
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            admin_require_auth=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        denied = await client.get("/api/admin/overview")
+        allowed = await client.get(
+            "/api/admin/overview",
+            headers={"X-Bot-Admin-Token": "test-secret"},
+        )
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_message_trace_records_group_silence_reason(tmp_path) -> None:
+    trace_store = MessageTraceStore(tmp_path / "traces.db")
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        trace_store=trace_store,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 999,
+                "user_id": 123,
+                "group_id": 456,
+                "message_id": 806,
+                "message": "今天群里有人踢球吗",
+            },
+        )
+        await _wait_for_condition(
+            lambda: bool(trace_store.list_recent(limit=1))
+        )
+
+    trace = trace_store.list_recent(limit=1)[0]
+    assert trace["status"] == "skipped"
+    assert "@" in trace["reason"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_test_endpoint_does_not_send_qq_message(
+    tmp_path,
+) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = await client.post(
+            "/api/admin/conversation-test",
+            json={
+                "message_type": "private",
+                "user_id": 123,
+                "display_name": "测试用户",
+                "message": "今天有点累",
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["reply"] == "测试回复"
+    assert sender.sent == []
 
 
 @pytest.mark.asyncio

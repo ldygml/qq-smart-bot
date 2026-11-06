@@ -20,6 +20,8 @@ class Settings(BaseSettings):
 
     onebot_api_base: str = "http://127.0.0.1:3000"
     onebot_token: SecretStr = SecretStr("")
+    admin_api_token: SecretStr = SecretStr("")
+    admin_require_auth: bool = False
 
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_model: str = "qwen-plus"
@@ -229,6 +231,13 @@ class Settings(BaseSettings):
         if "api.openai.com" in host:
             return self.openai_api_key.get_secret_value()
         return ""
+
+    @property
+    def effective_admin_token(self) -> str:
+        return (
+            self.admin_api_token.get_secret_value()
+            or self.onebot_token.get_secret_value()
+        )
 
     def _load_persona_prompt(self) -> str:
         path = self.persona_prompt_path

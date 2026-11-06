@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import logging
 import random
 import re
@@ -10,6 +11,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -103,11 +105,16 @@ from .sticker_policy import (
     StickerChoiceDecider,
 )
 from .topics import TopicStore, infer_topics
+from .tracing import MessageTrace, MessageTraceStore
 from .tts import TTSClient, TTSError
 from .usage import MeteredChatClient, UsageStore
 from .web_reader import WebArticleReader, WebReadError
 
 logger = logging.getLogger(__name__)
+current_message_trace: ContextVar[MessageTrace | None] = ContextVar(
+    "current_message_trace",
+    default=None,
+)
 MAX_WEBHOOK_BYTES = 1_048_576
 QQ_TRANSPORT_CHUNK_CHARS = 1500
 AI_COMMAND_PROMPTS = {
@@ -219,6 +226,7 @@ def create_app(
     quality_store: QualityStore | None = None,
     topic_store: TopicStore | None = None,
     presence_store: PresenceStore | None = None,
+    trace_store: MessageTraceStore | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -243,6 +251,7 @@ def create_app(
     quality = quality_store or QualityStore(config.database_path)
     topics = topic_store or TopicStore(config.database_path)
     presence = presence_store or PresenceStore(config.database_path)
+    traces = trace_store or MessageTraceStore(config.database_path)
     model_routes = parse_model_routes(
         config.model_routes_json.get_secret_value()
     )
@@ -447,6 +456,27 @@ def create_app(
     )
     app.state.settings = config
     app.state.memory = store
+
+    @app.middleware("http")
+    async def protect_admin_routes(request: Request, call_next):
+        path = request.url.path
+        protected = (
+            path == "/admin"
+            or path.startswith("/admin/")
+            or path.startswith("/api/admin/")
+        )
+        if protected and config.admin_require_auth:
+            supplied = request.headers.get("X-Bot-Admin-Token", "")
+            expected = config.effective_admin_token
+            if not supplied or not expected or not hmac.compare_digest(
+                supplied,
+                expected,
+            ):
+                return JSONResponse(
+                    {"detail": "owner console authentication required"},
+                    status_code=401,
+                )
+        return await call_next(request)
 
     def _purge_person_memory(user_id: int) -> dict[str, Any]:
         result = shared_memory.purge_person(user_id)
@@ -1046,11 +1076,23 @@ def create_app(
         sticker_id: int,
         payload: dict[str, Any] = Body(...),
     ) -> JSONResponse:
+        current = stickers.get_metadata(sticker_id) or {}
         updated = stickers.update(
             sticker_id,
-            category=str(payload.get("category") or "未分类"),
-            usage_hint=str(payload.get("usage_hint") or ""),
-            enabled=bool(payload.get("enabled", True)),
+            category=str(
+                payload.get("category")
+                or current.get("category")
+                or "未分类"
+            ),
+            usage_hint=str(
+                payload.get("usage_hint")
+                if "usage_hint" in payload
+                else current.get("usage_hint")
+                or ""
+            ),
+            enabled=bool(
+                payload.get("enabled", current.get("enabled", True))
+            ),
         )
         return JSONResponse(
             {"ok": updated},
@@ -1250,6 +1292,221 @@ def create_app(
             "states": presence.snapshot(),
             "backlog": presence.backlog(scope_key="global", limit=50),
             "global": presence.status("global"),
+        }
+
+    @app.get("/api/admin/traces")
+    async def admin_traces(
+        limit: int = 100,
+        skipped_only: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "traces": traces.list_recent(
+                limit=limit,
+                skipped_only=skipped_only,
+            )
+        }
+
+    @app.get("/api/admin/traces/{trace_id}")
+    async def admin_trace(trace_id: str) -> dict[str, Any]:
+        item = traces.get(trace_id)
+        if item is None:
+            return JSONResponse(
+                {"detail": "trace not found"},
+                status_code=404,
+            )
+        return item
+
+    @app.post("/api/admin/conversation-test")
+    async def admin_conversation_test(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        text = str(payload.get("message") or "").strip()
+        if not text:
+            return JSONResponse(
+                {"detail": "测试消息不能为空"},
+                status_code=400,
+            )
+        message_type = str(
+            payload.get("message_type") or "private"
+        ).strip()
+        if message_type not in {"private", "group"}:
+            return JSONResponse(
+                {"detail": "message_type 必须是 private 或 group"},
+                status_code=400,
+            )
+        user_id = _optional_int(payload.get("user_id")) or 10001
+        group_id = _optional_int(payload.get("group_id"))
+        if message_type == "group" and group_id is None:
+            return JSONResponse(
+                {"detail": "群聊测试需要 group_id"},
+                status_code=400,
+            )
+        display_name = str(
+            payload.get("display_name") or "测试用户"
+        ).strip()[:40]
+        mentioned = bool(payload.get("mentioned", False))
+        if (
+            config.presence_enabled
+            and presence.is_quiet("global", config.timezone)
+        ):
+            return {
+                "ok": True,
+                "status": "skipped",
+                "reason": "机器人处于忙碌或勿扰状态",
+                "reply": "",
+            }
+        group_profile: GroupPolicy | None = None
+        if group_id is not None:
+            group_profile = group_profiles.ensure(
+                group_id,
+                defaults=_default_group_profile_values(config),
+                name=group_name_cache.get(group_id, ""),
+            )
+            prefixes = group_profile.trigger_prefix_values
+            directly_addressed = (
+                mentioned
+                or text.startswith("/")
+                or config.bot_name in text
+                or any(text.lower().startswith(p.lower()) for p in prefixes)
+            )
+            if group_profile.require_mention and not directly_addressed:
+                return {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "当前群要求 @、引用或触发前缀",
+                    "reply": "",
+                }
+            if (
+                group_profile.smart_participation
+                and not directly_addressed
+            ):
+                decision = await _decider_for_group(
+                    group_profile
+                ).should_reply(
+                    history=[],
+                    current_sender=display_name,
+                    current_text=text,
+                )
+                if not decision:
+                    return {
+                        "ok": True,
+                        "status": "skipped",
+                        "reason": "群聊参与判断认为不需要插话",
+                        "reply": "",
+                    }
+        raw_history = payload.get("history")
+        history: list[dict[str, str]] = []
+        if isinstance(raw_history, list):
+            for item in raw_history[-20:]:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "")
+                content = str(item.get("content") or "").strip()
+                if role in {"user", "assistant"} and content:
+                    history.append(
+                        {"role": role, "content": content[:4000]}
+                    )
+        scope_key = reply_scope_key(user_id, group_id)
+        system_prompt = (
+            config.effective_system_prompt
+            if _looks_like_task_request(text)
+            else config.casual_system_prompt
+        )
+        system_prompt += (
+            f"\n\n当前时间：{datetime.now(ZoneInfo(config.timezone)):%Y-%m-%d %H:%M}。"
+            f"\n当前聊天对象显示名：{display_name}。不要每句话都叫名字。"
+        )
+        if group_profile is not None and group_profile.custom_prompt.strip():
+            system_prompt += (
+                "\n当前群专属规则："
+                + group_profile.custom_prompt[:2000]
+            )
+        if group_id is not None:
+            relationship = group_profiles.relationship_context(
+                group_id,
+                user_id,
+            )
+            if relationship:
+                system_prompt += "\n" + relationship
+            group_knowledge = group_profiles.knowledge_context(
+                group_id,
+                query=text,
+            )
+            if group_knowledge:
+                system_prompt += (
+                    "\n当前群资料（相关时自然使用）：\n"
+                    + group_knowledge
+                )
+        memory_context = ""
+        if config.shared_memory_enabled and payload.get("use_memory", True):
+            memory_context = shared_memory.context_for(
+                current_user_id=user_id,
+                current_user_name=display_name,
+                query=text,
+                limit=config.memory_context_limit,
+                include_private=not config.memory_privacy_protection,
+                current_conversation_id="admin-test",
+            )
+            if memory_context:
+                system_prompt += (
+                    "\n按话题自然使用以下记忆，不要逐条朗读：\n"
+                    + memory_context
+                )
+        policy = quality.contact_policy(
+            user_id=user_id,
+            group_id=group_id,
+        )
+        if policy.get("directives"):
+            system_prompt += (
+                "\n联系人策略：\n"
+                + "\n".join(f"- {item}" for item in policy["directives"])
+            )
+        topic_context = topics.context(scope_key, limit=5)
+        if topic_context:
+            system_prompt += "\n" + topic_context
+        strategy = "baseline"
+        rollout = quality.adaptive_style(
+            user_id=user_id,
+            group_id=group_id,
+        )
+        if (
+            rollout is not None
+            and random.random() < float(rollout["weight"])
+        ):
+            strategy = str(rollout["challenger_name"])
+            system_prompt += (
+                "\n本次采用更自然、温和、精简的表达策略。"
+            )
+        model = (
+            config.llm_model
+            if _looks_like_task_request(text)
+            else config.casual_model
+        )
+        started = time.perf_counter()
+        try:
+            reply = await client_for("chat").chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    *history,
+                    {"role": "user", "content": text},
+                ],
+                model=model,
+            )
+        except LLMError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=502)
+        return {
+            "ok": True,
+            "status": "replied",
+            "reason": "",
+            "reply": format_qq_text(reply),
+            "model": model,
+            "strategy": strategy,
+            "memory_count": len(memory_context.splitlines()) if memory_context else 0,
+            "topic_count": len(topics.active(scope_key, limit=10)),
+            "latency_ms": round(
+                (time.perf_counter() - started) * 1000,
+                2,
+            ),
         }
 
     @app.patch("/api/admin/presence")
@@ -2693,6 +2950,42 @@ def create_app(
 
     async def _process_event(event: OneBotEvent) -> None:
         assert event.user_id is not None
+        target = ReplyTarget(
+            event.message_type,
+            event.user_id,
+            event.group_id,
+        )
+        initial_content = extract_message_content(
+            event.message,
+            self_id=event.self_id,
+            raw_message=event.raw_message,
+        )
+        trace = traces.start(
+            message_id=event.message_id,
+            conversation_id=target.conversation_id,
+            message_type=event.message_type,
+            user_id=event.user_id,
+            group_id=event.group_id,
+            user_text=initial_content.text,
+        )
+        token = current_message_trace.set(trace)
+        try:
+            await _process_event_inner(event, trace)
+        except asyncio.CancelledError:
+            trace.error("处理被取消")
+            raise
+        except Exception as exc:
+            trace.error(f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            current_message_trace.reset(token)
+            trace.finish()
+
+    async def _process_event_inner(
+        event: OneBotEvent,
+        trace: MessageTrace,
+    ) -> None:
+        assert event.user_id is not None
         sender_info = event.sender or {}
         display_name = str(
             sender_info.get("card")
@@ -2713,6 +3006,7 @@ def create_app(
         if event.message_type == "private":
             if config.private_user_ids and event.user_id not in config.private_user_ids:
                 logger.info("Ignored private message outside allowlist")
+                trace.skip("发送者不在私聊白名单")
                 return
             target = ReplyTarget(
                 "private",
@@ -2720,6 +3014,7 @@ def create_app(
             )
         elif event.message_type == "group":
             if not config.enable_group or event.group_id is None:
+                trace.skip("群聊功能未开启或事件缺少群号")
                 return
             event_group_name = str(
                 getattr(event, "group_name", "")
@@ -2740,6 +3035,7 @@ def create_app(
                 and existing_profile is None
             ):
                 logger.info("Ignored group outside allowlist")
+                trace.skip("群号不在全局群白名单")
                 return
             group_profile = group_profiles.ensure(
                 event.group_id,
@@ -2747,6 +3043,7 @@ def create_app(
                 name=group_name_cache.get(event.group_id, ""),
             )
             if not group_profile.enabled:
+                trace.skip("该群的机器人功能已关闭")
                 return
             target = ReplyTarget(
                 "group",
@@ -2754,6 +3051,7 @@ def create_app(
                 event.group_id,
             )
         else:
+            trace.skip("不支持的会话类型")
             return
 
         content = extract_message_content(
@@ -2793,6 +3091,7 @@ def create_app(
                 message_type=target.message_type,
                 content=raw_user_text or content.text,
             )
+            trace.skip("机器人处于忙碌或勿扰状态，消息已进入积压", decision="queued")
             return
         image_sources = content.image_sources[: max(0, config.max_images_per_message)]
         file_sources = content.file_sources[: max(0, config.max_files_per_message)]
@@ -2804,6 +3103,14 @@ def create_app(
             or image_sources
             or file_sources
             or audio_sources
+        )
+        trace.stage(
+            "message",
+            text=raw_user_text[:500],
+            images=len(image_sources),
+            files=len(file_sources),
+            audio=len(audio_sources),
+            stickers=len(sticker_sources),
         )
         if event.group_id is not None:
             for mentioned_id in content.mentioned_user_ids:
@@ -2850,6 +3157,7 @@ def create_app(
             ]
             if any(keyword in text for keyword in blocked):
                 group_behavior.record_ordinary_ignored(event.group_id)
+                trace.skip("消息命中本群屏蔽关键词")
                 return
             directly_addressed_now = (
                 content.mentioned
@@ -2864,6 +3172,7 @@ def create_app(
                 )
             ):
                 group_behavior.record_ordinary_ignored(event.group_id)
+                trace.skip("当前不在本群活跃时段")
                 return
             if not directly_addressed_now:
                 fingerprint = hashlib.sha1(
@@ -2883,6 +3192,7 @@ def create_app(
                     group_behavior.record_ordinary_ignored(
                         event.group_id
                     )
+                    trace.skip("十分钟内收到重复群消息")
                     return
                 recent.append((fingerprint, now_value))
         observation_id: int | None = None
@@ -2986,11 +3296,13 @@ def create_app(
                         content=text,
                     )
                 group_behavior.record_ordinary_ignored(group_id)
+                trace.skip("机器人处于忙碌或勿扰状态")
                 return
             if (
                 group_profile.require_mention
                 and not directly_addressed
             ):
+                trace.skip("当前群要求 @、引用或触发前缀")
                 return
             if (
                 not group_profile.require_mention
@@ -2998,6 +3310,7 @@ def create_app(
             ):
                 if obvious_ignore(text):
                     group_behavior.record_ordinary_ignored(group_id)
+                    trace.skip("寒暄、短确认或无需参与的群消息")
                     return
                 prior_messages = list(group_history)[:-1]
                 if (
@@ -3006,12 +3319,14 @@ def create_app(
                     and prior_messages[-1].role == "assistant"
                 ):
                     group_behavior.record_ordinary_ignored(group_id)
+                    trace.skip("上一条已经是机器人发言，避免连续收尾")
                     return
                 if not group_behavior.can_reply_now(
                     group_id,
                     group_profile.hourly_reply_limit,
                 ):
                     group_behavior.record_ordinary_ignored(group_id)
+                    trace.skip("已达到本群每小时回复上限")
                     return
                 if (
                     group_profile.behavior_learning
@@ -3023,6 +3338,7 @@ def create_app(
                     )
                 ):
                     group_behavior.record_ordinary_ignored(group_id)
+                    trace.skip("本群行为学习判断当前仍处于回复冷却")
                     return
                 if group_profile.smart_participation:
                     should_join = await _decider_for_group(
@@ -3034,6 +3350,7 @@ def create_app(
                     )
                     if not should_join:
                         group_behavior.record_ordinary_ignored(group_id)
+                        trace.skip("群聊参与判断认为不需要插话")
                         return
             text = strip_trigger_prefix(text, trigger_prefixes)
 
@@ -3052,12 +3369,21 @@ def create_app(
                 else config.auto_sticker_enabled
             )
             if auto_sticker and stickers.count() > 0:
-                await _maybe_send_sticker(
+                sent_sticker = await _maybe_send_sticker(
                     target=target,
                     user_text="对方只发了一个表情包",
                     assistant_text="",
                     explicit_request=False,
                 )
+                if sent_sticker:
+                    trace.replied(
+                        reply="[表情包]",
+                        model="",
+                    )
+                else:
+                    trace.skip("没有匹配当前语境的表情包")
+            else:
+                trace.skip("表情库为空或自动表情已关闭")
             return
 
         poke_text = text.strip()
@@ -3089,6 +3415,8 @@ def create_app(
             )
             if not await _safe_poke(poke_target):
                 await _safe_send(target, "戳不动，NapCat 可能没有启用这个互动接口。")
+            else:
+                trace.replied(reply="[戳一戳]", model="")
             return
 
         if text.strip() in {"/反思", "/立即反思"}:
@@ -3134,6 +3462,7 @@ def create_app(
         if audio_sources:
             if not limiter.allow(str(event.user_id)):
                 logger.info("Rate limited one voice request")
+                trace.skip("语音请求触发用户限流")
                 return
             await _process_audio_request(
                 target=target,
@@ -3145,6 +3474,7 @@ def create_app(
         if file_sources:
             if not limiter.allow(str(event.user_id)):
                 logger.info("Rate limited one file request")
+                trace.skip("文件请求触发用户限流")
                 return
             await _process_file_request(
                 event=event,
@@ -3169,6 +3499,7 @@ def create_app(
 
         if not limiter.allow(str(event.user_id)):
             logger.info("Rate limited one user")
+            trace.skip("用户请求触发每分钟限流")
             return
 
         conversation_id = target.conversation_id
@@ -3447,6 +3778,17 @@ def create_app(
                     if is_task_request or use_web_search
                     else config.casual_model
                 )
+            )
+            trace.model = response_model
+            trace.memory_count = len(semantic_matches)
+            trace.knowledge_count = len(knowledge_matches)
+            trace.stage(
+                "model",
+                name=response_model,
+                task=bool(is_task_request or use_web_search),
+                images=len(loaded_images),
+                memory_matches=len(semantic_matches),
+                knowledge_matches=len(knowledge_matches),
             )
             try:
                 reply = await (
@@ -4906,6 +5248,14 @@ def create_app(
     async def _safe_send(target: ReplyTarget, text: str) -> bool:
         try:
             await sender.send_text(target, text)
+            trace = current_message_trace.get()
+            if trace is not None:
+                trace.replied(
+                    reply=text,
+                    model=trace.model,
+                    memory_count=trace.memory_count,
+                    knowledge_count=trace.knowledge_count,
+                )
             if target.message_type == "group" and target.group_id is not None:
                 group_behavior.record_reply(target.group_id)
                 group_histories.setdefault(

@@ -50,6 +50,13 @@ async def test_control_plane_auth_provider_and_instance(tmp_path, monkeypatch) -
 
         providers = await client.get("/api/providers")
         assert "super-secret-key" not in providers.text
+        audit = await client.get("/api/audit")
+        assert audit.status_code == 200
+        assert any(
+            event["path"] == "/api/providers"
+            for event in audit.json()["events"]
+        )
+        assert "super-secret-key" not in audit.text
 
         instance = await client.post(
             "/api/instances",
@@ -369,3 +376,72 @@ def test_stop_instance_handles_stored_pid_and_listening_port(
 
     assert control_plane._stop_instance(second_id, user_id) is True
     assert terminated == [12345, 67890]
+
+
+@pytest.mark.asyncio
+async def test_instance_admin_proxy_sends_owner_token(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = ControlStore(tmp_path / "control.db")
+    box = SecretBox()
+    user_id = store.create_user("owner", "secure-password")
+    provider_id = store.save_provider(
+        user_id=user_id,
+        provider_id=None,
+        name="provider",
+        provider_type="custom",
+        base_url="https://api.example.com/v1",
+        model="chat",
+        api_key_encrypted=box.encrypt("key"),
+    )
+    instance_id = store.save_instance(
+        user_id=user_id,
+        instance_id=None,
+        name="instance",
+        port=18081,
+        onebot_api_base="http://127.0.0.1:13000",
+        onebot_token_encrypted=box.encrypt("owner-token"),
+        provider_id=provider_id,
+        database_path="data/test.db",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        is_error = False
+        status_code = 200
+
+        def json(self):
+            return {"ok": True}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request(self, method, url, *, json, headers):
+            captured.update(
+                method=method,
+                url=url,
+                json=json,
+                headers=headers,
+            )
+            return FakeResponse()
+
+    monkeypatch.setattr(control_plane, "store", store)
+    monkeypatch.setattr(control_plane, "secrets_box", box)
+    monkeypatch.setattr(control_plane.httpx, "AsyncClient", FakeClient)
+    result = await control_plane._instance_admin_json(
+        instance_id,
+        user_id,
+        "/api/admin/overview",
+    )
+    assert result == {"ok": True}
+    assert captured["headers"] == {
+        "X-Bot-Admin-Token": "owner-token"
+    }

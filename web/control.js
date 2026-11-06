@@ -60,7 +60,7 @@ async function loadInstances() {
       <div class="item-head"><b>${esc(item.name)}</b><span class="status ${item.status === "online" ? "online" : ""}"><i></i>${esc(item.status)}</span></div>
       <div class="item-meta">127.0.0.1:${item.port} · ${esc(item.provider_name || "未知供应商")}<br>${esc(item.onebot_api_base)}</div>
       <div class="item-actions">
-        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-group-settings="${item.id}">群聊设置</button><button data-evolution="${item.id}">自适应与状态</button><button data-model-routes="${item.id}">模型路由</button><a href="${esc(item.dashboard_url)}" target="_blank">打开实例后台</a>` : `<button data-start="${item.id}">启动</button>`}
+        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-unified="${item.id}">内容管理</button><button data-group-settings="${item.id}">群聊设置</button><button data-evolution="${item.id}">自适应与状态</button><button data-chat-test="${item.id}">对话测试</button><button data-traces="${item.id}">消息追踪</button><button data-model-routes="${item.id}">模型路由</button>` : `<button data-start="${item.id}">启动</button>`}
         <button data-edit-instance="${item.id}">编辑</button><button data-delete-instance="${item.id}">删除</button>
       </div>
     </article>`).join("") : `<div class="empty">还没有机器人实例</div>`;
@@ -72,8 +72,11 @@ function bindInstanceActions() {
   document.querySelectorAll("[data-stop]").forEach((b) => b.onclick = () => instanceAction(b.dataset.stop, "stop"));
   document.querySelectorAll("[data-restart]").forEach((b) => b.onclick = () => instanceAction(b.dataset.restart, "restart"));
   document.querySelectorAll("[data-memory]").forEach((b) => b.onclick = () => openMemory(Number(b.dataset.memory)));
+  document.querySelectorAll("[data-unified]").forEach((b) => b.onclick = () => openUnified(Number(b.dataset.unified)));
   document.querySelectorAll("[data-group-settings]").forEach((b) => b.onclick = () => openGroupSettings(Number(b.dataset.groupSettings)));
   document.querySelectorAll("[data-evolution]").forEach((b) => b.onclick = () => openEvolution(Number(b.dataset.evolution)));
+  document.querySelectorAll("[data-chat-test]").forEach((b) => b.onclick = () => openChatTest(Number(b.dataset.chatTest)));
+  document.querySelectorAll("[data-traces]").forEach((b) => b.onclick = () => openTraces(Number(b.dataset.traces)));
   document.querySelectorAll("[data-model-routes]").forEach((b) => b.onclick = () => openModelRoutes(Number(b.dataset.modelRoutes)));
   document.querySelectorAll("[data-edit-instance]").forEach((b) => b.onclick = () => editInstance(Number(b.dataset.editInstance)));
   document.querySelectorAll("[data-delete-instance]").forEach((b) => b.onclick = () => deleteInstance(Number(b.dataset.deleteInstance)));
@@ -346,6 +349,144 @@ async function loadEvolution(instanceId) {
       <span class="tag">${esc(item.challenger_name)} ${Math.round(Number(item.weight) * 100)}%</span>
       <div class="row-meta">胜 ${esc(item.wins)} / 负 ${esc(item.losses)} · 样本 ${esc(item.samples)}</div></div>`).join("")
     : `<div class="empty">还没有达到灰度阈值的策略</div>`;
+}
+
+async function openUnified(instanceId) {
+  const select = document.querySelector("#unified-instance");
+  select.innerHTML = instances
+    .filter((item) => item.status === "online")
+    .map((item) => `<option value="${item.id}">${esc(item.name)} · :${item.port}</option>`)
+    .join("");
+  select.value = String(instanceId);
+  document.querySelector("#unified-error").textContent = "";
+  openPanel("unified-panel");
+  await loadUnified(instanceId);
+}
+
+async function loadUnified(instanceId) {
+  const [qualityData, stickerData, knowledgeData, auditData] = await Promise.all([
+    api(`/api/instances/${instanceId}/quality`),
+    api(`/api/instances/${instanceId}/stickers`),
+    api(`/api/instances/${instanceId}/knowledge`),
+    api("/api/audit"),
+  ]);
+  document.querySelector("#unified-quality-list").innerHTML =
+    qualityData.recent?.length
+      ? qualityData.recent.slice(0, 30).map((item) => `
+        <article class="source-row">
+          <div><span class="tag">${item.score == null ? "待评测" : esc(item.score)}</span>
+          ${esc(item.user_text)}</div>
+          <div class="row-meta">${esc(item.assistant_text)}</div>
+          ${item.review_notes ? `<div class="row-meta">建议：${esc(item.review_notes)}</div>` : ""}
+        </article>`).join("")
+      : `<div class="empty">暂时没有质量记录</div>`;
+  document.querySelector("#unified-sticker-list").innerHTML =
+    stickerData.stickers?.length
+      ? stickerData.stickers.map((item) => `
+        <article class="source-row">
+          <div><strong>${esc(item.summary)}</strong>
+          <span class="tag">${esc(item.category)}</span></div>
+          <div class="row-meta">${esc(item.usage_hint || "未填写使用场景")}</div>
+          <div class="item-actions">
+            <button data-sticker-toggle="${item.id}" data-enabled="${item.enabled ? "1" : "0"}">
+              ${item.enabled ? "停用" : "启用"}
+            </button>
+            <button class="danger" data-sticker-delete="${item.id}">删除</button>
+          </div>
+        </article>`).join("")
+      : `<div class="empty">表情库为空</div>`;
+  document.querySelector("#unified-knowledge-list").innerHTML =
+    knowledgeData.sources?.length
+      ? knowledgeData.sources.map((item) => `
+        <article class="source-row">
+          <div><strong>${esc(item.title || item.source_id)}</strong>
+          <span class="tag">${esc(item.namespace || "知识")}</span></div>
+          <div class="row-meta">${esc(item.location || "")}</div>
+          <button class="danger" data-knowledge-delete="${esc(item.source_id)}"
+            data-knowledge-namespace="${esc(item.namespace || "document")}">删除来源</button>
+        </article>`).join("")
+      : `<div class="empty">知识库为空</div>`;
+  document.querySelector("#audit-list").innerHTML =
+    auditData.events?.length
+      ? auditData.events.slice(0, 80).map((item) => `
+        <div class="row"><strong>${esc(item.method)} ${esc(item.path)}</strong>
+        <span class="tag">${esc(item.status_code)}</span>
+        <div class="row-meta">${esc(item.username || "未登录")} ·
+        ${esc(item.client_ip || "本地")} · ${esc(item.created_at)}</div></div>`).join("")
+      : `<div class="empty">暂无审计记录</div>`;
+  document.querySelectorAll("[data-sticker-toggle]").forEach((button) => {
+    button.onclick = async () => {
+      await api(`/api/instances/${instanceId}/stickers/${button.dataset.stickerToggle}`, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({enabled: button.dataset.enabled !== "1"}),
+      });
+      await loadUnified(instanceId);
+    };
+  });
+  document.querySelectorAll("[data-sticker-delete]").forEach((button) => {
+    button.onclick = async () => {
+      if (!confirm("删除这个表情包记录？")) return;
+      await api(`/api/instances/${instanceId}/stickers/${button.dataset.stickerDelete}`, {method:"DELETE"});
+      await loadUnified(instanceId);
+    };
+  });
+  document.querySelectorAll("[data-knowledge-delete]").forEach((button) => {
+    button.onclick = async () => {
+      if (!confirm("删除这个知识来源及其向量片段？")) return;
+      await api(`/api/instances/${instanceId}/knowledge/delete`, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          namespace:button.dataset.knowledgeNamespace,
+          source_id:button.dataset.knowledgeDelete,
+        }),
+      });
+      await loadUnified(instanceId);
+    };
+  });
+}
+
+async function openChatTest(instanceId) {
+  const select = document.querySelector("#test-instance");
+  select.innerHTML = instances
+    .filter((item) => item.status === "online")
+    .map((item) => `<option value="${item.id}">${esc(item.name)} · :${item.port}</option>`)
+    .join("");
+  select.value = String(instanceId);
+  document.querySelector("#test-error").textContent = "";
+  document.querySelector("#test-result").hidden = true;
+  openPanel("chat-test-panel");
+}
+
+async function openTraces(instanceId) {
+  const select = document.querySelector("#trace-instance");
+  select.innerHTML = instances
+    .filter((item) => item.status === "online")
+    .map((item) => `<option value="${item.id}">${esc(item.name)} · :${item.port}</option>`)
+    .join("");
+  select.value = String(instanceId);
+  document.querySelector("#trace-error").textContent = "";
+  openPanel("trace-panel");
+  await loadTraces(instanceId);
+}
+
+async function loadTraces(instanceId) {
+  const skipped = document.querySelector("#trace-skipped-only").checked;
+  const data = await api(
+    `/api/instances/${instanceId}/traces?limit=150&skipped_only=${skipped ? "true" : "false"}`
+  );
+  document.querySelector("#trace-list").innerHTML = data.traces?.length
+    ? data.traces.map((item) => `
+      <article class="source-row">
+        <div><span class="tag">${esc(item.status)}</span>
+        <strong>${esc(item.user_text || "[无文本]")}</strong></div>
+        <div class="row-meta">${esc(item.reason || item.decision)}
+        · ${item.latency_ms == null ? "-" : esc(item.latency_ms) + " ms"}</div>
+        ${item.reply ? `<div class="row-meta">回复：${esc(item.reply)}</div>` : ""}
+        <div class="row-meta">${esc(item.created_at)} · ${esc(item.trace_id)}</div>
+      </article>`).join("")
+    : `<div class="empty">还没有消息追踪记录</div>`;
 }
 
 async function loadGroupSettings(instanceId) {
@@ -861,6 +1002,104 @@ document.querySelector("#restore-backup").addEventListener("click", async () => 
 document.querySelector("#evolution-instance").addEventListener("change", (event) => {
   loadEvolution(Number(event.target.value)).catch((err) => {
     document.querySelector("#evolution-error").textContent = err.message;
+  });
+});
+
+document.querySelector("#unified-instance").addEventListener("change", (event) => {
+  loadUnified(Number(event.target.value)).catch((err) => {
+    document.querySelector("#unified-error").textContent = err.message;
+  });
+});
+
+document.querySelector("#review-instance-quality").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#unified-instance").value);
+  const error = document.querySelector("#unified-error");
+  error.textContent = "";
+  if (!instanceId) return;
+  try {
+    await api(`/api/instances/${instanceId}/quality/review`, {method:"POST"});
+    await loadUnified(instanceId);
+  } catch (err) { error.textContent = err.message; }
+});
+
+document.querySelector("#organize-instance-stickers").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#unified-instance").value);
+  const error = document.querySelector("#unified-error");
+  error.textContent = "";
+  if (!instanceId) return;
+  try {
+    await api(`/api/instances/${instanceId}/stickers/organize`, {method:"POST"});
+    await loadUnified(instanceId);
+  } catch (err) { error.textContent = err.message; }
+});
+
+document.querySelector("#refresh-instance-knowledge").addEventListener("click", () => {
+  const instanceId = Number(document.querySelector("#unified-instance").value);
+  if (instanceId) loadUnified(instanceId).catch((err) => {
+    document.querySelector("#unified-error").textContent = err.message;
+  });
+});
+
+document.querySelector("#refresh-audit").addEventListener("click", () => {
+  const instanceId = Number(document.querySelector("#unified-instance").value);
+  if (instanceId) loadUnified(instanceId).catch((err) => {
+    document.querySelector("#unified-error").textContent = err.message;
+  });
+});
+
+document.querySelector("#run-chat-test").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#test-instance").value);
+  const error = document.querySelector("#test-error");
+  const result = document.querySelector("#test-result");
+  error.textContent = "";
+  result.hidden = true;
+  if (!instanceId) {
+    error.textContent = "请选择在线实例。";
+    return;
+  }
+  try {
+    const data = await api(`/api/instances/${instanceId}/test-chat`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        message_type:document.querySelector("#test-message-type").value,
+        user_id:Number(document.querySelector("#test-user-id").value || 10001),
+        group_id:Number(document.querySelector("#test-group-id").value || 0) || null,
+        display_name:document.querySelector("#test-display-name").value.trim(),
+        mentioned:document.querySelector("#test-mentioned").checked,
+        use_memory:document.querySelector("#test-memory").checked,
+        message:document.querySelector("#test-message").value.trim(),
+      }),
+    });
+    result.hidden = false;
+    result.innerHTML = data.status === "skipped"
+      ? `<strong>没有回复</strong><div class="row-meta">${esc(data.reason)}</div>`
+      : `<strong>${esc(data.reply)}</strong>
+        <div class="row-meta">模型 ${esc(data.model)} · 策略 ${esc(data.strategy)}
+        · ${esc(data.latency_ms)} ms</div>`;
+  } catch (err) {
+    error.textContent = err.message;
+  }
+});
+
+document.querySelector("#trace-instance").addEventListener("change", (event) => {
+  const instanceId = Number(event.target.value);
+  if (instanceId) loadTraces(instanceId).catch((err) => {
+    document.querySelector("#trace-error").textContent = err.message;
+  });
+});
+
+document.querySelector("#refresh-traces").addEventListener("click", () => {
+  const instanceId = Number(document.querySelector("#trace-instance").value);
+  if (instanceId) loadTraces(instanceId).catch((err) => {
+    document.querySelector("#trace-error").textContent = err.message;
+  });
+});
+
+document.querySelector("#trace-skipped-only").addEventListener("change", () => {
+  const instanceId = Number(document.querySelector("#trace-instance").value);
+  if (instanceId) loadTraces(instanceId).catch((err) => {
+    document.querySelector("#trace-error").textContent = err.message;
   });
 });
 

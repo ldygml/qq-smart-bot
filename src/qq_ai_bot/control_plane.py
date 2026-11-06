@@ -369,6 +369,18 @@ class ControlStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (instance_id, capability)
                 );
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    username TEXT NOT NULL DEFAULT '',
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    status_code INTEGER NOT NULL,
+                    client_ip TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_audit_events_created
+                ON audit_events (created_at DESC, id DESC);
                 """
             )
 
@@ -456,6 +468,59 @@ class ControlStore:
                 "DELETE FROM control_sessions WHERE token_hash = ?",
                 (digest,),
             )
+
+    def audit_event(
+        self,
+        *,
+        user_id: int | None,
+        username: str,
+        method: str,
+        path: str,
+        status_code: int,
+        client_ip: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO audit_events
+                    (
+                        user_id, username, method, path,
+                        status_code, client_ip, created_at
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    username[:200],
+                    method.upper()[:12],
+                    path[:1000],
+                    int(status_code),
+                    client_ip[:100],
+                    _utc_now(),
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM audit_events
+                WHERE id NOT IN (
+                    SELECT id FROM audit_events
+                    ORDER BY id DESC
+                    LIMIT 5000
+                )
+                """
+            )
+
+    def audit_events(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM audit_events
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (max(1, min(1000, limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def providers(self, user_id: int) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -921,7 +986,7 @@ def _instance_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "pid": pid,
         "process_running": process_online,
         "status": status,
-        "dashboard_url": f"http://127.0.0.1:{item['port']}/admin",
+        "dashboard_url": "http://127.0.0.1:8090/",
         "health_url": f"http://127.0.0.1:{item['port']}/healthz",
     }
 
@@ -1129,6 +1194,33 @@ def _stop_instance(instance_id: int, user_id: int) -> bool:
 
 
 app = FastAPI(title="给她爱控制台", docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def audit_mutations(request: Request, call_next):
+    if request.method.upper() not in {"POST", "PATCH", "PUT", "DELETE"}:
+        return await call_next(request)
+    token = request.cookies.get(SESSION_COOKIE, "")
+    session = store.get_session(token) if token else None
+    response = await call_next(request)
+    try:
+        store.audit_event(
+            user_id=int(session["id"]) if session else None,
+            username=str(session["username"]) if session else "",
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            client_ip=request.client.host if request.client else "",
+        )
+    except Exception:
+        pass
+    return response
+
+
+@app.get("/api/audit")
+async def audit_log(request: Request) -> dict[str, Any]:
+    _request_user(request)
+    return {"events": store.audit_events(limit=300)}
 
 
 @app.get("/")
@@ -1433,9 +1525,17 @@ async def _instance_admin_json(
     if not instance:
         raise HTTPException(status_code=404, detail="instance not found")
     url = f"http://127.0.0.1:{instance['port']}{path}"
+    admin_token = secrets_box.decrypt(
+        str(instance["onebot_token_encrypted"])
+    )
     try:
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
-            response = await client.request(method, url, json=json_body)
+            response = await client.request(
+                method,
+                url,
+                json=json_body,
+                headers={"X-Bot-Admin-Token": admin_token},
+            )
     except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=503,
@@ -1568,6 +1668,186 @@ async def instance_adaptive(
         instance_id,
         int(user["id"]),
         "/api/admin/adaptive",
+    )
+
+
+@app.get("/api/instances/{instance_id}/quality")
+async def instance_quality(instance_id: int, request: Request) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/quality",
+    )
+
+
+@app.post("/api/instances/{instance_id}/quality/review")
+async def instance_review_quality(
+    instance_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/quality/review",
+        method="POST",
+        json_body={},
+    )
+
+
+@app.post("/api/instances/{instance_id}/quality/replay")
+async def instance_replay_quality(
+    instance_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/quality/replay",
+        method="POST",
+        json_body=payload,
+    )
+
+
+@app.get("/api/instances/{instance_id}/stickers")
+async def instance_stickers(instance_id: int, request: Request) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/stickers",
+    )
+
+
+@app.post("/api/instances/{instance_id}/stickers/organize")
+async def instance_organize_stickers(
+    instance_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/stickers/organize",
+        method="POST",
+        json_body={},
+    )
+
+
+@app.post("/api/instances/{instance_id}/stickers/{sticker_id}")
+async def instance_update_sticker(
+    instance_id: int,
+    sticker_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/stickers/{sticker_id}",
+        method="PATCH",
+        json_body=payload,
+    )
+
+
+@app.delete("/api/instances/{instance_id}/stickers/{sticker_id}")
+async def instance_delete_sticker(
+    instance_id: int,
+    sticker_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/stickers/{sticker_id}",
+        method="DELETE",
+    )
+
+
+@app.get("/api/instances/{instance_id}/knowledge")
+async def instance_knowledge(instance_id: int, request: Request) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/knowledge",
+    )
+
+
+@app.post("/api/instances/{instance_id}/knowledge/delete")
+async def instance_delete_knowledge(
+    instance_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/knowledge/delete",
+        method="POST",
+        json_body=payload,
+    )
+
+
+@app.get("/api/instances/{instance_id}/traces")
+async def instance_traces(
+    instance_id: int,
+    request: Request,
+    limit: int = 100,
+    skipped_only: bool = False,
+) -> Any:
+    user = _request_user(request)
+    suffix = (
+        f"?limit={max(1, min(500, limit))}"
+        f"&skipped_only={'true' if skipped_only else 'false'}"
+    )
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/traces{suffix}",
+    )
+
+
+@app.get("/api/instances/{instance_id}/traces/{trace_id}")
+async def instance_trace(
+    instance_id: int,
+    trace_id: str,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/traces/{quote(trace_id)}",
+    )
+
+
+@app.post("/api/instances/{instance_id}/test-chat")
+async def instance_test_chat(
+    instance_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/conversation-test",
+        method="POST",
+        json_body=payload,
     )
 
 
