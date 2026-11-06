@@ -19,10 +19,14 @@ class OneBotEvent(BaseModel):
     self_id: int | None = None
     user_id: int | None = None
     group_id: int | None = None
+    group_name: str = ""
     message_id: int | str | None = None
     message: Any = None
     raw_message: str = ""
     sender: dict[str, Any] | None = None
+    notice_type: str = ""
+    sub_type: str = ""
+    target_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,7 @@ class StickerSource:
 class MessageContent:
     text: str
     mentioned: bool
+    mentioned_user_ids: tuple[int, ...] = ()
     image_sources: tuple[str, ...] = ()
     file_sources: tuple[FileSource, ...] = ()
     audio_sources: tuple[AudioSource, ...] = ()
@@ -166,6 +171,22 @@ class OneBotClient:
         target: ReplyTarget,
         sticker: StickerSource,
     ) -> None:
+        if (
+            sticker.image_source
+            and not sticker.emoji_id
+            and not sticker.emoji_package_id
+            and not sticker.key
+        ):
+            await self._send_segment(
+                target,
+                "image",
+                {
+                    "file": sticker.image_source,
+                    "sub_type": 1,
+                    "summary": sticker.summary,
+                },
+            )
+            return
         data: dict[str, Any] = {"summary": sticker.summary}
         if sticker.emoji_id:
             data["emoji_id"] = sticker.emoji_id
@@ -359,6 +380,31 @@ class OneBotClient:
                 )
         return result
 
+    async def get_group_member_name(
+        self,
+        group_id: int,
+        user_id: int,
+    ) -> str:
+        response = await self._client.post(
+            "get_group_member_info",
+            json={"group_id": group_id, "user_id": user_id},
+            timeout=10.0,
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            return ""
+        if response.is_error or data.get("status") != "ok":
+            return ""
+        member = data.get("data")
+        if not isinstance(member, dict):
+            return ""
+        return str(
+            member.get("card")
+            or member.get("nickname")
+            or ""
+        ).strip()[:80]
+
     async def close(self) -> None:
         await self._client.aclose()
 
@@ -411,6 +457,7 @@ def extract_message_content(
         reply_id = ""
         sticker_summaries: list[str] = []
         sticker_sources: list[StickerSource] = []
+        mentioned_user_ids: list[int] = []
         mentioned = False
         for segment in message:
             if not isinstance(segment, dict):
@@ -426,6 +473,13 @@ def extract_message_content(
                 qq = str(data.get("qq", ""))
                 if self_id is not None and qq == str(self_id):
                     mentioned = True
+                else:
+                    try:
+                        mentioned_id = int(qq)
+                    except ValueError:
+                        mentioned_id = 0
+                    if mentioned_id > 0:
+                        mentioned_user_ids.append(mentioned_id)
             elif segment_type == "image":
                 is_sticker = any(
                     data.get(key)
@@ -523,6 +577,7 @@ def extract_message_content(
         return MessageContent(
             text=_normalize_text("".join(parts)),
             mentioned=mentioned,
+            mentioned_user_ids=tuple(dict.fromkeys(mentioned_user_ids)),
             image_sources=tuple(image_sources),
             file_sources=tuple(file_sources),
             audio_sources=tuple(audio_sources),
@@ -542,6 +597,7 @@ def extract_message_content(
     audio_sources: list[AudioSource] = []
     sticker_summaries: list[str] = []
     sticker_sources: list[StickerSource] = []
+    mentioned_user_ids: list[int] = []
 
     def replace_image(match: re.Match[str]) -> str:
         parameters = _cq_parameters(match.group(1))
@@ -627,21 +683,26 @@ def extract_message_content(
     reply_match = _CQ_REPLY_PATTERN.search(source)
     reply_id = reply_match.group(1) if reply_match else ""
     source = _CQ_REPLY_PATTERN.sub("", source)
-    if self_id is not None:
-        mention_code = f"[CQ:at,qq={self_id}]"
-        mentioned = mention_code in source
+    def replace_at(match: re.Match[str]) -> str:
+        nonlocal mentioned
+        qq = match.group(1)
+        if self_id is not None and qq == str(self_id):
+            mentioned = True
+        else:
+            try:
+                mentioned_id = int(qq)
+            except ValueError:
+                mentioned_id = 0
+            if mentioned_id > 0:
+                mentioned_user_ids.append(mentioned_id)
+        return ""
 
-        def replace_at(match: re.Match[str]) -> str:
-            nonlocal mentioned
-            if match.group(1) == str(self_id):
-                mentioned = True
-            return ""
-
-        source = _CQ_AT_PATTERN.sub(replace_at, source)
+    source = _CQ_AT_PATTERN.sub(replace_at, source)
     source = _CQ_OTHER_PATTERN.sub("", source)
     return MessageContent(
         text=_normalize_text(source),
         mentioned=mentioned,
+        mentioned_user_ids=tuple(dict.fromkeys(mentioned_user_ids)),
         image_sources=tuple(image_sources),
         file_sources=tuple(file_sources),
         audio_sources=tuple(audio_sources),

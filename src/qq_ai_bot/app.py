@@ -79,7 +79,11 @@ from .vector_memory import (
     VectorMemoryStore,
 )
 from .stickers import StickerStore
-from .sticker_policy import LLMStickerChoiceDecider, StickerChoiceDecider
+from .sticker_policy import (
+    LLMStickerChoiceDecider,
+    LLMStickerOrganizer,
+    StickerChoiceDecider,
+)
 from .tts import TTSClient, TTSError
 from .usage import MeteredChatClient, UsageStore
 from .web_reader import WebArticleReader, WebReadError
@@ -174,6 +178,7 @@ def create_app(
     group_behavior_store: GroupBehaviorStore | None = None,
     group_profile_store: GroupProfileStore | None = None,
     sticker_choice_decider: StickerChoiceDecider | None = None,
+    sticker_organizer: LLMStickerOrganizer | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -261,6 +266,10 @@ def create_app(
         model=config.sticker_model,
         min_confidence=config.sticker_min_confidence,
     )
+    sticker_organizer_client = sticker_organizer or LLMStickerOrganizer(
+        llm,
+        model=config.sticker_model,
+    )
     group_behavior = group_behavior_store or GroupBehaviorStore(
         config.database_path
     )
@@ -293,6 +302,8 @@ def create_app(
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
     conversation_locks: dict[str, asyncio.Lock] = {}
     background_tasks: set[asyncio.Task[Any]] = set()
+    sticker_organize_inflight: set[int] = set()
+    last_poke_reply: dict[tuple[str, int, int], float] = {}
     seen_message_ids: OrderedDict[str, None] = OrderedDict()
     reflection_lock = asyncio.Lock()
     group_histories: dict[int, deque[GroupMessage]] = {}
@@ -694,6 +705,37 @@ def create_app(
                 include_disabled=True,
             ),
             "categories": stickers.categories(),
+        }
+
+    @app.post("/api/admin/stickers/organize")
+    async def admin_organize_stickers() -> dict[str, Any]:
+        candidates = stickers.list_unclassified(limit=100)
+        gate = asyncio.Semaphore(4)
+
+        async def organize(item: dict[str, object]) -> bool:
+            async with gate:
+                classification = await sticker_organizer_client.classify(
+                    summary=str(item.get("summary") or "表情包"),
+                )
+                return stickers.update_classification(
+                    int(item["id"]),
+                    category=classification.category,
+                    usage_hint=classification.usage_hint,
+                )
+
+        results = await asyncio.gather(
+            *(organize(item) for item in candidates),
+            return_exceptions=True,
+        )
+        organized = sum(result is True for result in results)
+        return {
+            "ok": True,
+            "organized": organized,
+            "failed": len(results) - organized,
+            "stickers": stickers.list_recent(
+                limit=100,
+                include_disabled=True,
+            ),
         }
 
     @app.patch("/api/admin/stickers/{sticker_id}")
@@ -1105,6 +1147,14 @@ def create_app(
         except (ValueError, ValidationError):
             return JSONResponse({"detail": "invalid event"}, status_code=400)
 
+        if _is_poke_event(event):
+            if event.user_id is None or event.target_id is None:
+                return Response(status_code=204)
+            task = asyncio.create_task(_run_poke_notice(event))
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+            return Response(status_code=204)
+
         if event.post_type != "message" or event.message_type not in {
             "private",
             "group",
@@ -1142,6 +1192,120 @@ def create_app(
             raise
         except Exception:
             logger.exception("Unexpected message-processing failure")
+
+    async def _run_poke_notice(event: OneBotEvent) -> None:
+        try:
+            await _process_poke_notice(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Unexpected poke-notice processing failure")
+
+    async def _process_poke_notice(event: OneBotEvent) -> None:
+        if (
+            event.user_id is None
+            or event.target_id is None
+            or (event.self_id is not None and event.user_id == event.self_id)
+        ):
+            return
+        sender_info = event.sender or {}
+        poker_id = int(event.user_id)
+        target_id = int(event.target_id)
+        poker_name = str(
+            sender_info.get("card")
+            or sender_info.get("nickname")
+            or poker_id
+        ).strip()
+        if config.shared_memory_enabled:
+            shared_memory.record_person(poker_id, poker_name)
+
+        message_type = event.message_type or (
+            "group" if event.group_id is not None else "private"
+        )
+        if message_type == "private":
+            if (
+                config.private_user_ids
+                and poker_id not in config.private_user_ids
+            ):
+                return
+            target = ReplyTarget("private", poker_id)
+        elif message_type == "group" and event.group_id is not None:
+            if not config.enable_group:
+                return
+            existing_profile = group_profiles.get(event.group_id)
+            if (
+                config.group_ids
+                and event.group_id not in config.group_ids
+                and existing_profile is None
+            ):
+                return
+            profile = group_profiles.ensure(
+                event.group_id,
+                defaults=_default_group_profile_values(config),
+                name=group_name_cache.get(event.group_id, ""),
+            )
+            if not profile.enabled:
+                return
+            target = ReplyTarget("group", poker_id, event.group_id)
+        else:
+            return
+
+        target_name = ""
+        if event.group_id is not None:
+            getter = getattr(sender, "get_group_member_name", None)
+            if callable(getter):
+                try:
+                    target_name = await getter(
+                        event.group_id,
+                        target_id,
+                    )
+                except Exception:
+                    target_name = ""
+            if config.shared_memory_enabled and target_name:
+                shared_memory.record_person(target_id, target_name)
+
+        if target_id != event.self_id:
+            if message_type == "group" and event.group_id is not None:
+                content = (
+                    f"{poker_name} 戳了 "
+                    f"{target_name or f'QQ {target_id}'} 一下"
+                )
+                group_histories.setdefault(
+                    event.group_id,
+                    deque(maxlen=24),
+                ).append(
+                    GroupMessage(
+                        role="user",
+                        sender=poker_name,
+                        content=content,
+                    )
+                )
+                if config.shared_memory_enabled:
+                    shared_memory.observe_message(
+                        conversation_id=(
+                            f"group:{event.group_id}:user:{poker_id}"
+                        ),
+                        message_type="group",
+                        group_id=event.group_id,
+                        speaker_user_id=poker_id,
+                        speaker_name=poker_name,
+                        content=f"[戳一戳] {content}",
+                    )
+            return
+
+        poke_key = (target.message_type, target.group_id or 0, poker_id)
+        now = time.monotonic()
+        if now - last_poke_reply.get(poke_key, 0.0) < 6.0:
+            return
+        last_poke_reply[poke_key] = now
+
+        await _safe_poke(target)
+        replies = (
+            "在，有话直说。",
+            "戳什么，说事。",
+            "行，戳回来了。",
+        )
+        await _safe_send(target, replies[int(now) % len(replies)])
 
     async def _reminder_loop() -> None:
         await asyncio.sleep(1)
@@ -1407,6 +1571,47 @@ def create_app(
                 "conflicts": harvest["conflicts"],
             }
 
+    def _queue_sticker_organization(
+        sticker_id: int,
+        *,
+        summary: str,
+        context: str,
+    ) -> None:
+        metadata = stickers.get_metadata(sticker_id)
+        if metadata is None:
+            return
+        if (
+            str(metadata.get("category") or "") != "未分类"
+            or str(metadata.get("usage_hint") or "")
+        ):
+            return
+        if sticker_id in sticker_organize_inflight:
+            return
+        sticker_organize_inflight.add(sticker_id)
+
+        async def organize() -> None:
+            try:
+                classification = await sticker_organizer_client.classify(
+                    summary=summary,
+                    recent_context=context,
+                )
+                stickers.update_classification(
+                    sticker_id,
+                    category=classification.category,
+                    usage_hint=classification.usage_hint,
+                )
+            except Exception:
+                logger.warning(
+                    "Automatic sticker classification failed",
+                    exc_info=True,
+                )
+            finally:
+                sticker_organize_inflight.discard(sticker_id)
+
+        task = asyncio.create_task(organize())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
     async def _process_event(event: OneBotEvent) -> None:
         assert event.user_id is not None
         sender_info = event.sender or {}
@@ -1478,7 +1683,13 @@ def create_app(
         sticker_summaries = content.sticker_summaries[:3]
         sticker_sources = content.sticker_sources[:3]
         for sticker in sticker_sources:
-            stickers.record(sticker)
+            sticker_id = stickers.record(sticker)
+            if sticker_id is not None:
+                _queue_sticker_organization(
+                    sticker_id,
+                    summary=sticker.summary,
+                    context=f"{display_name}：{text}",
+                )
         if sticker_summaries:
             sticker_text = "、".join(dict.fromkeys(sticker_summaries))
             text = f"[对方发了一个表情包：{sticker_text}] {text}".strip()
@@ -1545,12 +1756,14 @@ def create_app(
                 )
             addressed_by_name = config.bot_name in text
             natural_generation = _detect_natural_generation(text) is not None
+            poke_command = _is_poke_command_text(text)
             directly_addressed = (
                 content.mentioned
                 or quoted_bot
                 or prefix_triggered
                 or addressed_by_name
                 or text.startswith("/")
+                or poke_command
                 or (
                     natural_generation
                     and not group_profile.require_mention
@@ -1611,9 +1824,24 @@ def create_app(
         if not text and image_sources:
             text = "请分析这张图片。如果是题目，请给出解题步骤和最终答案。"
 
-        if text.strip().lower() in {"/戳", "/戳一戳", "戳一戳", "戳我"}:
-            if not await _safe_poke(target):
+        poke_text = text.strip()
+        if _is_poke_command_text(poke_text):
+            target_qq = event.user_id
+            if content.mentioned_user_ids:
+                target_qq = content.mentioned_user_ids[0]
+            else:
+                number = re.search(r"(?<!\d)(\d{5,12})(?!\d)", poke_text)
+                if number:
+                    target_qq = int(number.group(1))
+            poke_target = ReplyTarget(
+                target.message_type,
+                target_qq,
+                target.group_id,
+            )
+            if not await _safe_poke(poke_target):
                 await _safe_send(target, "戳不动，NapCat 可能没有启用这个互动接口。")
+            elif target_qq != event.user_id:
+                await _safe_send(target, "戳了。")
             return
 
         if text.strip() in {"/反思", "/立即反思"}:
@@ -2771,7 +2999,7 @@ def create_app(
                 "搜索：/搜 最新问题，机器人会联网核实\n"
                 "网页：直接发链接，或使用 /网页 URL 总结正文\n"
                 "网页收藏：/收藏网页 URL，会写入知识库来源并参与后续检索\n"
-                "互动：/戳，或者私聊直接说“戳一戳”\n"
+                "互动：/戳；/戳 @群友；/戳 QQ号；也会回应别人对机器人的戳一戳\n"
                 "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情；/表情库\n"
                 "生成：/生成图表 数据；/生成文档 要求；/生成文件 要求；/生成代码 需求\n"
                 "联网生成：/联网生成文档 要求；或说“先联网搜索，再整理成Word发我”\n"
@@ -3000,6 +3228,20 @@ def create_app(
             return False
 
     return app
+
+
+def _is_poke_event(event: OneBotEvent) -> bool:
+    if event.post_type != "notice":
+        return False
+    notice_type = event.notice_type.strip().lower()
+    sub_type = event.sub_type.strip().lower()
+    return notice_type == "poke" or sub_type == "poke"
+
+
+def _is_poke_command_text(text: str) -> bool:
+    return text.strip().lower().startswith(
+        ("/戳", "戳一戳", "戳一下", "戳我", "戳 ")
+    )
 
 
 def _parse_id(raw: str) -> int | None:

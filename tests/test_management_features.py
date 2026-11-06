@@ -32,6 +32,7 @@ from qq_ai_bot.control_plane import (
 from qq_ai_bot.group_behavior import GroupBehaviorStore
 from qq_ai_bot.group_profiles import GroupProfileStore
 from qq_ai_bot.onebot import StickerSource
+from qq_ai_bot.sticker_policy import LLMStickerOrganizer
 from qq_ai_bot.stickers import StickerStore
 from qq_ai_bot.usage import MeteredChatClient, UsageStore
 
@@ -431,6 +432,63 @@ def test_sticker_management_and_disabled_filter(tmp_path) -> None:
     assert store.list_recent() == []
     assert store.get_by_id(sticker_id) is None
     assert store.delete(sticker_id)
+
+
+def test_image_only_sticker_is_collected_by_url_fingerprint(tmp_path) -> None:
+    store = StickerStore(tmp_path / "bot.db")
+    first_id = store.record(
+        StickerSource(
+            summary="动画表情",
+            image_source="https://example.com/cat.png",
+        )
+    )
+    duplicate_id = store.record(
+        StickerSource(
+            summary="动画表情",
+            image_source="https://example.com/cat.png",
+        )
+    )
+    second_id = store.record(
+        StickerSource(
+            summary="动画表情",
+            image_source="https://example.com/dog.png",
+        )
+    )
+    assert first_id is not None
+    assert duplicate_id == first_id
+    assert second_id is not None and second_id != first_id
+    assert store.count() == 2
+    sticker = store.get_by_id(first_id)
+    assert sticker is not None
+    assert sticker.image_source == "https://example.com/cat.png"
+
+
+@pytest.mark.asyncio
+async def test_sticker_organizer_classifies_summary(tmp_path) -> None:
+    class OrganizerChat(FeatureChat):
+        async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+            return '{"category":"无语","usage_hint":"对方说离谱事情时使用"}'
+
+    store = StickerStore(tmp_path / "bot.db")
+    sticker_id = store.record(
+        StickerSource(
+            summary="无语流汗",
+            image_source="https://example.com/sweat.png",
+        )
+    )
+    assert sticker_id
+    organizer = LLMStickerOrganizer(OrganizerChat(), model="test")
+    classification = await organizer.classify(summary="无语流汗")
+    assert classification.category == "无语"
+    assert store.update_classification(
+        sticker_id,
+        category=classification.category,
+        usage_hint=classification.usage_hint,
+    )
+    metadata = store.get_metadata(sticker_id)
+    assert metadata is not None
+    assert metadata["category"] == "无语"
+    assert "离谱" in str(metadata["usage_hint"])
 
 
 @pytest.mark.asyncio

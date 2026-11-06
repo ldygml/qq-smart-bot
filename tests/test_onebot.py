@@ -8,6 +8,7 @@ import pytest
 from qq_ai_bot.onebot import (
     OneBotClient,
     ReplyTarget,
+    StickerSource,
     extract_message_content,
     extract_message_text,
     split_reply,
@@ -182,6 +183,36 @@ async def test_group_reply_includes_quote_segment() -> None:
 
 
 @pytest.mark.asyncio
+async def test_image_only_sticker_is_sent_as_image_segment() -> None:
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"status": "ok", "retcode": 0, "data": {"message_id": 1}},
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await client.send_sticker(
+            ReplyTarget("private", 123),
+            StickerSource(
+                summary="动画表情",
+                image_source="https://example.com/sticker.png",
+            ),
+        )
+    finally:
+        await client.close()
+    assert captured["message"][0]["type"] == "image"
+    assert captured["message"][0]["data"]["sub_type"] == 1
+
+
+@pytest.mark.asyncio
 async def test_get_group_list_returns_group_names() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/get_group_list")
@@ -212,12 +243,48 @@ async def test_get_group_list_returns_group_names() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_get_group_member_name_uses_card_or_nickname() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload == {"group_id": 100, "user_id": 200}
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "retcode": 0,
+                "data": {"card": "群名片", "nickname": "昵称"},
+            },
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        name = await client.get_group_member_name(100, 200)
+    finally:
+        await client.close()
+    assert name == "群名片"
+
+
 def test_at_another_user_is_not_bot_mention() -> None:
-    _, mentioned = extract_message_text(
+    content = extract_message_content(
         [{"type": "at", "data": {"qq": "20002"}}],
         self_id=10001,
     )
-    assert mentioned is False
+    assert content.mentioned is False
+    assert content.mentioned_user_ids == (20002,)
+
+
+def test_extract_mentioned_user_ids_from_cq_code() -> None:
+    content = extract_message_content(
+        "[CQ:at,qq=20002] 戳一下",
+        self_id=10001,
+    )
+    assert content.text == "戳一下"
+    assert content.mentioned_user_ids == (20002,)
 
 
 def test_strip_trigger_prefix() -> None:

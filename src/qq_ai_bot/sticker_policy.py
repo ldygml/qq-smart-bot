@@ -2,9 +2,67 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .llm import ChatClient
+
+
+@dataclass(frozen=True)
+class StickerClassification:
+    category: str
+    usage_hint: str
+
+
+class LLMStickerOrganizer:
+    def __init__(
+        self,
+        chat_client: ChatClient,
+        *,
+        model: str,
+    ) -> None:
+        self.chat_client = chat_client
+        self.model = model
+
+    async def classify(
+        self,
+        *,
+        summary: str,
+        recent_context: str = "",
+    ) -> StickerClassification:
+        prompt = (
+            "整理一个 QQ 表情包。根据名称和最近语境判断它的情绪与适用场景。"
+            '只返回 JSON：{"category":"分类","usage_hint":"何时适合使用"}。'
+            "分类优先从：开心、无语、震惊、生气、委屈、嘲讽、赞同、"
+            "疑惑、安慰、加油、日常 中选择，也可以使用更准确的中文短分类。"
+            "usage_hint 要具体，例如“对方说了离谱的事情时使用”。"
+            "不要在语境冲突时强行使用表情。\n\n"
+            f"表情名称：{summary or '动画表情'}\n"
+            f"最近聊天：{recent_context[:1200] or '无'}"
+        )
+        try:
+            reply = await self.chat_client.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "严格输出 JSON，不要 Markdown，不要解释。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                model=self.model,
+                extra_payload={
+                    "reasoning_effort": "none",
+                    "response_format": {"type": "json_object"},
+                },
+            )
+            data = _parse_json(reply)
+            category = str(data.get("category") or "").strip()[:80]
+            usage_hint = str(data.get("usage_hint") or "").strip()[:300]
+            if category and usage_hint:
+                return StickerClassification(category, usage_hint)
+        except Exception:
+            pass
+        return infer_sticker_classification(summary)
 
 
 class StickerChoiceDecider(Protocol):
@@ -110,3 +168,56 @@ def _parse_json(reply: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return data if isinstance(data, dict) else {}
+
+
+def infer_sticker_classification(summary: str) -> StickerClassification:
+    value = summary.lower()
+    rules = (
+        (
+            ("开心", "笑", "哈哈", "庆祝", "赞", "妙", "棒"),
+            "开心",
+            "气氛轻松、值得庆祝或表示赞同的时候使用",
+        ),
+        (
+            ("无语", "汗", "省略号", "尴尬", "离谱", "服了"),
+            "无语",
+            "对方说了离谱、尴尬或让人接不下去的事情时使用",
+        ),
+        (
+            ("震惊", "惊", "吓", "啊", "什么"),
+            "震惊",
+            "听到意外消息或需要表达惊讶时使用",
+        ),
+        (
+            ("生气", "怒", "火", "打", "刀"),
+            "生气",
+            "表达不满或对明显不合理的事情作出反应时使用",
+        ),
+        (
+            ("委屈", "哭", "难过", "泪", "可怜"),
+            "委屈",
+            "对方情绪低落或需要少量安慰时使用",
+        ),
+        (
+            ("嘲讽", "白眼", "呵呵", "阴阳", "菜"),
+            "嘲讽",
+            "轻松互损或指出明显失误时使用，不能用于严肃求助",
+        ),
+        (
+            ("疑惑", "问号", "懵", "不懂"),
+            "疑惑",
+            "没有理解对方意思或需要请求解释时使用",
+        ),
+        (
+            ("加油", "努力", "冲", "鼓励", "抱抱"),
+            "加油",
+            "对方需要鼓励、准备行动或完成阶段目标时使用",
+        ),
+    )
+    for keywords, category, hint in rules:
+        if any(keyword in value for keyword in keywords):
+            return StickerClassification(category, hint)
+    return StickerClassification(
+        "日常",
+        "普通闲聊中语气和情绪匹配时使用，不要连续发送",
+    )

@@ -432,6 +432,7 @@ async def test_group_can_reply_without_mention(tmp_path) -> None:
             tmp_path,
             enable_group=True,
             group_require_mention=False,
+            shared_memory_enabled=True,
         ),
         chat_client=llm,
         onebot_client=sender,
@@ -750,6 +751,149 @@ async def test_poke_command_pokes_sender_without_ai_call(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_group_poke_command_can_target_mentioned_member(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=True,
+            group_smart_participation=False,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 999,
+                "group_id": 500,
+                "user_id": 123,
+                "message_id": 1701,
+                "message": [
+                    {"type": "at", "data": {"qq": "456"}},
+                    {"type": "text", "data": {"text": " 戳一下"}},
+                ],
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.poked))
+
+    assert sender.poked[0].message_type == "group"
+    assert sender.poked[0].group_id == 500
+    assert sender.poked[0].user_id == 456
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_incoming_poke_notice_makes_bot_respond(tmp_path) -> None:
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "notice",
+                "notice_type": "notify",
+                "sub_type": "poke",
+                "message_type": "group",
+                "self_id": 999,
+                "group_id": 500,
+                "user_id": 123,
+                "target_id": 999,
+                "sender": {"nickname": "小明"},
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert sender.poked[0].user_id == 123
+    assert sender.poked[0].group_id == 500
+    assert sender.sent[0][0].user_id == 123
+    assert sender.sent[0][1] in {
+        "在，有话直说。",
+        "戳什么，说事。",
+        "行，戳回来了。",
+    }
+
+
+@pytest.mark.asyncio
+async def test_incoming_poke_between_members_is_recorded_silently(
+    tmp_path,
+) -> None:
+    shared = SharedMemoryStore(tmp_path / "shared.db")
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=False,
+            shared_memory_enabled=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        shared_memory_store=shared,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "notice",
+                "notice_type": "poke",
+                "message_type": "group",
+                "self_id": 999,
+                "group_id": 500,
+                "user_id": 123,
+                "target_id": 456,
+                "sender": {"nickname": "小明"},
+            },
+        )
+        await _wait_for_condition(
+            lambda: bool(shared.observations_since(0))
+        )
+
+    assert sender.sent == []
+    assert sender.poked == []
+    observation = shared.observations_since(0)[0]
+    assert "小明" in observation["content"]
+    assert "456" in observation["content"]
+
+
+@pytest.mark.asyncio
 async def test_voice_message_uses_audio_model(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()
@@ -951,7 +1095,9 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
         )
         await _wait_for_condition(lambda: bool(sender.sent))
 
-    assert llm.models == ["qwen3.8-flash"]
+    assert llm.models
+    assert all(model == "qwen3.8-flash" for model in llm.models)
+    assert all(model != "qwen3-vl-plus" for model in llm.models)
     assert "表情包" in llm.calls[0][-1]["content"]
     assert sender.sent[0][0].message_id is None
     assert sticker_store.count() == 1
@@ -1161,6 +1307,60 @@ async def test_media_commands_send_voice_image_file_and_sticker(tmp_path) -> Non
     assert sender.images[0][1].endswith("a.png")
     assert sender.files[0][2] == "sample.txt"
     assert sender.stickers[0][1].summary == "开心"
+
+
+@pytest.mark.asyncio
+async def test_image_only_animation_sticker_is_collected_and_organized(
+    tmp_path,
+) -> None:
+    store = StickerStore(tmp_path / "stickers.db")
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=FakeChatClient(),
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        sticker_store=store,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2750,
+                "message": [
+                    {
+                        "type": "image",
+                        "data": {
+                            "sub_type": "1",
+                            "summary": "无语",
+                            "url": "https://example.com/wuyu.png",
+                        },
+                    }
+                ],
+            },
+        )
+        await _wait_for_condition(lambda: store.count() == 1)
+        await _wait_for_condition(
+            lambda: (
+                store.get_metadata(int(store.list_recent()[0]["id"]))
+                or {}
+            ).get("category")
+            == "无语"
+        )
+    metadata = store.get_metadata(int(store.list_recent()[0]["id"]))
+    assert metadata is not None
+    assert metadata["category"] == "无语"
+    assert metadata["usage_hint"]
 
 
 @pytest.mark.asyncio

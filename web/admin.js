@@ -451,6 +451,22 @@ async function loadStickers() {
   bindStickerActions();
 }
 
+$("#organize-stickers").addEventListener("click", async () => {
+  const button = $("#organize-stickers");
+  button.disabled = true;
+  button.textContent = "整理中…";
+  try {
+    const data = await api("/api/admin/stickers/organize", {method:"POST"});
+    alert(`已自动整理 ${data.organized} 个表情，失败 ${data.failed} 个。`);
+    await loadStickers();
+  } catch (error) {
+    alert(`整理失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = "自动整理未分类表情";
+  }
+});
+
 function bindStickerActions() {
   document.querySelectorAll("[data-save-sticker]").forEach((button) => {
     button.onclick = async () => {

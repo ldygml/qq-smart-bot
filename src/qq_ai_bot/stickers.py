@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -59,13 +60,27 @@ class StickerStore:
                         f"ADD COLUMN {column} {definition}"
                     )
 
-    def record(self, sticker: StickerSource) -> None:
-        if not (
-            sticker.emoji_id
-            or sticker.emoji_package_id
-            or sticker.key
+    def record(self, sticker: StickerSource) -> int | None:
+        summary = sticker.summary.strip() or "表情包"
+        fingerprint = sticker.key
+        if not fingerprint and sticker.image_source:
+            fingerprint = "url-" + hashlib.sha256(
+                sticker.image_source.encode("utf-8")
+            ).hexdigest()[:24]
+        if not fingerprint and (
+            sticker.emoji_id or sticker.emoji_package_id
         ):
-            return
+            fingerprint = "emoji-" + hashlib.sha256(
+                (
+                    sticker.emoji_id
+                    + "|"
+                    + sticker.emoji_package_id
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+        if not fingerprint:
+            if not sticker.image_source:
+                return None
+            fingerprint = "image"
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
@@ -84,21 +99,36 @@ class StickerStore:
                     END
                 """,
                 (
-                    sticker.summary,
+                    summary,
                     sticker.emoji_id,
                     sticker.emoji_package_id,
-                    sticker.key,
+                    fingerprint,
                     sticker.image_source,
                     _utc_now(),
                 ),
             )
+            row = connection.execute(
+                """
+                SELECT id FROM sticker_catalog
+                WHERE summary = ? AND emoji_id = ?
+                  AND emoji_package_id = ? AND sticker_key = ?
+                """,
+                (
+                    summary,
+                    sticker.emoji_id,
+                    sticker.emoji_package_id,
+                    fingerprint,
+                ),
+            ).fetchone()
+            return int(row["id"]) if row else None
 
     def random_sticker(self, keyword: str = "") -> StickerSource | None:
         with self._lock, self._connect() as connection:
             if keyword:
                 rows = connection.execute(
                     """
-                    SELECT summary, emoji_id, emoji_package_id, sticker_key
+                    SELECT summary, emoji_id, emoji_package_id,
+                           sticker_key, image_source
                     FROM sticker_catalog
                     WHERE enabled = 1
                       AND (summary LIKE ? OR usage_hint LIKE ?
@@ -115,7 +145,8 @@ class StickerStore:
             else:
                 rows = connection.execute(
                     """
-                    SELECT summary, emoji_id, emoji_package_id, sticker_key
+                    SELECT summary, emoji_id, emoji_package_id,
+                           sticker_key, image_source
                     FROM sticker_catalog
                     WHERE enabled = 1
                     ORDER BY RANDOM()
@@ -145,6 +176,7 @@ class StickerStore:
             emoji_id=str(row["emoji_id"]),
             emoji_package_id=str(row["emoji_package_id"]),
             key=str(row["sticker_key"]),
+            image_source=str(row["image_source"]),
         )
 
     def count(self) -> int:
@@ -180,7 +212,8 @@ class StickerStore:
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT summary, emoji_id, emoji_package_id, sticker_key
+                SELECT summary, emoji_id, emoji_package_id,
+                       sticker_key, image_source
                 FROM sticker_catalog
                 WHERE id = ? AND enabled = 1
                 """,
@@ -197,6 +230,7 @@ class StickerStore:
             emoji_id=str(row["emoji_id"]),
             emoji_package_id=str(row["emoji_package_id"]),
             key=str(row["sticker_key"]),
+            image_source=str(row["image_source"]),
         )
 
     def get_metadata(self, sticker_id: int) -> dict[str, object] | None:
@@ -256,6 +290,43 @@ class StickerStore:
                 """
             ).fetchall()
         return [str(row["category"]) for row in rows]
+
+    def list_unclassified(self, limit: int = 100) -> list[dict[str, object]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, summary, emoji_id, emoji_package_id,
+                       sticker_key, image_source, category, usage_hint
+                FROM sticker_catalog
+                WHERE category = '未分类' AND usage_hint = ''
+                ORDER BY seen_at DESC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_classification(
+        self,
+        sticker_id: int,
+        *,
+        category: str,
+        usage_hint: str,
+    ) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE sticker_catalog
+                SET category = ?, usage_hint = ?
+                WHERE id = ?
+                """,
+                (
+                    category.strip()[:80] or "未分类",
+                    usage_hint.strip()[:300],
+                    sticker_id,
+                ),
+            )
+            return cursor.rowcount > 0
 
 
 def _utc_now() -> str:
