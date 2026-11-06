@@ -1,6 +1,7 @@
 let csrf = "";
 let providers = [];
 let instances = [];
+let groupDetails = {knowledge: [], members: []};
 
 async function api(path, options = {}) {
   const headers = {...(options.headers || {})};
@@ -58,7 +59,7 @@ async function loadInstances() {
       <div class="item-head"><b>${esc(item.name)}</b><span class="status ${item.status === "online" ? "online" : ""}"><i></i>${esc(item.status)}</span></div>
       <div class="item-meta">127.0.0.1:${item.port} · ${esc(item.provider_name || "未知供应商")}<br>${esc(item.onebot_api_base)}</div>
       <div class="item-actions">
-        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-group-settings="${item.id}">群聊设置</button><a href="${esc(item.dashboard_url)}" target="_blank">打开实例后台</a>` : `<button data-start="${item.id}">启动</button>`}
+        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-group-settings="${item.id}">群聊设置</button><button data-model-routes="${item.id}">模型路由</button><a href="${esc(item.dashboard_url)}" target="_blank">打开实例后台</a>` : `<button data-start="${item.id}">启动</button>`}
         <button data-edit-instance="${item.id}">编辑</button><button data-delete-instance="${item.id}">删除</button>
       </div>
     </article>`).join("") : `<div class="empty">还没有机器人实例</div>`;
@@ -71,6 +72,7 @@ function bindInstanceActions() {
   document.querySelectorAll("[data-restart]").forEach((b) => b.onclick = () => instanceAction(b.dataset.restart, "restart"));
   document.querySelectorAll("[data-memory]").forEach((b) => b.onclick = () => openMemory(Number(b.dataset.memory)));
   document.querySelectorAll("[data-group-settings]").forEach((b) => b.onclick = () => openGroupSettings(Number(b.dataset.groupSettings)));
+  document.querySelectorAll("[data-model-routes]").forEach((b) => b.onclick = () => openModelRoutes(Number(b.dataset.modelRoutes)));
   document.querySelectorAll("[data-edit-instance]").forEach((b) => b.onclick = () => editInstance(Number(b.dataset.editInstance)));
   document.querySelectorAll("[data-delete-instance]").forEach((b) => b.onclick = () => deleteInstance(Number(b.dataset.deleteInstance)));
 }
@@ -323,11 +325,15 @@ async function loadGroupSettings(instanceId) {
     document.querySelector("#settings-learning").checked = Boolean(settings.group_behavior_learning);
     document.querySelector("#settings-quote").checked = Boolean(settings.quote_replies);
     document.querySelector("#settings-quote-mention").checked = Boolean(settings.group_quote_counts_as_mention);
+    document.querySelector("#settings-natural-pacing").checked = Boolean(settings.natural_pacing_enabled);
+    document.querySelector("#settings-natural-split").checked = Boolean(settings.natural_split_replies);
     document.querySelector("#settings-confidence").value = settings.group_min_reply_confidence;
     document.querySelector("#settings-cooldown").value = settings.group_reply_cooldown_seconds;
     document.querySelector("#settings-model").value = settings.group_participation_model || "";
     document.querySelector("#settings-allowlist").value = settings.group_allowlist || "";
     document.querySelector("#settings-prefixes").value = settings.group_trigger_prefixes || "";
+    document.querySelector("#settings-delay-min").value = settings.natural_reply_delay_min_ms ?? 200;
+    document.querySelector("#settings-delay-max").value = settings.natural_reply_delay_max_ms ?? 900;
     await loadGroupProfiles(instanceId);
   } catch (err) {
     error.textContent = err.message;
@@ -346,6 +352,7 @@ async function loadGroupProfiles(instanceId) {
     select.value = previous;
   }
   if (select.value) renderGroupProfile(data.groups, Number(select.value));
+  if (select.value) await loadGroupDetails(instanceId, Number(select.value));
 }
 
 function renderGroupProfile(profiles, groupId) {
@@ -365,6 +372,14 @@ function renderGroupProfile(profiles, groupId) {
   document.querySelector("#profile-hourly-limit").value = item.hourly_reply_limit;
   document.querySelector("#profile-model").value = item.participation_model || "";
   document.querySelector("#profile-prefixes").value = item.trigger_prefixes || "";
+  document.querySelector("#profile-poke-policy").value = item.poke_policy || "allow";
+  document.querySelector("#profile-quote-mode").value = item.quote_mode || "smart";
+  document.querySelector("#profile-active-hours").value = item.active_hours || "";
+  document.querySelector("#profile-blocked-keywords").value = item.blocked_keywords || "";
+  document.querySelector("#profile-delay-min").value = item.reply_delay_min_ms ?? 200;
+  document.querySelector("#profile-delay-max").value = item.reply_delay_max_ms ?? 900;
+  document.querySelector("#profile-digest-hours").value = item.announcement_digest_hours ?? 24;
+  document.querySelector("#profile-welcome-message").value = item.welcome_message || "";
   document.querySelector("#profile-custom-prompt").value = item.custom_prompt || "";
 }
 
@@ -373,7 +388,45 @@ document.querySelector("#settings-profile-select").addEventListener("change", as
   if (!instanceId || !event.target.value) return;
   const data = await api(`/api/instances/${instanceId}/group-profiles`);
   renderGroupProfile(data.groups, Number(event.target.value));
+  await loadGroupDetails(instanceId, Number(event.target.value));
 });
+
+async function loadGroupDetails(instanceId, groupId) {
+  const data = await api(`/api/instances/${instanceId}/group-profiles/${groupId}/details`);
+  groupDetails = data;
+  renderGroupKnowledge();
+  renderGroupMembers();
+}
+
+function renderGroupKnowledge() {
+  const list = document.querySelector("#group-knowledge-list");
+  list.innerHTML = groupDetails.knowledge.length
+    ? groupDetails.knowledge.map((item) => `
+      <article class="source-row">
+        <div><span class="tag">${esc(item.kind)}</span> <strong>${esc(item.title)}</strong></div>
+        <div class="row-meta">${esc(item.content)}</div>
+        <button data-delete-group-knowledge="${item.id}">删除</button>
+      </article>`).join("")
+    : `<div class="empty">暂无群资料</div>`;
+  document.querySelectorAll("[data-delete-group-knowledge]").forEach((button) => {
+    button.onclick = async () => {
+      const instanceId = Number(document.querySelector("#settings-instance").value);
+      const groupId = Number(document.querySelector("#settings-profile-select").value);
+      await api(`/api/instances/${instanceId}/group-profiles/${groupId}/knowledge/${button.dataset.deleteGroupKnowledge}`, {method:"DELETE"});
+      await loadGroupDetails(instanceId, groupId);
+    };
+  });
+}
+
+function renderGroupMembers() {
+  const list = document.querySelector("#group-member-list");
+  list.innerHTML = groupDetails.members.length
+    ? groupDetails.members.map((item) => `
+      <div class="row"><strong>${esc(item.nickname || item.user_id)}</strong> · QQ ${esc(item.user_id)}
+      ${item.no_jokes ? `<span class="tag">不要开玩笑</span>` : ""}
+      <div class="row-meta">${esc(item.notes || "无额外偏好")}</div></div>`).join("")
+    : `<div class="empty">暂无成员偏好</div>`;
+}
 
 document.querySelector("#profile-add-group").addEventListener("click", async () => {
   const instanceId = Number(document.querySelector("#settings-instance").value);
@@ -427,11 +480,68 @@ document.querySelector("#save-group-profile").addEventListener("click", async ()
         hourly_reply_limit:Number(document.querySelector("#profile-hourly-limit").value),
         participation_model:document.querySelector("#profile-model").value.trim(),
         trigger_prefixes:document.querySelector("#profile-prefixes").value.trim(),
+        poke_policy:document.querySelector("#profile-poke-policy").value,
+        quote_mode:document.querySelector("#profile-quote-mode").value,
+        active_hours:document.querySelector("#profile-active-hours").value.trim(),
+        blocked_keywords:document.querySelector("#profile-blocked-keywords").value.trim(),
+        reply_delay_min_ms:Number(document.querySelector("#profile-delay-min").value),
+        reply_delay_max_ms:Number(document.querySelector("#profile-delay-max").value),
+        announcement_digest_hours:Number(document.querySelector("#profile-digest-hours").value),
+        welcome_message:document.querySelector("#profile-welcome-message").value.trim(),
         custom_prompt:document.querySelector("#profile-custom-prompt").value.trim(),
       }),
     });
     result.textContent = "本群设置已保存并立即生效。";
+    await loadGroupDetails(instanceId, groupId);
   } catch (err) { error.textContent = err.message; }
+});
+
+document.querySelector("#add-group-knowledge").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const groupId = Number(document.querySelector("#settings-profile-select").value);
+  if (!instanceId || !groupId) return;
+  try {
+    await api(`/api/instances/${instanceId}/group-profiles/${groupId}/knowledge`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        kind:document.querySelector("#group-knowledge-kind").value,
+        title:document.querySelector("#group-knowledge-title").value.trim(),
+        content:document.querySelector("#group-knowledge-content").value.trim(),
+      }),
+    });
+    document.querySelector("#group-knowledge-title").value = "";
+    document.querySelector("#group-knowledge-content").value = "";
+    await loadGroupDetails(instanceId, groupId);
+  } catch (err) {
+    document.querySelector("#profile-error").textContent = err.message;
+  }
+});
+
+document.querySelector("#save-group-member").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const groupId = Number(document.querySelector("#settings-profile-select").value);
+  const memberId = Number(document.querySelector("#group-member-id").value);
+  if (!instanceId || !groupId || !memberId) return;
+  try {
+    await api(`/api/instances/${instanceId}/group-profiles/${groupId}/members`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        user_id:memberId,
+        nickname:document.querySelector("#group-member-name").value.trim(),
+        notes:document.querySelector("#group-member-notes").value.trim(),
+        no_jokes:document.querySelector("#group-member-no-jokes").checked,
+      }),
+    });
+    document.querySelector("#group-member-id").value = "";
+    document.querySelector("#group-member-name").value = "";
+    document.querySelector("#group-member-notes").value = "";
+    document.querySelector("#group-member-no-jokes").checked = false;
+    await loadGroupDetails(instanceId, groupId);
+  } catch (err) {
+    document.querySelector("#profile-error").textContent = err.message;
+  }
 });
 
 document.querySelector("#reset-group-profile").addEventListener("click", async () => {
@@ -475,6 +585,10 @@ document.querySelector("#save-settings").addEventListener("click", async () => {
         group_behavior_learning:document.querySelector("#settings-learning").checked,
         quote_replies:document.querySelector("#settings-quote").checked,
         group_quote_counts_as_mention:document.querySelector("#settings-quote-mention").checked,
+        natural_pacing_enabled:document.querySelector("#settings-natural-pacing").checked,
+        natural_split_replies:document.querySelector("#settings-natural-split").checked,
+        natural_reply_delay_min_ms:Number(document.querySelector("#settings-delay-min").value),
+        natural_reply_delay_max_ms:Number(document.querySelector("#settings-delay-max").value),
         group_min_reply_confidence:Number(document.querySelector("#settings-confidence").value),
         group_reply_cooldown_seconds:Number(document.querySelector("#settings-cooldown").value),
         group_participation_model:document.querySelector("#settings-model").value.trim(),
@@ -488,6 +602,86 @@ document.querySelector("#save-settings").addEventListener("click", async () => {
   } finally {
     button.disabled = false;
     button.textContent = "保存群聊设置";
+  }
+});
+
+const routeCapabilities = [
+  ["chat", "聊天"],
+  ["code", "代码"],
+  ["vision", "视觉"],
+  ["ocr", "OCR"],
+  ["audio", "语音识别"],
+  ["tts", "语音合成"],
+  ["embedding", "向量"],
+  ["reflection", "反思"],
+];
+
+async function openModelRoutes(instanceId) {
+  const select = document.querySelector("#routes-instance");
+  select.innerHTML = instances.map((item) => `<option value="${item.id}">${esc(item.name)} · :${item.port}</option>`).join("");
+  select.value = String(instanceId);
+  document.querySelector("#routes-error").textContent = "";
+  document.querySelector("#routes-result").textContent = "";
+  openPanel("model-routes-panel");
+  await loadModelRoutes(instanceId);
+}
+
+async function loadModelRoutes(instanceId) {
+  const data = await api(`/api/instances/${instanceId}/model-routes`);
+  const byCapability = new Map(data.routes.map((item) => [item.capability, item]));
+  const firstProvider = providers[0];
+  document.querySelector("#model-route-editor").innerHTML = routeCapabilities.map(([capability, label]) => {
+    const route = byCapability.get(capability);
+    const providerId = route?.primary_provider_id || firstProvider?.id || "";
+    const provider = providers.find((item) => item.id === Number(providerId));
+    const model = route?.primary_model || provider?.model || "";
+    const fallbackText = (route?.fallbacks || []).map((item) => `${item.provider_id}:${item.model}`).join(",");
+    return `<section class="route-row" data-capability="${capability}">
+      <h3>${label}</h3>
+      <div class="route-fields">
+        <label>主供应商<select data-route-provider>${providers.map((item) => `<option value="${item.id}" ${item.id === Number(providerId) ? "selected" : ""}>${esc(item.name)}</option>`).join("")}</select></label>
+        <label>主模型<input data-route-model value="${esc(model)}"></label>
+        <label>备用链<input data-route-fallbacks value="${esc(fallbackText)}" placeholder="供应商ID:模型,供应商ID:模型"></label>
+      </div>
+      <div class="item-meta">可用供应商：${providers.map((item) => `ID ${item.id} = ${esc(item.name)}`).join("；")}</div>
+    </section>`;
+  }).join("");
+}
+
+document.querySelector("#routes-instance").addEventListener("change", async (event) => {
+  if (event.target.value) await loadModelRoutes(Number(event.target.value));
+});
+
+document.querySelector("#save-model-routes").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#routes-instance").value);
+  const error = document.querySelector("#routes-error");
+  const result = document.querySelector("#routes-result");
+  error.textContent = "";
+  result.textContent = "";
+  try {
+    const routes = [...document.querySelectorAll(".route-row")].map((row) => {
+      const fallbackText = row.querySelector("[data-route-fallbacks]").value.trim();
+      const fallbacks = fallbackText
+        ? fallbackText.split(",").filter(Boolean).map((item) => {
+          const [providerId, ...modelParts] = item.split(":");
+          return {provider_id:Number(providerId), model:modelParts.join(":").trim()};
+        })
+        : [];
+      return {
+        capability: row.dataset.capability,
+        primary_provider_id: Number(row.querySelector("[data-route-provider]").value),
+        primary_model: row.querySelector("[data-route-model]").value.trim(),
+        fallbacks,
+      };
+    });
+    await api(`/api/instances/${instanceId}/model-routes`, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({routes}),
+    });
+    result.textContent = "路由已保存；重启实例后生效。";
+  } catch (err) {
+    error.textContent = err.message;
   }
 });
 

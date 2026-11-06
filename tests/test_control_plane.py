@@ -65,6 +65,35 @@ async def test_control_plane_auth_provider_and_instance(tmp_path, monkeypatch) -
         )
         assert instance.status_code == 200
         assert instance.json()["instance"]["name"] == "测试实例"
+        instance_id = instance.json()["instance"]["id"]
+
+        routes = await client.post(
+            f"/api/instances/{instance_id}/model-routes",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "routes": [
+                    {
+                        "capability": "chat",
+                        "primary_provider_id": provider_id,
+                        "primary_model": "example-chat",
+                        "fallbacks": [
+                            {
+                                "provider_id": provider_id,
+                                "model": "backup-chat",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        assert routes.status_code == 200
+        assert routes.json()["routes"][0]["capability"] == "chat"
+        route_env = control_plane._build_model_routes_env(
+            instance_id,
+            store.authenticate("owner", "secure-password")["id"],
+        )
+        assert "backup-chat" in route_env
+        assert "super-secret-key" in route_env
 
         portal = await client.get("/portal")
         assert portal.status_code == 200

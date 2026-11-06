@@ -39,21 +39,39 @@ class TTSClient:
         )
 
     async def synthesize(self, text: str) -> str:
+        return await self.synthesize_styled(text)
+
+    async def synthesize_styled(
+        self,
+        text: str,
+        *,
+        voice: str = "",
+        rate: float | None = None,
+    ) -> str:
         value = text.strip()
         if not value:
             raise TTSError("要合成的文字为空。")
+        value = (
+            value.replace("...", "……")
+            .replace("。。。", "……")
+            .replace("\n\n", "\n")
+        )
+        input_payload: dict[str, object] = {
+            "text": value,
+            "voice": voice or self._voice,
+            "format": "wav",
+            "sample_rate": 24000,
+        }
+        request_payload: dict[str, object] = {
+            "model": self._model,
+            "input": input_payload,
+        }
+        if rate is not None and abs(float(rate) - 1.0) > 0.001:
+            request_payload["parameters"] = {"rate": float(rate)}
         try:
             response = await self._client.post(
                 self._endpoint,
-                json={
-                    "model": self._model,
-                    "input": {
-                        "text": value,
-                        "voice": self._voice,
-                        "format": "wav",
-                        "sample_rate": 24000,
-                    },
-                },
+                json=request_payload,
             )
         except httpx.TimeoutException as exc:
             raise TTSError("语音合成超时，请稍后再试。") from exc

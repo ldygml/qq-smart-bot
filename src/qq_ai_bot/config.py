@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     dashscope_api_key: SecretStr = SecretStr("")
     deepseek_api_key: SecretStr = SecretStr("")
     openai_api_key: SecretStr = SecretStr("")
+    model_routes_json: SecretStr = SecretStr("")
     llm_temperature: float = 0.8
     llm_timeout_seconds: float = 90.0
     llm_trust_env: bool = False
@@ -55,6 +56,10 @@ class Settings(BaseSettings):
     tts_enabled: bool = True
     tts_model: str = "qwen-audio-3.1-tts-flash"
     tts_voice: str = "longanhuan_v3.1"
+    tts_voice_calm: str = ""
+    tts_voice_lively: str = ""
+    tts_voice_sad: str = ""
+    tts_rate: float = 1.0
     max_tts_chars: int = 800
     media_send_enabled: bool = True
     generated_media_dir: Path = Path("data/generated")
@@ -68,6 +73,7 @@ class Settings(BaseSettings):
     memory_privacy_protection: bool = True
     profile_learning_enabled: bool = True
     profile_update_after_messages: int = 5
+    relationship_inactive_days: int = 14
     reflection_enabled: bool = False
     reflection_model: str = "qwen-plus"
     reflection_interval_seconds: float = 1200.0
@@ -92,6 +98,16 @@ class Settings(BaseSettings):
     group_min_reply_confidence: float = 0.65
     group_reply_cooldown_seconds: float = 90.0
     group_behavior_learning: bool = True
+    group_poke_policy: str = "allow"
+    group_active_hours: str = ""
+    group_blocked_keywords: str = ""
+    group_quote_mode: str = "smart"
+    group_welcome_message: str = ""
+    group_announcement_digest_hours: int = 24
+    natural_pacing_enabled: bool = False
+    natural_reply_delay_min_ms: int = 200
+    natural_reply_delay_max_ms: int = 900
+    natural_split_replies: bool = True
     quote_replies: bool = True
     group_quote_counts_as_mention: bool = True
 
@@ -99,6 +115,9 @@ class Settings(BaseSettings):
     max_history_rows_per_chat: int = 160
     rate_limit_per_minute: int = 8
     max_concurrent_requests: int = 4
+    quality_review_enabled: bool = True
+    quality_review_interval_seconds: float = 1800.0
+    quality_review_batch_size: int = 8
     database_path: Path = Path("data/bot.db")
     owner_qq: int = 0
     timezone: str = "Asia/Shanghai"

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import random
 import re
 import time
 from collections import OrderedDict, deque
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -46,6 +48,12 @@ from .group_profiles import GroupPolicy, GroupProfileStore
 from .images import ImageLoader, ImageLoaderProtocol, ImageLoadError
 from .llm import ChatClient, CompatibleChatClient, LLMError
 from .memory import ChatMemory
+from .model_router import (
+    FailoverChatClient,
+    FailoverEmbeddingClient,
+    FailoverTTSClient,
+    parse_model_routes,
+)
 from .onebot import (
     OneBotClient,
     OneBotError,
@@ -64,6 +72,7 @@ from .productivity import (
     parse_reminder_time,
     split_reminder_argument,
 )
+from .quality import QualityStore, evaluate_quality
 from .qq_format import format_qq_text
 from .ratelimit import SlidingWindowRateLimiter
 from .security import request_is_authorized
@@ -150,6 +159,16 @@ GROUP_SETTING_SPECS = {
         "group_reply_cooldown_seconds",
         "cooldown",
     ),
+    "natural_pacing_enabled": ("natural_pacing_enabled", "bool"),
+    "natural_split_replies": ("natural_split_replies", "bool"),
+    "natural_reply_delay_min_ms": (
+        "natural_reply_delay_min_ms",
+        "delay",
+    ),
+    "natural_reply_delay_max_ms": (
+        "natural_reply_delay_max_ms",
+        "delay",
+    ),
     "quote_replies": ("quote_replies", "bool"),
     "group_quote_counts_as_mention": (
         "group_quote_counts_as_mention",
@@ -179,6 +198,7 @@ def create_app(
     group_profile_store: GroupProfileStore | None = None,
     sticker_choice_decider: StickerChoiceDecider | None = None,
     sticker_organizer: LLMStickerOrganizer | None = None,
+    quality_store: QualityStore | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -186,7 +206,7 @@ def create_app(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    llm = chat_client or CompatibleChatClient(
+    base_llm = chat_client or CompatibleChatClient(
         base_url=config.llm_base_url,
         model=config.llm_model,
         api_key=config.effective_llm_api_key,
@@ -200,7 +220,32 @@ def create_app(
     )
     store = memory or ChatMemory(config.database_path)
     usage = UsageStore(config.database_path)
-    llm = MeteredChatClient(llm, usage)
+    quality = quality_store or QualityStore(config.database_path)
+    model_routes = parse_model_routes(
+        config.model_routes_json.get_secret_value()
+    )
+    capability_clients: dict[str, ChatClient] = {}
+    if model_routes:
+        for capability, targets in model_routes.items():
+            capability_clients[capability] = FailoverChatClient(
+                targets,
+                capability=capability,
+                usage=usage,
+            )
+    default_metered = MeteredChatClient(base_llm, usage)
+    for capability in (
+        "chat",
+        "code",
+        "vision",
+        "ocr",
+        "audio",
+        "reflection",
+    ):
+        capability_clients.setdefault(capability, default_metered)
+    llm = capability_clients["chat"]
+
+    def client_for(capability: str) -> ChatClient:
+        return capability_clients.get(capability, llm)
     images = image_loader or ImageLoader(
         max_bytes=config.max_image_bytes,
         timeout_seconds=config.image_timeout_seconds,
@@ -208,7 +253,7 @@ def create_app(
     productivity = productivity_store or ProductivityStore(config.database_path)
     documents = document_loader or DocumentLoader(
         timeout_seconds=config.document_timeout_seconds,
-        ocr_client=llm,
+        ocr_client=client_for("ocr"),
         vision_model=config.vision_model,
         ocr_enabled=config.ocr_enabled,
     )
@@ -217,30 +262,46 @@ def create_app(
     )
     shared_memory = shared_memory_store or SharedMemoryStore(config.database_path)
     _apply_saved_group_settings(config, shared_memory)
-    embeddings = embedding_client or (
-        EmbeddingClient(
+    if embedding_client is not None:
+        embeddings = embedding_client
+    elif (
+        config.vector_memory_enabled
+        and model_routes.get("embedding")
+    ):
+        embeddings = FailoverEmbeddingClient(
+            model_routes["embedding"]
+        )
+    elif config.vector_memory_enabled:
+        embeddings = EmbeddingClient(
             base_url=config.llm_base_url,
             api_key=config.effective_llm_api_key,
             model=config.embedding_model,
             timeout_seconds=config.llm_timeout_seconds,
             trust_env=config.llm_trust_env,
         )
-        if config.vector_memory_enabled
-        else None
-    )
+    else:
+        embeddings = None
     vectors = vector_store or (
         VectorMemoryStore(config.database_path)
         if config.vector_memory_enabled
         else None
     )
-    tts = tts_client or TTSClient(
-        compatible_base_url=config.llm_base_url,
-        api_key=config.effective_llm_api_key,
-        model=config.tts_model,
-        voice=config.tts_voice,
-        timeout_seconds=config.llm_timeout_seconds,
-        trust_env=config.llm_trust_env,
-    )
+    if tts_client is not None:
+        tts = tts_client
+    elif model_routes.get("tts"):
+        tts = FailoverTTSClient(
+            model_routes["tts"],
+            default_voice=config.tts_voice,
+        )
+    else:
+        tts = TTSClient(
+            compatible_base_url=config.llm_base_url,
+            api_key=config.effective_llm_api_key,
+            model=config.tts_model,
+            voice=config.tts_voice,
+            timeout_seconds=config.llm_timeout_seconds,
+            trust_env=config.llm_trust_env,
+        )
     stickers = sticker_store or StickerStore(config.database_path)
     web_articles = web_reader or WebArticleReader(
         timeout_seconds=config.web_reader_timeout_seconds,
@@ -267,8 +328,9 @@ def create_app(
         min_confidence=config.sticker_min_confidence,
     )
     sticker_organizer_client = sticker_organizer or LLMStickerOrganizer(
-        llm,
+        client_for("vision"),
         model=config.sticker_model,
+        vision_model=config.vision_model,
     )
     group_behavior = group_behavior_store or GroupBehaviorStore(
         config.database_path
@@ -308,22 +370,41 @@ def create_app(
     reflection_lock = asyncio.Lock()
     group_histories: dict[int, deque[GroupMessage]] = {}
     group_name_cache: dict[int, str] = {}
+    recent_group_message_hashes: dict[
+        int,
+        deque[tuple[str, float]],
+    ] = {}
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         reminder_task = asyncio.create_task(_reminder_loop())
         reflection_task = asyncio.create_task(_reflection_loop())
+        quality_task = asyncio.create_task(_quality_review_loop())
+        group_digest_task = asyncio.create_task(_group_digest_loop())
         try:
             yield
         finally:
             reminder_task.cancel()
             reflection_task.cancel()
-            pending = [*background_tasks, reminder_task, reflection_task]
+            quality_task.cancel()
+            group_digest_task.cancel()
+            pending = [
+                *background_tasks,
+                reminder_task,
+                reflection_task,
+                quality_task,
+                group_digest_task,
+            ]
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             await sender.close()
-            await llm.close()
+            closed_clients: set[int] = set()
+            for client in capability_clients.values():
+                if id(client) in closed_clients:
+                    continue
+                closed_clients.add(id(client))
+                await client.close()
             await images.close()
             await documents.close()
             await audio.close()
@@ -381,6 +462,10 @@ def create_app(
             "casual_model": config.casual_model,
             "code_model": config.code_model,
             "code_fallback_model": config.code_fallback_model,
+            "model_routes": {
+                capability: [target.model for target in targets]
+                for capability, targets in model_routes.items()
+            },
             "web_search_enabled": config.web_search_enabled,
             "web_reader_enabled": config.web_reader_enabled,
             "vector_memory_enabled": config.vector_memory_enabled,
@@ -442,6 +527,26 @@ def create_app(
 
     @app.get("/api/admin/overview")
     async def admin_overview() -> dict[str, Any]:
+        inactive = []
+        now_utc = datetime.now(timezone.utc)
+        for person in shared_memory.list_people(limit=200):
+            try:
+                last_seen = datetime.fromisoformat(
+                    str(person["last_seen"])
+                )
+                if last_seen.tzinfo is None:
+                    last_seen = last_seen.replace(tzinfo=timezone.utc)
+                days = (now_utc - last_seen).total_seconds() / 86400
+            except (ValueError, TypeError):
+                continue
+            if days >= config.relationship_inactive_days:
+                inactive.append(
+                    {
+                        "user_id": person["user_id"],
+                        "display_name": person["display_name"],
+                        "days": round(days, 1),
+                    }
+                )
         return {
             "models": {
                 "chat": config.llm_model,
@@ -451,6 +556,12 @@ def create_app(
                 "audio": config.audio_model,
                 "embedding": config.embedding_model,
             },
+            "model_routes": {
+                capability: [target.model for target in targets]
+                for capability, targets in model_routes.items()
+            },
+            "relationship_events": shared_memory.relationship_events(20),
+            "inactive_relationships": inactive[:20],
             "memory": shared_memory.stats(),
             "vector_chunks": vectors.count() if vectors else 0,
             "stickers": stickers.count(),
@@ -542,6 +653,120 @@ def create_app(
             "deleted": _purge_all_memory(),
         }
 
+    @app.get("/api/admin/memory/export")
+    async def admin_export_memory() -> JSONResponse:
+        payload = shared_memory.export_data()
+        return JSONResponse(
+            payload,
+            headers={
+                "Content-Disposition": (
+                    'attachment; filename="qq-bot-memory-export.json"'
+                )
+            },
+        )
+
+    @app.post("/api/admin/memory/import")
+    async def admin_import_memory(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        imported = shared_memory.import_data(payload)
+        return {"ok": True, "imported": imported}
+
+    @app.post("/api/admin/memory/purge-range")
+    async def admin_purge_memory_range(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        start_text = str(payload.get("start_at") or "").strip()
+        end_text = str(payload.get("end_at") or "").strip()
+        try:
+            start_local = datetime.fromisoformat(start_text).replace(
+                tzinfo=ZoneInfo(config.timezone)
+            )
+            end_local = datetime.fromisoformat(end_text).replace(
+                tzinfo=ZoneInfo(config.timezone)
+            )
+        except ValueError:
+            return JSONResponse(
+                {"detail": "开始和结束时间格式无效"},
+                status_code=400,
+            )
+        if end_local <= start_local:
+            return JSONResponse(
+                {"detail": "结束时间必须晚于开始时间"},
+                status_code=400,
+            )
+        deleted = shared_memory.purge_between(
+            start_at=start_local.astimezone(timezone.utc).isoformat(),
+            end_at=end_local.astimezone(timezone.utc).isoformat(),
+        )
+        if vectors is not None:
+            memory_sources = [
+                f"memory:{memory_id}"
+                for memory_id in deleted["memories"]
+            ]
+            episode_sources = [
+                f"episode:{episode_id}"
+                for episode_id in deleted["episodes"]
+            ]
+            vectors.delete_sources("memory", memory_sources)
+            vectors.delete_sources("episode", episode_sources)
+        return JSONResponse({"ok": True, "deleted": deleted})
+
+    @app.post("/api/admin/people/{user_id}/summary")
+    async def admin_person_summary(user_id: int) -> JSONResponse:
+        person = shared_memory.get_person(user_id)
+        if person is None:
+            return JSONResponse(
+                {"detail": "person not found"},
+                status_code=404,
+            )
+        memories = shared_memory.list_memories(user_id)
+        episodes = shared_memory.episodes_for_speaker(
+            user_id,
+            limit=30,
+        )
+        prompt = (
+            "根据以下资料生成联系人近况摘要。只写有证据支持的内容，"
+            "分为：最近在忙什么、明确承诺/约定、关系变化、可能需要跟进的事项。"
+            "没有依据的栏目写“暂无”。不要心理诊断。\n\n"
+            f"联系人：{person['display_name']}\n"
+            f"互动画像：{person.get('style_profile') or '暂无'}\n"
+            f"关系备注：{person.get('relationship_note') or '暂无'}\n"
+            "长期记忆：\n"
+            + "\n".join(
+                f"- {item['content']}" for item in memories
+            )
+            + "\n最近对话：\n"
+            + "\n".join(
+                f"- 用户：{item['user_content'][:300]}；"
+                f"机器人：{item['assistant_content'][:200]}"
+                for item in episodes[-15:]
+            )
+        )
+        try:
+            summary = await llm.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "输出简洁中文纯文本，不使用 Markdown。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                model=config.llm_model,
+            )
+        except LLMError as exc:
+            return JSONResponse(
+                {"detail": str(exc)},
+                status_code=502,
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "user_id": user_id,
+                "summary": format_qq_text(summary),
+            }
+        )
+
     @app.get("/api/admin/memory/timeline")
     async def admin_memory_timeline(
         user_id: int | None = None,
@@ -556,6 +781,55 @@ def create_app(
                 limit=100,
             ),
         }
+
+    @app.get("/api/admin/followups")
+    async def admin_followups() -> dict[str, Any]:
+        return {
+            "due": shared_memory.due_followups(limit=100),
+        }
+
+    @app.patch("/api/admin/memories/{memory_id}/followup")
+    async def admin_set_followup(
+        memory_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        follow_up_at = str(payload.get("follow_up_at") or "").strip() or None
+        status = str(payload.get("status") or "pending")
+        if status not in {"pending", "done", "dismissed", "none"}:
+            return JSONResponse(
+                {"detail": "follow_up_status 无效"},
+                status_code=400,
+            )
+        updated = shared_memory.set_followup(
+            memory_id,
+            follow_up_at=follow_up_at,
+            status=status,
+        )
+        return JSONResponse(
+            {"ok": updated},
+            status_code=200 if updated else 404,
+        )
+
+    @app.patch("/api/admin/conflicts/{conflict_id}")
+    async def admin_resolve_conflict(
+        conflict_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        decision = str(payload.get("decision") or "")
+        try:
+            updated = shared_memory.resolve_conflict(
+                conflict_id,
+                decision=decision,
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                {"detail": str(exc)},
+                status_code=400,
+            )
+        return JSONResponse(
+            {"ok": updated},
+            status_code=200 if updated else 404,
+        )
 
     @app.patch("/api/admin/memories/{memory_id}")
     async def admin_update_memory(
@@ -716,11 +990,13 @@ def create_app(
             async with gate:
                 classification = await sticker_organizer_client.classify(
                     summary=str(item.get("summary") or "表情包"),
+                    image_url=str(item.get("image_source") or ""),
                 )
                 return stickers.update_classification(
                     int(item["id"]),
                     category=classification.category,
                     usage_hint=classification.usage_hint,
+                    tags=classification.tags,
                 )
 
         results = await asyncio.gather(
@@ -783,7 +1059,13 @@ def create_app(
             )
         namespace = str(payload.get("namespace") or "")
         source_id = str(payload.get("source_id") or "")
-        if namespace not in {"document", "web"} or not source_id:
+        if (
+            namespace not in {"document", "web"}
+            and not (
+                namespace.startswith("group:")
+                and namespace.endswith(":document")
+            )
+        ) or not source_id:
             return JSONResponse(
                 {"detail": "invalid source"},
                 status_code=400,
@@ -821,6 +1103,115 @@ def create_app(
         )
         summary["pricing"] = dict(usage_pricing)
         return summary
+
+    @app.get("/api/admin/quality")
+    async def admin_quality() -> dict[str, Any]:
+        return {
+            "stats": quality.stats(),
+            "recent": quality.list_recent(limit=80),
+        }
+
+    @app.post("/api/admin/quality/review")
+    async def admin_quality_review() -> dict[str, Any]:
+        reviewed = 0
+        for item in quality.pending_review(
+            limit=config.quality_review_batch_size
+        ):
+            result = await evaluate_quality(
+                llm,
+                model=config.llm_model,
+                user_text=str(item["user_text"]),
+                assistant_text=str(item["assistant_text"]),
+                group_context=(
+                    f"群聊 {item['group_id']}"
+                    if item["group_id"]
+                    else "私聊"
+                ),
+            )
+            if quality.mark_review(
+                int(item["id"]),
+                score=result["score"],
+                issues=result["issues"],
+                notes=result["notes"],
+            ):
+                reviewed += 1
+        return {
+            "ok": True,
+            "reviewed": reviewed,
+            "reviews": quality.list_recent(limit=80),
+        }
+
+    @app.post("/api/admin/quality/replay")
+    async def admin_quality_replay(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        user_message = str(payload.get("user_message") or "").strip()
+        if not user_message:
+            return JSONResponse(
+                {"detail": "user_message is required"},
+                status_code=400,
+            )
+        conversation_id = str(
+            payload.get("conversation_id") or "replay"
+        )
+        history = store.history(conversation_id, config.history_messages)
+        raw_variants = payload.get("variants")
+        variants = raw_variants if isinstance(raw_variants, list) else []
+        if not variants:
+            variants = [
+                {
+                    "name": "当前人格",
+                    "model": config.casual_model,
+                    "system_prompt": config.casual_system_prompt,
+                },
+                {
+                    "name": "直接简洁",
+                    "model": config.casual_model,
+                    "system_prompt": (
+                        config.casual_system_prompt
+                        + "\n再短一些，只说核心判断。"
+                    ),
+                },
+            ]
+        results: list[dict[str, Any]] = []
+        for index, variant in enumerate(variants[:5]):
+            if not isinstance(variant, dict):
+                continue
+            system_prompt = str(
+                variant.get("system_prompt")
+                or config.casual_system_prompt
+            )
+            model = str(variant.get("model") or config.casual_model)
+            try:
+                reply = await llm.chat(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        *history,
+                        {"role": "user", "content": user_message},
+                    ],
+                    model=model,
+                    extra_payload={"_allow_model_override": True},
+                )
+                results.append(
+                    {
+                        "name": str(
+                            variant.get("name") or f"方案 {index + 1}"
+                        ),
+                        "model": model,
+                        "reply": format_qq_text(reply),
+                    }
+                )
+            except LLMError as exc:
+                results.append(
+                    {
+                        "name": str(
+                            variant.get("name") or f"方案 {index + 1}"
+                        ),
+                        "model": model,
+                        "error": str(exc),
+                    }
+                )
+        return {"ok": True, "results": results}
 
     @app.get("/api/admin/group-behavior")
     async def admin_group_behavior() -> dict[str, Any]:
@@ -1037,6 +1428,99 @@ def create_app(
             }
         )
 
+    @app.get("/api/admin/group-profiles/{group_id}/details")
+    async def admin_group_profile_details(
+        group_id: int,
+    ) -> dict[str, Any]:
+        profile = group_profiles.get(group_id)
+        if profile is None:
+            return JSONResponse(
+                {"detail": "群聊配置不存在"},
+                status_code=404,
+            )
+        return {
+            "profile": {
+                **profile.__dict__,
+                "trigger_prefix_values": profile.trigger_prefix_values,
+            },
+            "knowledge": group_profiles.knowledge(group_id),
+            "members": group_profiles.member_preferences(group_id),
+        }
+
+    @app.post("/api/admin/group-profiles/{group_id}/knowledge")
+    async def admin_add_group_knowledge(
+        group_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        title = str(payload.get("title") or "").strip()
+        content = str(payload.get("content") or "").strip()
+        kind = str(payload.get("kind") or "note").strip().lower()
+        if not title or not content:
+            return JSONResponse(
+                {"detail": "标题和内容不能为空"},
+                status_code=400,
+            )
+        if kind not in {
+            "faq",
+            "rule",
+            "announcement",
+            "file",
+            "note",
+            "digest",
+        }:
+            return JSONResponse(
+                {"detail": "知识类型无效"},
+                status_code=400,
+            )
+        knowledge_id = group_profiles.add_knowledge(
+            group_id,
+            kind=kind,
+            title=title,
+            content=content,
+        )
+        return {
+            "ok": True,
+            "id": knowledge_id,
+            "knowledge": group_profiles.knowledge(group_id),
+        }
+
+    @app.delete(
+        "/api/admin/group-profiles/{group_id}/knowledge/{knowledge_id}"
+    )
+    async def admin_delete_group_knowledge(
+        group_id: int,
+        knowledge_id: int,
+    ) -> dict[str, Any]:
+        return {
+            "ok": group_profiles.delete_knowledge(
+                group_id,
+                knowledge_id,
+            )
+        }
+
+    @app.post("/api/admin/group-profiles/{group_id}/members")
+    async def admin_save_group_member(
+        group_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        member_id = _optional_int(payload.get("user_id"))
+        if member_id is None:
+            return JSONResponse(
+                {"detail": "QQ 号无效"},
+                status_code=400,
+            )
+        group_profiles.save_member_preference(
+            group_id,
+            member_id,
+            nickname=str(payload.get("nickname") or ""),
+            notes=str(payload.get("notes") or ""),
+            no_jokes=bool(payload.get("no_jokes", False)),
+        )
+        return {
+            "ok": True,
+            "members": group_profiles.member_preferences(group_id),
+        }
+
     @app.delete("/api/admin/group-behavior/{group_id}")
     async def admin_reset_group_behavior(group_id: int) -> dict[str, Any]:
         return {
@@ -1082,7 +1566,7 @@ def create_app(
                 )
             elif kind == "code":
                 artifact = await generate_code(
-                    llm,
+                    client_for("code"),
                     model=config.code_model,
                     fallback_model=config.code_fallback_model,
                     prompt=prompt,
@@ -1155,6 +1639,12 @@ def create_app(
             task.add_done_callback(background_tasks.discard)
             return Response(status_code=204)
 
+        if _is_group_increase_event(event):
+            task = asyncio.create_task(_run_group_increase(event))
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+            return Response(status_code=204)
+
         if event.post_type != "message" or event.message_type not in {
             "private",
             "group",
@@ -1201,6 +1691,47 @@ def create_app(
         except Exception:
             logger.exception("Unexpected poke-notice processing failure")
 
+    async def _run_group_increase(event: OneBotEvent) -> None:
+        try:
+            await _process_group_increase(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Unexpected group-increase processing failure")
+
+    async def _process_group_increase(event: OneBotEvent) -> None:
+        if (
+            event.group_id is None
+            or event.user_id is None
+            or not config.enable_group
+            or (event.self_id is not None and event.user_id == event.self_id)
+        ):
+            return
+        profile = group_profiles.get(event.group_id)
+        if profile is None or not profile.enabled or not profile.welcome_message:
+            return
+        member_name = str(
+            (event.sender or {}).get("card")
+            or (event.sender or {}).get("nickname")
+            or event.user_id
+        ).strip()
+        getter = getattr(sender, "get_group_member_name", None)
+        if callable(getter):
+            try:
+                fetched = await getter(event.group_id, event.user_id)
+                if fetched:
+                    member_name = fetched
+            except Exception:
+                pass
+        message = profile.welcome_message.replace(
+            "{name}",
+            member_name,
+        ).replace("{group}", group_name_cache.get(event.group_id, "本群"))
+        await _safe_send(
+            ReplyTarget("group", event.user_id, event.group_id),
+            message[:1000],
+        )
+
     async def _process_poke_notice(event: OneBotEvent) -> None:
         if (
             event.user_id is None
@@ -1245,6 +1776,13 @@ def create_app(
                 name=group_name_cache.get(event.group_id, ""),
             )
             if not profile.enabled:
+                return
+            if profile.poke_policy == "deny":
+                return
+            if (
+                profile.poke_policy == "admin"
+                and poker_id != config.owner_qq
+            ):
                 return
             target = ReplyTarget("group", poker_id, event.group_id)
         else:
@@ -1341,6 +1879,115 @@ def create_app(
                 logger.warning("Periodic memory reflection failed", exc_info=True)
             await asyncio.sleep(max(60.0, config.reflection_interval_seconds))
 
+    async def _quality_review_loop() -> None:
+        if not config.quality_review_enabled:
+            return
+        await asyncio.sleep(15)
+        while True:
+            try:
+                quality.mark_ignored_stale(minutes=20)
+                pending = quality.pending_review(
+                    limit=config.quality_review_batch_size
+                )
+                for item in pending:
+                    result = await evaluate_quality(
+                        llm,
+                        model=config.llm_model,
+                        user_text=str(item["user_text"]),
+                        assistant_text=str(item["assistant_text"]),
+                        group_context=(
+                            f"群聊 {item['group_id']}"
+                            if item["group_id"]
+                            else "私聊"
+                        ),
+                    )
+                    quality.mark_review(
+                        int(item["id"]),
+                        score=result["score"],
+                        issues=result["issues"],
+                        notes=result["notes"],
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Conversation quality review failed",
+                    exc_info=True,
+                )
+            await asyncio.sleep(
+                max(60.0, config.quality_review_interval_seconds)
+            )
+
+    async def _group_digest_loop() -> None:
+        await asyncio.sleep(20)
+        while True:
+            try:
+                for profile in group_profiles.list_all():
+                    hours = profile.announcement_digest_hours
+                    if hours <= 0 or not profile.enabled:
+                        continue
+                    announcements = group_profiles.knowledge(
+                        profile.group_id,
+                        kind="announcement",
+                        limit=100,
+                    )
+                    if not announcements:
+                        continue
+                    run_key = f"group_digest:{profile.group_id}:last_run"
+                    last_run = shared_memory.get_state(run_key, "")
+                    if last_run:
+                        try:
+                            elapsed_hours = (
+                                datetime.now(timezone.utc)
+                                - datetime.fromisoformat(last_run)
+                            ).total_seconds() / 3600
+                        except ValueError:
+                            elapsed_hours = hours
+                        if elapsed_hours < hours:
+                            continue
+                    state_key = (
+                        f"group_digest:{profile.group_id}:last_updated"
+                    )
+                    latest = max(
+                        str(item["updated_at"])
+                        for item in announcements
+                    )
+                    if shared_memory.get_state(state_key, "") == latest:
+                        continue
+                    content = "\n".join(
+                        f"- {item['title']}：{item['content']}"
+                        for item in announcements[:30]
+                    )
+                    summary = await llm.chat(
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "总结群公告，保留时间、行动项和重要变化，"
+                                    "不要编造，不要使用 Markdown。"
+                                ),
+                            },
+                            {"role": "user", "content": content},
+                        ],
+                        model=config.llm_model,
+                    )
+                    group_profiles.add_knowledge(
+                        profile.group_id,
+                        kind="digest",
+                        title=f"群公告定期总结 {datetime.now(ZoneInfo(config.timezone)):%Y-%m-%d %H:%M}",
+                        content=format_qq_text(summary),
+                    )
+                    shared_memory.set_state(state_key, latest)
+                    shared_memory.set_state(
+                        run_key,
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Group announcement digest failed", exc_info=True)
+            await asyncio.sleep(600)
+
     async def _harvest_episode_memories(*, force: bool) -> dict[str, int]:
         extracted = 0
         conflicts = 0
@@ -1364,6 +2011,14 @@ def create_app(
             )
             chunks: list[VectorChunk] = []
             for memory in candidates:
+                follow_up_at = (
+                    (
+                        datetime.now(timezone.utc)
+                        + timedelta(days=memory.follow_up_days)
+                    ).isoformat()
+                    if memory.follow_up_days
+                    else None
+                )
                 memory_id = shared_memory.add_memory(
                     subject_user_id=user_id,
                     subject_name=speaker_name,
@@ -1375,6 +2030,7 @@ def create_app(
                     confidence=memory.confidence,
                     source_episode_id=source_episode_id,
                     source_observation_id=source_observation_id,
+                    follow_up_at=follow_up_at,
                 )
                 if memory_id is None:
                     continue
@@ -1526,7 +2182,7 @@ def create_app(
                 include_private=not config.memory_privacy_protection,
             )
             result = await reflect_on_memories(
-                llm,
+                client_for("reflection"),
                 model=config.reflection_model,
                 memories=memories,
                 existing_growth=shared_memory.growth_summary(
@@ -1594,11 +2250,13 @@ def create_app(
                 classification = await sticker_organizer_client.classify(
                     summary=summary,
                     recent_context=context,
+                    image_url=str(metadata.get("image_source") or ""),
                 )
                 stickers.update_classification(
                     sticker_id,
                     category=classification.category,
                     usage_hint=classification.usage_hint,
+                    tags=classification.tags,
                 )
             except Exception:
                 logger.warning(
@@ -1693,6 +2351,53 @@ def create_app(
         if sticker_summaries:
             sticker_text = "、".join(dict.fromkeys(sticker_summaries))
             text = f"[对方发了一个表情包：{sticker_text}] {text}".strip()
+        quality.mark_follow_up(target.conversation_id, text)
+        if group_profile is not None and event.group_id is not None:
+            blocked = [
+                keyword.strip()
+                for keyword in re.split(
+                    r"[,，]",
+                    group_profile.blocked_keywords,
+                )
+                if keyword.strip()
+            ]
+            if any(keyword in text for keyword in blocked):
+                group_behavior.record_ordinary_ignored(event.group_id)
+                return
+            directly_addressed_now = (
+                content.mentioned
+                or text.strip().startswith("/")
+                or config.bot_name in text
+            )
+            if (
+                not directly_addressed_now
+                and not _within_active_hours(
+                    group_profile.active_hours,
+                    config.timezone,
+                )
+            ):
+                group_behavior.record_ordinary_ignored(event.group_id)
+                return
+            if not directly_addressed_now:
+                fingerprint = hashlib.sha1(
+                    re.sub(r"\s+", "", text).encode("utf-8")
+                ).hexdigest()
+                recent = recent_group_message_hashes.setdefault(
+                    event.group_id,
+                    deque(maxlen=80),
+                )
+                now_value = time.monotonic()
+                while recent and now_value - recent[0][1] > 600:
+                    recent.popleft()
+                if any(
+                    previous == fingerprint
+                    for previous, _ in recent
+                ):
+                    group_behavior.record_ordinary_ignored(
+                        event.group_id
+                    )
+                    return
+                recent.append((fingerprint, now_value))
         observation_id: int | None = None
         if (
             config.shared_memory_enabled
@@ -1708,18 +2413,30 @@ def create_app(
                 speaker_name=display_name,
                 content=text,
             )
-        should_quote = (
-            (
-                group_profile.quote_replies
-                if group_profile is not None
-                else config.quote_replies
-            )
-            and (
+        quote_enabled = (
+            group_profile.quote_replies
+            if group_profile is not None
+            else config.quote_replies
+        )
+        quote_mode = (
+            group_profile.quote_mode
+            if group_profile is not None
+            else "smart"
+        )
+        quote_context = (
+            bool(content.reply_id)
+            if quote_mode == "reply_only"
+            else (
                 bool(content.reply_id)
                 or bool(image_sources)
                 or bool(file_sources)
                 or bool(audio_sources)
             )
+        )
+        should_quote = (
+            quote_enabled
+            and quote_mode != "never"
+            and quote_context
         )
         if should_quote:
             target = replace(target, message_id=event.message_id)
@@ -1826,6 +2543,19 @@ def create_app(
 
         poke_text = text.strip()
         if _is_poke_command_text(poke_text):
+            if (
+                group_profile is not None
+                and group_profile.poke_policy == "deny"
+            ):
+                await _safe_send(target, "这个群不允许使用戳一戳。")
+                return
+            if (
+                group_profile is not None
+                and group_profile.poke_policy == "admin"
+                and event.user_id != config.owner_qq
+            ):
+                await _safe_send(target, "这个群只有管理员可以戳人。")
+                return
             target_qq = event.user_id
             if content.mentioned_user_ids:
                 target_qq = content.mentioned_user_ids[0]
@@ -1932,6 +2662,7 @@ def create_app(
                     return
 
             history = store.history(conversation_id, config.history_messages)
+            last_activity = store.last_message_at(conversation_id)
             memory_context = ""
             if config.shared_memory_enabled:
                 memory_context = shared_memory.context_for(
@@ -1947,10 +2678,16 @@ def create_app(
                 namespaces=("memory", "episode"),
                 limit=4,
             )
+            document_namespaces = (
+                (f"group:{target.group_id}:document",)
+                if target.message_type == "group"
+                and target.group_id is not None
+                else ("document",)
+            )
             knowledge_matches = (
                 await _vector_context(
                     text,
-                    namespaces=("document",),
+                    namespaces=document_namespaces,
                     limit=config.knowledge_top_k,
                 )
                 if use_doc_lookup
@@ -2000,6 +2737,52 @@ def create_app(
                     "\n\n当前群聊专属规则（与系统规则冲突时以系统安全规则为准）：\n"
                     f"{group_profile.custom_prompt[:2000]}"
                 )
+            if (
+                group_profile is not None
+                and target.message_type == "group"
+                and target.group_id is not None
+            ):
+                member_preference = group_profiles.member_preference(
+                    target.group_id,
+                    event.user_id,
+                )
+                if member_preference:
+                    preference_text = (
+                        f"\n当前群成员称呼："
+                        f"{member_preference.get('nickname') or safe_display_name}。"
+                    )
+                    if member_preference.get("no_jokes"):
+                        preference_text += "对方明确不喜欢玩笑，不要调侃。"
+                    if member_preference.get("notes"):
+                        preference_text += (
+                            f"成员偏好：{member_preference['notes']}"
+                        )
+                    system_prompt += preference_text
+                group_context = group_profiles.knowledge_context(
+                    target.group_id,
+                    query=text,
+                )
+                if group_context:
+                    system_prompt += (
+                        "\n\n当前群专属资料（回答时优先使用，不能泄露给其他群）：\n"
+                        f"{group_context}"
+                    )
+            gap_note = _conversation_gap_note(
+                last_activity,
+                config.timezone,
+            )
+            if gap_note:
+                system_prompt += "\n\n" + gap_note
+            emotion_note = _emotion_style_hint(text)
+            if emotion_note:
+                system_prompt += "\n\n" + emotion_note
+            if (
+                target.message_type == "group"
+                and len(group_histories.get(target.group_id or 0, ())) >= 8
+            ):
+                system_prompt += (
+                    "\n本群最近消息较密集，回复更短，能不说就不多说。"
+                )
             if use_web_search:
                 system_prompt += (
                     "\n本次回答必须依据联网搜索结果。说明信息日期和来源，"
@@ -2012,6 +2795,19 @@ def create_app(
                     "也不要机械复述共享记忆。\n"
                     f"{memory_context}"
                 )
+                due_followups = shared_memory.due_followups(
+                    user_id=event.user_id,
+                    limit=6,
+                )
+                if due_followups:
+                    system_prompt += (
+                        "\n\n到期可自然追问的承诺或项目（只在合适时询问，"
+                        "不要像催办机器人）：\n"
+                        + "\n".join(
+                            f"- {item['content']}"
+                            for item in due_followups
+                        )
+                    )
             if semantic_matches:
                 semantic_lines = [
                     "语义相关的长期记忆：",
@@ -2031,7 +2827,14 @@ def create_app(
                     ),
                 ]
                 system_prompt += "\n" + "\n".join(knowledge_lines)
-            elif use_doc_lookup and vectors is not None and vectors.count("document") == 0:
+            elif (
+                use_doc_lookup
+                and vectors is not None
+                and not any(
+                    vectors.count(namespace)
+                    for namespace in document_namespaces
+                )
+            ):
                 await _safe_send(target, "知识库里还没有可检索的文件，请先发送文件。")
                 return
             messages = [
@@ -2042,18 +2845,23 @@ def create_app(
                 *history,
                 {"role": "user", "content": current_content},
             ]
+            response_model = (
+                config.vision_model
+                if loaded_images
+                else (
+                    config.llm_model
+                    if is_task_request or use_web_search
+                    else config.casual_model
+                )
+            )
             try:
-                reply = await llm.chat(
+                reply = await (
+                    client_for("vision")
+                    if loaded_images
+                    else client_for("chat")
+                ).chat(
                     messages,
-                    model=(
-                        config.vision_model
-                        if loaded_images
-                        else (
-                            config.llm_model
-                            if is_task_request or use_web_search
-                            else config.casual_model
-                        )
-                    ),
+                    model=response_model,
                     extra_payload=(
                         {
                             "enable_search": True,
@@ -2094,6 +2902,14 @@ def create_app(
                 except LLMError:
                     logger.warning("Casual reply rewrite failed; using original reply.")
             reply = format_qq_text(reply)
+            quality.record(
+                conversation_id=conversation_id,
+                user_id=event.user_id,
+                group_id=event.group_id,
+                user_text=text,
+                assistant_text=reply,
+                model=response_model,
+            )
             store.append_exchange(
                 conversation_id,
                 history_text,
@@ -2158,6 +2974,12 @@ def create_app(
                     return
 
             for document_index, document in enumerate(parsed_documents):
+                document_namespace = (
+                    f"group:{target.group_id}:document"
+                    if target.message_type == "group"
+                    and target.group_id is not None
+                    else "document"
+                )
                 sections = document.sections or [
                     DocumentSection("全文", document.text)
                 ]
@@ -2172,7 +2994,7 @@ def create_app(
                             location += f" 第 {part_index} 段"
                         chunks.append(
                             VectorChunk(
-                                namespace="document",
+                                namespace=document_namespace,
                                 source_id=(
                                     f"doc:{event.message_id or 'upload'}:"
                                     f"{document_index}"
@@ -2187,6 +3009,7 @@ def create_app(
                     metadata={
                         "conversation_id": target.conversation_id,
                         "file_name": document.name,
+                        "group_id": target.group_id,
                     },
                 )
 
@@ -2269,7 +3092,7 @@ def create_app(
                 },
             ]
             try:
-                reply = await llm.chat(
+                reply = await client_for("audio").chat(
                     messages,
                     model=config.audio_model,
                     extra_payload={
@@ -2299,8 +3122,38 @@ def create_app(
 
     async def _send_long_reply(target: ReplyTarget, reply: str) -> None:
         chunks = split_reply(reply, QQ_TRANSPORT_CHUNK_CHARS)
+        if (
+            config.natural_pacing_enabled
+            and config.natural_split_replies
+            and len(chunks) == 1
+            and len(reply) >= 90
+        ):
+            chunks = _split_casual_reply(reply, max_chunks=2)
         current_target = target
         for index, chunk in enumerate(chunks):
+            if config.natural_pacing_enabled:
+                profile = (
+                    group_profiles.get(target.group_id)
+                    if target.message_type == "group"
+                    and target.group_id is not None
+                    else None
+                )
+                minimum = (
+                    profile.reply_delay_min_ms
+                    if profile is not None
+                    else config.natural_reply_delay_min_ms
+                )
+                maximum = (
+                    profile.reply_delay_max_ms
+                    if profile is not None
+                    else config.natural_reply_delay_max_ms
+                )
+                if maximum < minimum:
+                    maximum = minimum
+                if maximum > 0:
+                    await asyncio.sleep(
+                        random.randint(minimum, maximum) / 1000
+                    )
             if not await _safe_send(current_target, chunk):
                 break
             if len(chunks) > 1:
@@ -2471,6 +3324,14 @@ def create_app(
             )
             memory_chunks: list[VectorChunk] = []
             for memory in candidates:
+                follow_up_at = (
+                    (
+                        datetime.now(timezone.utc)
+                        + timedelta(days=memory.follow_up_days)
+                    ).isoformat()
+                    if memory.follow_up_days
+                    else None
+                )
                 memory_id = shared_memory.add_memory(
                     subject_user_id=event.user_id,
                     subject_name=display_name,
@@ -2481,6 +3342,7 @@ def create_app(
                     fact_key=memory.fact_key,
                     confidence=memory.confidence,
                     source_episode_id=episode_id,
+                    follow_up_at=follow_up_at,
                 )
                 if memory_id is not None:
                     if vectors is not None:
@@ -2751,7 +3613,7 @@ def create_app(
             await _safe_send(target, "正在编写代码文件…")
             try:
                 artifact = await generate_code(
-                    llm,
+                    client_for("code"),
                     model=config.code_model,
                     fallback_model=config.code_fallback_model,
                     prompt=argument,
@@ -2783,7 +3645,16 @@ def create_app(
                 )
                 return True
             try:
-                audio_url = await tts.synthesize(argument)
+                selected_voice = _tts_voice_for_text(argument, config)
+                styled = getattr(tts, "synthesize_styled", None)
+                if callable(styled):
+                    audio_url = await styled(
+                        argument,
+                        voice=selected_voice,
+                        rate=config.tts_rate,
+                    )
+                else:
+                    audio_url = await tts.synthesize(argument)
                 await sender.send_record(target, audio_url)
             except (TTSError, OneBotError) as exc:
                 await _safe_send(target, f"语音发送失败：{exc}")
@@ -2837,12 +3708,20 @@ def create_app(
                     "表情包库里还没有可发送的表情。先让别人发几个表情包给我。",
                 )
                 return True
+            sticker_context = value
+            if target.group_id is not None:
+                member_pref = group_profiles.member_preference(
+                    target.group_id,
+                    event.user_id,
+                )
+                if member_pref and member_pref.get("no_jokes"):
+                    sticker_context += "；该成员明确不接受玩笑和嘲讽"
             sticker_id = await sticker_decider.choose(
                 history=store.history(
                     target.conversation_id,
                     config.history_messages,
                 ),
-                user_text=value,
+                user_text=sticker_context,
                 assistant_text="",
                 candidates=candidates,
                 explicit_request=True,
@@ -2868,12 +3747,20 @@ def create_app(
         candidates = stickers.list_recent(limit=50)
         if not candidates:
             return False
+        sticker_context = user_text
+        if target.group_id is not None:
+            member_pref = group_profiles.member_preference(
+                target.group_id,
+                target.user_id,
+            )
+            if member_pref and member_pref.get("no_jokes"):
+                sticker_context += "；该成员明确不接受玩笑和嘲讽"
         choice_id = await sticker_decider.choose(
             history=store.history(
                 target.conversation_id,
                 config.history_messages,
             ),
-            user_text=user_text,
+            user_text=sticker_context,
             assistant_text=assistant_text,
             candidates=candidates,
             explicit_request=explicit_request,
@@ -2999,6 +3886,7 @@ def create_app(
                 "搜索：/搜 最新问题，机器人会联网核实\n"
                 "网页：直接发链接，或使用 /网页 URL 总结正文\n"
                 "网页收藏：/收藏网页 URL，会写入知识库来源并参与后续检索\n"
+                "群知识：/群规则；/群公告；/群收藏 标题 | 重要内容；/加群资料 类型 | 标题 | 内容\n"
                 "互动：/戳；/戳 @群友；/戳 QQ号；也会回应别人对机器人的戳一戳\n"
                 "媒体：/发语音 文本；/发图 URL；/发文件 本机路径；/发表情；/表情库\n"
                 "生成：/生成图表 数据；/生成文档 要求；/生成文件 要求；/生成代码 需求\n"
@@ -3107,6 +3995,65 @@ def create_app(
             lines = ["我目前整理出的成长笔记："]
             lines.extend(f"- {item['content']}" for item in growth)
             return "\n".join(lines)
+        if command in {"/群规则", "/群公告", "/群资料"} and target.group_id:
+            kind = (
+                "rule"
+                if command == "/群规则"
+                else "announcement"
+                if command == "/群公告"
+                else None
+            )
+            items = group_profiles.knowledge(
+                target.group_id,
+                kind=kind,
+                limit=20,
+            )
+            if not items:
+                return "这个群还没有保存相关资料。"
+            lines = ["本群资料："]
+            lines.extend(
+                f"- [{item['kind']}] {item['title']}：{item['content']}"
+                for item in items
+            )
+            return "\n".join(lines)
+        if command == "/加群资料":
+            if not target.group_id:
+                return "这个命令只能在群聊中使用。"
+            if event.user_id != config.owner_qq:
+                return "添加群资料仅限机器人管理员使用。"
+            raw_value = text.partition(" ")[2].strip()
+            parts = [part.strip() for part in raw_value.split("|", 2)]
+            if len(parts) != 3 or not all(parts):
+                return "用法：/加群资料 类型 | 标题 | 内容"
+            if parts[0].lower() not in {
+                "faq",
+                "rule",
+                "announcement",
+                "file",
+                "note",
+            }:
+                return "类型只能是 faq、rule、announcement、file 或 note。"
+            knowledge_id = group_profiles.add_knowledge(
+                target.group_id,
+                kind=parts[0],
+                title=parts[1],
+                content=parts[2],
+            )
+            return f"已保存群资料 #{knowledge_id}。"
+        if command == "/群收藏":
+            if not target.group_id:
+                return "这个命令只能在群聊中使用。"
+            raw_value = text.partition(" ")[2].strip()
+            title, separator, content = raw_value.partition("|")
+            if not separator or not title.strip() or not content.strip():
+                return "用法：/群收藏 标题 | 重要内容"
+            knowledge_id = group_profiles.add_knowledge(
+                target.group_id,
+                kind="note",
+                title=title.strip(),
+                content=content.strip(),
+            )
+            return f"已收藏为群资料 #{knowledge_id}。"
         if command == "/表情库":
             recent = stickers.list_recent(limit=20)
             if not recent:
@@ -3238,6 +4185,17 @@ def _is_poke_event(event: OneBotEvent) -> bool:
     return notice_type == "poke" or sub_type == "poke"
 
 
+def _is_group_increase_event(event: OneBotEvent) -> bool:
+    if event.post_type != "notice":
+        return False
+    notice_type = event.notice_type.strip().lower()
+    sub_type = event.sub_type.strip().lower()
+    return (
+        notice_type in {"group_increase", "group_increase_notice"}
+        or sub_type in {"increase", "group_increase"}
+    )
+
+
 def _is_poke_command_text(text: str) -> bool:
     return text.strip().lower().startswith(
         ("/戳", "戳一戳", "戳一下", "戳我", "戳 ")
@@ -3287,6 +4245,105 @@ def _group_settings_snapshot(config: Settings) -> dict[str, Any]:
     }
 
 
+def _valid_active_hours(value: str) -> bool:
+    if not value.strip():
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:[01]?\d|2[0-3]):[0-5]\d-(?:[01]?\d|2[0-3]):[0-5]\d",
+            value.strip(),
+        )
+    )
+
+
+def _within_active_hours(value: str, timezone_name: str) -> bool:
+    value = value.strip()
+    if not value:
+        return True
+    match = re.fullmatch(
+        r"((?:[01]?\d|2[0-3]):[0-5]\d)-((?:[01]?\d|2[0-3]):[0-5]\d)",
+        value,
+    )
+    if not match:
+        return True
+    current = datetime.now(ZoneInfo(timezone_name)).strftime("%H:%M")
+    start, end = match.groups()
+    if start <= end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def _split_casual_reply(text: str, *, max_chunks: int = 2) -> list[str]:
+    value = text.strip()
+    if not value:
+        return []
+    boundaries = [
+        match.end()
+        for match in re.finditer(r"[。！？!?]\s*", value)
+    ]
+    if not boundaries:
+        return [value]
+    target = len(value) // max_chunks
+    split_at = min(boundaries, key=lambda position: abs(position - target))
+    if split_at <= 0 or split_at >= len(value):
+        return [value]
+    first, second = value[:split_at].strip(), value[split_at:].strip()
+    return [part for part in (first, second) if part]
+
+
+def _conversation_gap_note(
+    last_message_at: str | None,
+    timezone_name: str,
+) -> str:
+    if not last_message_at:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(last_message_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        elapsed = (
+            datetime.now(ZoneInfo(timezone_name)) - parsed
+        ).total_seconds()
+    except (ValueError, TypeError):
+        return ""
+    if elapsed >= 6 * 3600:
+        return (
+            "距离上次聊天已经很久。不要生硬复述旧话题，也不要假装一直在等；"
+            "先自然回应当前消息，必要时再轻轻提到之前的事。"
+        )
+    if elapsed >= 30 * 60:
+        return "距离上次聊天已有一段时间，回复时避免机械续接旧对话。"
+    return ""
+
+
+def _emotion_style_hint(text: str) -> str:
+    value = text.strip()
+    if any(
+        marker in value
+        for marker in ("难过", "崩溃", "烦死", "想哭", "失眠", "压力", "累")
+    ):
+        return "对方当前情绪偏低，先接住情绪，不要冷嘲，建议要短。"
+    if any(marker in value for marker in ("生气", "气死", "恶心", "离谱")):
+        return "对方情绪较强，可以先表达明确判断，但不要升级冲突。"
+    if any(marker in value for marker in ("哈哈", "开心", "太好了", "笑死")):
+        return "当前气氛轻松，可以自然接梗，但不必强行发表情。"
+    return ""
+
+
+def _tts_voice_for_text(text: str, config: Settings) -> str:
+    if any(
+        marker in text
+        for marker in ("难过", "低落", "遗憾", "告别", "失眠", "压力")
+    ):
+        return config.tts_voice_sad or config.tts_voice_calm
+    if any(
+        marker in text
+        for marker in ("开心", "太棒", "庆祝", "进球", "赢了", "哈哈")
+    ):
+        return config.tts_voice_lively or config.tts_voice_calm
+    return config.tts_voice_calm
+
+
 def _coerce_group_setting(key: str, value: Any) -> Any:
     spec = GROUP_SETTING_SPECS.get(key)
     if spec is None:
@@ -3316,6 +4373,14 @@ def _coerce_group_setting(key: str, value: Any) -> Any:
             raise ValueError("回复冷却时间必须是数字") from exc
         if not 0.0 <= parsed <= 3600.0:
             raise ValueError("回复冷却时间必须在 0 到 3600 秒之间")
+        return parsed
+    if kind == "delay":
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("打字延迟必须是整数毫秒") from exc
+        if not 0 <= parsed <= 10_000:
+            raise ValueError("打字延迟必须在 0 到 10000 毫秒之间")
         return parsed
     normalized = str(value or "").strip()
     if len(normalized) > 1000:
@@ -3367,6 +4432,16 @@ def _default_group_profile_values(config: Settings) -> dict[str, Any]:
         ),
         "auto_sticker_enabled": config.auto_sticker_enabled,
         "avoid_last_word": True,
+        "poke_policy": config.group_poke_policy,
+        "active_hours": config.group_active_hours,
+        "blocked_keywords": config.group_blocked_keywords,
+        "quote_mode": config.group_quote_mode,
+        "welcome_message": config.group_welcome_message,
+        "reply_delay_min_ms": config.natural_reply_delay_min_ms,
+        "reply_delay_max_ms": config.natural_reply_delay_max_ms,
+        "announcement_digest_hours": (
+            config.group_announcement_digest_hours
+        ),
         "custom_prompt": "",
     }
 
@@ -3418,15 +4493,60 @@ def _validate_group_profile_updates(
             if not 1 <= parsed <= 500:
                 raise ValueError("每小时回复上限必须在 1 到 500 之间")
             result[key] = parsed
+        elif key in {"reply_delay_min_ms", "reply_delay_max_ms"}:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("回复延迟必须是整数毫秒") from exc
+            if not 0 <= parsed <= 10_000:
+                raise ValueError("回复延迟必须在 0 到 10000 毫秒之间")
+            result[key] = parsed
+        elif key == "announcement_digest_hours":
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("群公告总结周期必须是整数小时") from exc
+            if not 0 <= parsed <= 720:
+                raise ValueError("群公告总结周期必须在 0 到 720 小时之间")
+            result[key] = parsed
+        elif key == "poke_policy":
+            normalized = str(value or "allow").strip().lower()
+            if normalized not in {"allow", "deny", "admin"}:
+                raise ValueError("戳一戳策略必须是 allow、deny 或 admin")
+            result[key] = normalized
+        elif key == "quote_mode":
+            normalized = str(value or "smart").strip().lower()
+            if normalized not in {"smart", "reply_only", "never"}:
+                raise ValueError(
+                    "引用策略必须是 smart、reply_only 或 never"
+                )
+            result[key] = normalized
         elif key == "participation_model":
             normalized = str(value or "").strip()
             if not normalized:
                 raise ValueError("群聊参与模型不能为空")
             result[key] = normalized[:200]
-        elif key in {"name", "trigger_prefixes", "custom_prompt"}:
+        elif key in {
+            "name",
+            "trigger_prefixes",
+            "active_hours",
+            "blocked_keywords",
+            "welcome_message",
+            "custom_prompt",
+        }:
             normalized = str(value or "").strip()
             limit = 2000 if key == "custom_prompt" else 500
             result[key] = normalized[:limit]
+            if key == "active_hours" and not _valid_active_hours(normalized):
+                raise ValueError("活跃时段格式应为 08:00-23:00")
+    min_delay = result.get("reply_delay_min_ms")
+    max_delay = result.get("reply_delay_max_ms")
+    if (
+        min_delay is not None
+        and max_delay is not None
+        and min_delay > max_delay
+    ):
+        raise ValueError("最小回复延迟不能大于最大回复延迟")
     return result
 
 

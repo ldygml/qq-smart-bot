@@ -3,6 +3,8 @@ const state = {
   people: [],
   selectedMemories: new Set(),
   groupProfiles: [],
+  groupKnowledge: [],
+  groupMembers: [],
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -98,6 +100,17 @@ async function loadOverview() {
   $("#overview-config").innerHTML = rows.map(([key, value]) =>
     `<div class="row"><span class="row-meta">${esc(key)}</span>${esc(value)}</div>`
   ).join("");
+  const alerts = [
+    ...(data.inactive_relationships || []).map((item) =>
+      `<div class="row"><span class="tag">长期未联系</span> ${esc(item.display_name)} · ${esc(item.days)} 天</div>`
+    ),
+    ...(data.relationship_events || []).slice(0, 10).map((item) =>
+      `<div class="row"><span class="tag">关系变化</span> ${esc(item.display_name || item.user_id)}：${esc(item.old_value)} → ${esc(item.new_value)}</div>`
+    ),
+  ];
+  $("#relationship-alerts").innerHTML = alerts.length
+    ? alerts.join("")
+    : `<div class="empty">暂无关系变化提醒。</div>`;
 }
 
 async function loadPeople() {
@@ -183,6 +196,25 @@ $("#save-profile").addEventListener("click", async () => {
   }
 });
 
+$("#person-summary").addEventListener("click", async () => {
+  if (!state.selectedUser) return;
+  const button = $("#person-summary");
+  const output = $("#person-summary-result");
+  button.disabled = true;
+  button.textContent = "整理中…";
+  try {
+    const data = await api(`/api/admin/people/${state.selectedUser}/summary`, {method:"POST"});
+    output.hidden = false;
+    output.textContent = data.summary;
+  } catch (error) {
+    output.hidden = false;
+    output.textContent = error.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = "生成近况摘要";
+  }
+});
+
 $("#purge-person-memory").addEventListener("click", async () => {
   if (!state.selectedUser) return;
   const name = $("#person-name").textContent;
@@ -232,6 +264,41 @@ $("#purge-all-memory").addEventListener("click", async () => {
   }
 });
 
+$("#purge-memory-range").addEventListener("click", async () => {
+  const startAt = $("#purge-range-start").value;
+  const endAt = $("#purge-range-end").value;
+  if (!startAt || !endAt) {
+    alert("请选择开始和结束时间。");
+    return;
+  }
+  if (!confirm("删除这个时间段内的记忆、对话片段和观察记录？此操作不可撤销。")) return;
+  try {
+    const data = await jsonRequest("/api/admin/memory/purge-range", "POST", {
+      start_at: startAt,
+      end_at: endAt,
+    });
+    alert(`已删除 ${data.deleted.memories.length} 条记忆、${data.deleted.episodes.length} 条对话片段。`);
+    await Promise.all([loadOverview(), loadPeople(), loadTimeline()]);
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+$("#import-memory-file").addEventListener("change", async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  try {
+    const data = JSON.parse(await file.text());
+    const result = await jsonRequest("/api/admin/memory/import", "POST", data);
+    alert(`记忆导入完成：${Object.entries(result.imported).map(([name, count]) => `${name} ${count}`).join("，")}`);
+    await Promise.all([loadOverview(), loadPeople(), loadTimeline()]);
+  } catch (error) {
+    alert(`导入失败：${error.message}`);
+  } finally {
+    event.target.value = "";
+  }
+});
+
 async function loadTimeline() {
   state.selectedMemories.clear();
   const userId = $("#timeline-person").value;
@@ -243,13 +310,32 @@ async function loadTimeline() {
         <div class="row-meta">${esc(item.display_name || item.subject_user_id)} · ${esc(item.fact_key || "未命名主题")} · ${dateText(item.created_at)}</div>
         <div><span class="old-value">${esc(item.old_content || "记录已删除")}</span></div>
         <div><span class="new-value">${esc(item.new_content || "记录已删除")}</span></div>
-        <small>${esc(item.reason)}；当前采用较新的说法。</small>
+        <small>${esc(item.reason)}；审核状态：${esc(item.review_status || "pending")}</small>
+        ${item.review_status === "pending" ? `<div class="item-actions">
+          <button data-resolve-conflict="${item.id}" data-decision="keep_new">保留新说法</button>
+          <button data-resolve-conflict="${item.id}" data-decision="revert_old">恢复旧说法</button>
+          <button data-resolve-conflict="${item.id}" data-decision="dismiss">忽略提醒</button>
+        </div>` : ""}
       </div>`).join("")}`
     : `<div class="muted">没有检测到记忆冲突。</div>`;
   $("#memory-timeline").innerHTML = data.memories.length
     ? data.memories.map((item) => memoryCard(item)).join("")
     : `<div class="empty">还没有长期记忆。机器人会在后续对话和反思中自动提取。</div>`;
   bindMemoryCards();
+  bindConflictActions();
+}
+
+function bindConflictActions() {
+  document.querySelectorAll("[data-resolve-conflict]").forEach((button) => {
+    button.onclick = async () => {
+      try {
+        await jsonRequest(`/api/admin/conflicts/${button.dataset.resolveConflict}`, "PATCH", {
+          decision: button.dataset.decision,
+        });
+        await loadTimeline();
+      } catch (error) { alert(error.message); }
+    };
+  });
 }
 
 function memoryCard(item) {
@@ -271,6 +357,8 @@ function memoryCard(item) {
       </select>
     </div>
     ${item.source_text ? `<details class="source"><summary>查看来源</summary><p>${esc(item.source_text)}</p>${item.source_reply ? `<p class="muted">当时回复：${esc(item.source_reply)}</p>` : ""}</details>` : `<p class="muted">来源：${esc(item.source_conversation)}</p>`}
+    ${item.follow_up_at ? `<div class="row-meta">跟进时间 ${dateText(item.follow_up_at)} · 状态 ${esc(item.follow_up_status || "pending")}
+      ${item.follow_up_status === "pending" ? `<button data-complete-followup="${item.id}">标记已跟进</button>` : ""}</div>` : ""}
     <div class="row-meta">创建 ${dateText(item.created_at)} · 更新 ${dateText(item.updated_at)}${item.superseded_by ? ` · 被 #${esc(item.superseded_by)} 取代` : ""}</div>
     ${active ? `<div class="item-actions"><button data-save-memory="${item.id}" data-user="${item.subject_user_id}">保存修改</button><button class="danger" data-delete-memory="${item.id}" data-user="${item.subject_user_id}">删除</button></div>` : ""}
   </article>`;
@@ -304,6 +392,17 @@ function bindMemoryCards() {
       if (!confirm("删除这条记忆？")) return;
       try {
         await api(`/api/admin/people/${button.dataset.user}/memories/${button.dataset.deleteMemory}`, {method:"DELETE"});
+        await loadTimeline();
+      } catch (error) { alert(error.message); }
+    };
+  });
+  document.querySelectorAll("[data-complete-followup]").forEach((button) => {
+    button.onclick = async () => {
+      try {
+        await jsonRequest(`/api/admin/memories/${button.dataset.completeFollowup}/followup`, "PATCH", {
+          follow_up_at: null,
+          status: "done",
+        });
         await loadTimeline();
       } catch (error) { alert(error.message); }
     };
@@ -442,6 +541,7 @@ async function loadStickers() {
         <div class="sticker-preview">${item.image_source ? `<img src="${esc(item.image_source)}" alt="${esc(item.summary)}" loading="lazy">` : `<span>${esc(item.summary)}</span>`}</div>
         <strong>${esc(item.summary)}</strong>
         <div class="row-meta">emoji ${esc(item.emoji_id || "-")} · 使用 ${esc(item.use_count)} 次</div>
+        <div class="row-meta">${(item.tags || []).map((tag) => `#${esc(tag)}`).join(" ") || "暂无识别标签"}</div>
         <label>分类<input data-sticker-category="${item.id}" value="${esc(item.category || "未分类")}"></label>
         <label>适用场景<input data-sticker-hint="${item.id}" value="${esc(item.usage_hint || "")}" placeholder="例如：无语、震惊、庆祝"></label>
         <label class="check"><input type="checkbox" data-sticker-enabled="${item.id}" ${item.enabled ? "checked" : ""}> 启用自动选择</label>
@@ -517,14 +617,16 @@ async function loadKnowledge() {
 }
 
 async function loadOperations() {
-  const [usage, groups, settingsData, profileData] = await Promise.all([
+  const [usage, groups, settingsData, profileData, qualityData] = await Promise.all([
     api("/api/admin/usage"),
     api("/api/admin/group-behavior"),
     api("/api/admin/group-settings"),
     api("/api/admin/group-profiles"),
+    api("/api/admin/quality"),
   ]);
   renderGroupSettings(settingsData.settings);
   renderGroupProfiles(profileData.groups);
+  renderQuality(qualityData);
   const totals = usage.totals;
   $("#input-price").value = usage.pricing?.input || 0;
   $("#output-price").value = usage.pricing?.output || 0;
@@ -536,7 +638,7 @@ async function loadOperations() {
     [number(totals.output_tokens), "估算输出 Token"],
     [totals.pricing_configured ? `¥${number(totals.estimated_cost, 4)}` : "未配置单价", "估算费用"],
   ].map(([value, label]) => `<div class="card"><strong>${esc(value)}</strong><span>${esc(label)}</span></div>`).join("");
-  $("#usage-models").innerHTML = `<table><thead><tr><th>模型</th><th>调用</th><th>失败</th><th>平均延迟</th><th>输入 Token</th><th>输出 Token</th></tr></thead><tbody>${usage.by_model.length ? usage.by_model.map((item) => `<tr><td>${esc(item.model)}</td><td>${esc(item.calls)}</td><td>${esc(item.errors)}</td><td>${number(item.avg_ms)} ms</td><td>${number(item.input_tokens)}</td><td>${number(item.output_tokens)}</td></tr>`).join("") : `<tr><td colspan="6">暂无调用记录</td></tr>`}</tbody></table>`;
+  $("#usage-models").innerHTML = `<table><thead><tr><th>模型</th><th>调用</th><th>失败</th><th>成功率</th><th>平均延迟</th><th>输入 Token</th><th>输出 Token</th><th>估算费用</th></tr></thead><tbody>${usage.by_model.length ? usage.by_model.map((item) => `<tr><td>${esc(item.model)}</td><td>${esc(item.calls)}</td><td>${esc(item.errors)}</td><td>${number(Number(item.success_rate) * 100, 1)}%</td><td>${number(item.avg_ms)} ms</td><td>${number(item.input_tokens)}</td><td>${number(item.output_tokens)}</td><td>${usage.totals.pricing_configured ? `¥${number(item.estimated_cost, 4)}` : "未配置"}</td></tr>`).join("") : `<tr><td colspan="8">暂无调用记录</td></tr>`}</tbody></table>`;
   $("#usage-recent").innerHTML = usage.recent.length
     ? `<h3>最近调用</h3><div class="recent-grid">${usage.recent.slice(0, 20).map((item) => `<div class="usage-line ${item.success ? "" : "failed"}"><span>${esc(item.operation)}</span><b>${esc(item.model)}</b><span>${number(item.duration_ms)} ms</span><small>${esc(item.error || "成功")}</small></div>`).join("")}</div>`
     : "";
@@ -559,6 +661,75 @@ async function loadOperations() {
   });
 }
 
+function renderQuality(data) {
+  const stats = data.stats || {};
+  $("#quality-stats").innerHTML = [
+    [stats.total || 0, "已记录回复"],
+    [stats.reviewed || 0, "已评测"],
+    [stats.corrected || 0, "被纠正/追问"],
+    [stats.average_score == null ? "-" : Number(stats.average_score).toFixed(2), "平均分"],
+  ].map(([value, label]) =>
+    `<div class="card"><strong>${esc(value)}</strong><span>${esc(label)}</span></div>`
+  ).join("");
+  const items = (data.recent || []).slice(0, 30);
+  $("#quality-list").innerHTML = items.length
+    ? items.map((item) => `
+      <article class="source-row">
+        <div><span class="tag">${item.score == null ? item.status : Number(item.score).toFixed(2)}</span>
+          <strong>${esc(item.user_text)}</strong></div>
+        <div class="row-meta">${esc(item.assistant_text)}<br>
+          ${esc((item.issues || []).join("、") || item.review_notes || "尚无评测问题")}
+        </div>
+      </article>`).join("")
+    : `<div class="empty">还没有质量记录。</div>`;
+}
+
+$("#review-quality").addEventListener("click", async () => {
+  const button = $("#review-quality");
+  button.disabled = true;
+  button.textContent = "评测中…";
+  try {
+    const data = await api("/api/admin/quality/review", {method:"POST"});
+    renderQuality({stats:(await api("/api/admin/quality")).stats, recent:data.reviews});
+    alert(`已评测 ${data.reviewed} 条回复。`);
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "评测最近回复";
+  }
+});
+
+$("#run-replay").addEventListener("click", async () => {
+  const button = $("#run-replay");
+  const output = $("#replay-results");
+  let variants;
+  try {
+    variants = JSON.parse($("#replay-variants").value || "[]");
+  } catch {
+    alert("候选方案不是有效 JSON。");
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "生成中…";
+  try {
+    const data = await jsonRequest("/api/admin/quality/replay", "POST", {
+      user_message: $("#replay-message").value.trim(),
+      variants,
+    });
+    output.innerHTML = data.results.map((item) => `
+      <article class="source-row">
+        <div><strong>${esc(item.name)}</strong> <span class="tag">${esc(item.model)}</span></div>
+        <div>${esc(item.reply || item.error)}</div>
+      </article>`).join("");
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "运行对比";
+  }
+});
+
 function renderGroupProfiles(profiles) {
   state.groupProfiles = profiles;
   const select = $("#group-profile-select");
@@ -570,6 +741,7 @@ function renderGroupProfiles(profiles) {
     select.value = previous;
   }
   if (select.value) renderGroupProfile(Number(select.value));
+  if (select.value) loadGroupDetails(Number(select.value)).catch(() => {});
 }
 
 function renderGroupProfile(groupId) {
@@ -589,12 +761,58 @@ function renderGroupProfile(groupId) {
   $("#profile-hourly-limit").value = profile.hourly_reply_limit;
   $("#profile-model").value = profile.participation_model || "";
   $("#profile-prefixes").value = profile.trigger_prefixes || "";
+  $("#profile-poke-policy").value = profile.poke_policy || "allow";
+  $("#profile-quote-mode").value = profile.quote_mode || "smart";
+  $("#profile-active-hours").value = profile.active_hours || "";
+  $("#profile-blocked-keywords").value = profile.blocked_keywords || "";
+  $("#profile-delay-min").value = profile.reply_delay_min_ms ?? 200;
+  $("#profile-delay-max").value = profile.reply_delay_max_ms ?? 900;
+  $("#profile-digest-hours").value = profile.announcement_digest_hours ?? 24;
+  $("#profile-welcome-message").value = profile.welcome_message || "";
   $("#profile-custom-prompt").value = profile.custom_prompt || "";
   $("#group-profile-status").textContent = `已记录消息 ${profile.messages_seen || 0} 条，已回复 ${profile.replies_sent || 0} 次。`;
 }
 
-$("#group-profile-select").addEventListener("change", (event) => {
-  if (event.target.value) renderGroupProfile(Number(event.target.value));
+async function loadGroupDetails(groupId) {
+  const data = await api(`/api/admin/group-profiles/${groupId}/details`);
+  state.groupKnowledge = data.knowledge;
+  state.groupMembers = data.members;
+  renderGroupKnowledge();
+  renderGroupMembers();
+}
+
+function renderGroupKnowledge() {
+  $("#group-knowledge-list").innerHTML = state.groupKnowledge.length
+    ? state.groupKnowledge.map((item) => `
+      <article class="source-row">
+        <div><span class="tag">${esc(item.kind)}</span> <strong>${esc(item.title)}</strong></div>
+        <div class="row-meta">${esc(item.content)}</div>
+        <button class="danger" data-delete-group-knowledge="${item.id}">删除</button>
+      </article>`).join("")
+    : `<div class="muted">暂无群资料</div>`;
+  document.querySelectorAll("[data-delete-group-knowledge]").forEach((button) => {
+    button.onclick = async () => {
+      const groupId = Number($("#group-profile-select").value);
+      await api(`/api/admin/group-profiles/${groupId}/knowledge/${button.dataset.deleteGroupKnowledge}`, {method:"DELETE"});
+      await loadGroupDetails(groupId);
+    };
+  });
+}
+
+function renderGroupMembers() {
+  $("#group-member-list").innerHTML = state.groupMembers.length
+    ? state.groupMembers.map((item) => `
+      <div class="row"><strong>${esc(item.nickname || item.user_id)}</strong> · QQ ${esc(item.user_id)}
+      ${item.no_jokes ? `<span class="tag">不要开玩笑</span>` : ""}
+      <div class="row-meta">${esc(item.notes || "无额外偏好")}</div></div>`).join("")
+    : `<div class="muted">暂无成员偏好</div>`;
+}
+
+$("#group-profile-select").addEventListener("change", async (event) => {
+  if (!event.target.value) return;
+  const groupId = Number(event.target.value);
+  renderGroupProfile(groupId);
+  await loadGroupDetails(groupId);
 });
 
 $("#add-group-profile").addEventListener("click", async () => {
@@ -614,6 +832,7 @@ $("#add-group-profile").addEventListener("click", async () => {
     await loadOperations();
     $("#group-profile-select").value = String(groupId);
     renderGroupProfile(groupId);
+    await loadGroupDetails(groupId);
   } catch (error) { status.textContent = error.message; }
 });
 
@@ -640,11 +859,20 @@ $("#save-group-profile").addEventListener("click", async () => {
       hourly_reply_limit: Number($("#profile-hourly-limit").value),
       participation_model: $("#profile-model").value.trim(),
       trigger_prefixes: $("#profile-prefixes").value.trim(),
+      poke_policy: $("#profile-poke-policy").value,
+      quote_mode: $("#profile-quote-mode").value,
+      active_hours: $("#profile-active-hours").value.trim(),
+      blocked_keywords: $("#profile-blocked-keywords").value.trim(),
+      reply_delay_min_ms: Number($("#profile-delay-min").value),
+      reply_delay_max_ms: Number($("#profile-delay-max").value),
+      announcement_digest_hours: Number($("#profile-digest-hours").value),
+      welcome_message: $("#profile-welcome-message").value.trim(),
       custom_prompt: $("#profile-custom-prompt").value.trim(),
     });
     await loadOperations();
     $("#group-profile-select").value = String(groupId);
     renderGroupProfile(groupId);
+    await loadGroupDetails(groupId);
     status.textContent = "本群设置已保存并立即生效。";
   } catch (error) { status.textContent = error.message; }
 });
@@ -659,6 +887,45 @@ $("#reset-group-profile").addEventListener("click", async () => {
     await loadOperations();
     $("#group-profile-select").value = String(groupId);
     renderGroupProfile(groupId);
+    await loadGroupDetails(groupId);
+  } catch (error) {
+    $("#group-profile-status").textContent = error.message;
+  }
+});
+
+$("#add-group-knowledge").addEventListener("click", async () => {
+  const groupId = Number($("#group-profile-select").value);
+  if (!groupId) return;
+  try {
+    await jsonRequest(`/api/admin/group-profiles/${groupId}/knowledge`, "POST", {
+      kind: $("#group-knowledge-kind").value,
+      title: $("#group-knowledge-title").value.trim(),
+      content: $("#group-knowledge-content").value.trim(),
+    });
+    $("#group-knowledge-title").value = "";
+    $("#group-knowledge-content").value = "";
+    await loadGroupDetails(groupId);
+  } catch (error) {
+    $("#group-profile-status").textContent = error.message;
+  }
+});
+
+$("#save-group-member").addEventListener("click", async () => {
+  const groupId = Number($("#group-profile-select").value);
+  const memberId = Number($("#group-member-id").value);
+  if (!groupId || !memberId) return;
+  try {
+    await jsonRequest(`/api/admin/group-profiles/${groupId}/members`, "POST", {
+      user_id: memberId,
+      nickname: $("#group-member-name").value.trim(),
+      notes: $("#group-member-notes").value.trim(),
+      no_jokes: $("#group-member-no-jokes").checked,
+    });
+    $("#group-member-id").value = "";
+    $("#group-member-name").value = "";
+    $("#group-member-notes").value = "";
+    $("#group-member-no-jokes").checked = false;
+    await loadGroupDetails(groupId);
   } catch (error) {
     $("#group-profile-status").textContent = error.message;
   }
@@ -671,11 +938,15 @@ function renderGroupSettings(settings) {
   $("#group-learning").checked = Boolean(settings.group_behavior_learning);
   $("#quote-replies").checked = Boolean(settings.quote_replies);
   $("#group-quote-mention").checked = Boolean(settings.group_quote_counts_as_mention);
+  $("#natural-pacing").checked = Boolean(settings.natural_pacing_enabled);
+  $("#natural-split").checked = Boolean(settings.natural_split_replies);
   $("#group-confidence").value = settings.group_min_reply_confidence;
   $("#group-cooldown").value = settings.group_reply_cooldown_seconds;
   $("#group-model").value = settings.group_participation_model || "";
   $("#group-allowlist").value = settings.group_allowlist || "";
   $("#group-prefixes").value = settings.group_trigger_prefixes || "";
+  $("#natural-delay-min").value = settings.natural_reply_delay_min_ms ?? 200;
+  $("#natural-delay-max").value = settings.natural_reply_delay_max_ms ?? 900;
 }
 
 $("#save-group-settings").addEventListener("click", async () => {
@@ -692,6 +963,10 @@ $("#save-group-settings").addEventListener("click", async () => {
       group_behavior_learning: $("#group-learning").checked,
       quote_replies: $("#quote-replies").checked,
       group_quote_counts_as_mention: $("#group-quote-mention").checked,
+      natural_pacing_enabled: $("#natural-pacing").checked,
+      natural_split_replies: $("#natural-split").checked,
+      natural_reply_delay_min_ms: Number($("#natural-delay-min").value),
+      natural_reply_delay_max_ms: Number($("#natural-delay-max").value),
       group_min_reply_confidence: Number($("#group-confidence").value),
       group_reply_cooldown_seconds: Number($("#group-cooldown").value),
       group_participation_model: $("#group-model").value.trim(),

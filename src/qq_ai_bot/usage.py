@@ -147,6 +147,24 @@ class UsageStore:
             input_tokens / 1_000_000 * max(0.0, input_price_per_million)
             + output_tokens / 1_000_000 * max(0.0, output_price_per_million)
         )
+        model_rows: list[dict[str, Any]] = []
+        for row in by_model:
+            item = dict(row)
+            calls = int(item.get("calls") or 0)
+            errors = int(item.get("errors") or 0)
+            item["success_rate"] = (
+                (calls - errors) / calls if calls else 0.0
+            )
+            item["estimated_cost"] = round(
+                int(item.get("input_tokens") or 0)
+                / 1_000_000
+                * max(0.0, input_price_per_million)
+                + int(item.get("output_tokens") or 0)
+                / 1_000_000
+                * max(0.0, output_price_per_million),
+                6,
+            )
+            model_rows.append(item)
         return {
             "totals": {
                 **data,
@@ -155,7 +173,7 @@ class UsageStore:
                     input_price_per_million or output_price_per_million
                 ),
             },
-            "by_model": [dict(row) for row in by_model],
+            "by_model": model_rows,
             "by_operation": [dict(row) for row in by_operation],
             "recent": [dict(row) for row in recent],
         }
@@ -178,12 +196,14 @@ class MeteredChatClient:
         input_chars = len(
             json.dumps(list(messages), ensure_ascii=False, default=str)
         )
+        payload = dict(extra_payload or {})
+        payload.pop("_allow_model_override", None)
         started = time.perf_counter()
         try:
             reply = await self.client.chat(
                 messages,
                 model=model,
-                extra_payload=extra_payload,
+                extra_payload=payload or None,
             )
         except Exception as exc:
             self.usage.record(

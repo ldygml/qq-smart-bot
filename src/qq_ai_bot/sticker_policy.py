@@ -12,6 +12,7 @@ from .llm import ChatClient
 class StickerClassification:
     category: str
     usage_hint: str
+    tags: tuple[str, ...] = ()
 
 
 class LLMStickerOrganizer:
@@ -20,26 +21,40 @@ class LLMStickerOrganizer:
         chat_client: ChatClient,
         *,
         model: str,
+        vision_model: str | None = None,
     ) -> None:
         self.chat_client = chat_client
         self.model = model
+        self.vision_model = vision_model or model
 
     async def classify(
         self,
         *,
         summary: str,
         recent_context: str = "",
+        image_url: str = "",
     ) -> StickerClassification:
         prompt = (
             "整理一个 QQ 表情包。根据名称和最近语境判断它的情绪与适用场景。"
-            '只返回 JSON：{"category":"分类","usage_hint":"何时适合使用"}。'
+            '只返回 JSON：{"category":"分类","usage_hint":"何时适合使用",'
+            '"tags":["识别到的文字、梗或情绪标签"]}。'
             "分类优先从：开心、无语、震惊、生气、委屈、嘲讽、赞同、"
             "疑惑、安慰、加油、日常 中选择，也可以使用更准确的中文短分类。"
             "usage_hint 要具体，例如“对方说了离谱的事情时使用”。"
             "不要在语境冲突时强行使用表情。\n\n"
             f"表情名称：{summary or '动画表情'}\n"
+            f"表情图片：{'已提供，请直接识别画面和文字' if image_url else '无'}\n"
             f"最近聊天：{recent_context[:1200] or '无'}"
         )
+        user_content: Any = prompt
+        if image_url.startswith(("http://", "https://", "data:image/")):
+            user_content = [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                },
+            ]
         try:
             reply = await self.chat_client.chat(
                 [
@@ -47,9 +62,9 @@ class LLMStickerOrganizer:
                         "role": "system",
                         "content": "严格输出 JSON，不要 Markdown，不要解释。",
                     },
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": user_content},
                 ],
-                model=self.model,
+                model=self.vision_model if image_url else self.model,
                 extra_payload={
                     "reasoning_effort": "none",
                     "response_format": {"type": "json_object"},
@@ -58,8 +73,14 @@ class LLMStickerOrganizer:
             data = _parse_json(reply)
             category = str(data.get("category") or "").strip()[:80]
             usage_hint = str(data.get("usage_hint") or "").strip()[:300]
+            raw_tags = data.get("tags")
+            tags = tuple(
+                str(item).strip()[:40]
+                for item in raw_tags[:12]
+                if str(item).strip()
+            ) if isinstance(raw_tags, list) else ()
             if category and usage_hint:
-                return StickerClassification(category, usage_hint)
+                return StickerClassification(category, usage_hint, tags)
         except Exception:
             pass
         return infer_sticker_classification(summary)

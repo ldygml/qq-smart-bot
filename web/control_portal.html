@@ -55,11 +55,15 @@
         <label class="check-row"><input id="settings-learning" type="checkbox"> 学习群内沉默倾向</label>
         <label class="check-row"><input id="settings-quote" type="checkbox"> 按语境引用</label>
         <label class="check-row"><input id="settings-quote-mention" type="checkbox"> 引用机器人视为 @</label>
+        <label class="check-row"><input id="settings-natural-pacing" type="checkbox"> 自然打字延迟与分段</label>
+        <label class="check-row"><input id="settings-natural-split" type="checkbox"> 长回复随机分段</label>
       </div>
       <div class="settings-fields">
         <label>最低回复置信度<input id="settings-confidence" type="number" min="0" max="1" step="0.01"></label>
         <label>回复冷却（秒）<input id="settings-cooldown" type="number" min="0" max="3600"></label>
         <label>群聊参与模型<input id="settings-model"></label>
+        <label>最小打字延迟 ms<input id="settings-delay-min" type="number" min="0" max="10000"></label>
+        <label>最大打字延迟 ms<input id="settings-delay-max" type="number" min="0" max="10000"></label>
         <label>群白名单<input id="settings-allowlist" placeholder="留空表示全部群"></label>
         <label>触发前缀<input id="settings-prefixes" placeholder="/ai,/问"></label>
       </div>
@@ -92,14 +96,51 @@
         <label>每小时回复上限<input id="profile-hourly-limit" type="number" min="1" max="500"></label>
         <label>参与模型<input id="profile-model"></label>
         <label>触发前缀<input id="profile-prefixes"></label>
+        <label>戳一戳策略<select id="profile-poke-policy"><option value="allow">允许</option><option value="admin">仅管理员</option><option value="deny">禁止</option></select></label>
+        <label>引用策略<select id="profile-quote-mode"><option value="smart">按需引用</option><option value="reply_only">只引用回复</option><option value="never">从不引用</option></select></label>
+        <label>活跃时段<input id="profile-active-hours" placeholder="08:00-23:00；留空表示全天"></label>
+        <label>屏蔽关键词<input id="profile-blocked-keywords" placeholder="多个词用逗号分隔"></label>
+        <label>最小打字延迟 ms<input id="profile-delay-min" type="number" min="0" max="10000"></label>
+        <label>最大打字延迟 ms<input id="profile-delay-max" type="number" min="0" max="10000"></label>
+        <label>公告总结周期小时<input id="profile-digest-hours" type="number" min="0" max="720"></label>
+        <label>新成员欢迎语<textarea id="profile-welcome-message" rows="2"></textarea></label>
         <label>本群专属规则<textarea id="profile-custom-prompt" rows="4" placeholder="例如：只回答技术问题；少插话；不要接梗。"></textarea></label>
       </div>
+      <div class="settings-divider"></div>
+      <p class="eyebrow">GROUP KNOWLEDGE</p>
+      <div class="group-add-row">
+        <select id="group-knowledge-kind"><option value="faq">FAQ</option><option value="rule">规则</option><option value="announcement">公告</option><option value="note">资料</option></select>
+        <input id="group-knowledge-title" placeholder="标题">
+        <button id="add-group-knowledge">添加</button>
+      </div>
+      <textarea id="group-knowledge-content" rows="3" placeholder="只对这个群生效的内容"></textarea>
+      <div id="group-knowledge-list" class="source-list"></div>
+      <div class="settings-divider"></div>
+      <p class="eyebrow">MEMBER PREFERENCES</p>
+      <div class="group-add-row">
+        <input id="group-member-id" inputmode="numeric" placeholder="QQ 号">
+        <input id="group-member-name" placeholder="群昵称">
+      </div>
+      <input id="group-member-notes" placeholder="称呼、禁忌、偏好">
+      <label class="check-row"><input id="group-member-no-jokes" type="checkbox"> 不要开玩笑</label>
+      <button id="save-group-member">保存成员偏好</button>
+      <div id="group-member-list" class="source-list"></div>
       <div class="profile-actions">
         <button id="save-group-profile" class="primary">保存本群设置</button>
         <button id="reset-group-profile">恢复默认</button>
       </div>
       <p id="profile-error" class="error"></p>
       <p id="profile-result" class="muted"></p>
+    </section>
+
+    <section id="model-routes-panel" class="form-panel" hidden>
+      <div class="panel-head"><div><p class="eyebrow">MODEL ROUTING</p><h2>全能力模型路由</h2></div><button class="close" data-close="model-routes-panel">×</button></div>
+      <label>机器人实例<select id="routes-instance"></select></label>
+      <p class="muted">每个能力依次尝试主供应商和备用供应商。连续失败两次会熔断 30 秒。</p>
+      <div id="model-route-editor" class="route-editor"></div>
+      <button id="save-model-routes" class="primary">保存模型路由</button>
+      <p id="routes-error" class="error"></p>
+      <p id="routes-result" class="muted"></p>
     </section>
 
     <section id="provider-form" class="form-panel" hidden>

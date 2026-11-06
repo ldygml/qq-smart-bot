@@ -33,6 +33,10 @@
         <h2>运行配置</h2>
         <div id="overview-config"></div>
       </article>
+      <article class="panel">
+        <h2>关系变化提醒</h2>
+        <div id="relationship-alerts"></div>
+      </article>
     </section>
 
     <section id="people" class="tab">
@@ -51,6 +55,7 @@
               </div>
               <div class="toolbar">
                 <button id="save-profile" class="primary">保存画像</button>
+                <button id="person-summary">生成近况摘要</button>
                 <button id="purge-person-memory" class="danger">删除此人的全部记忆</button>
               </div>
             </div>
@@ -61,6 +66,7 @@
               <textarea id="relationship-note" rows="3" placeholder="陌生、朋友、熟人、工作关系……"></textarea>
             </label>
             <div id="person-sections"></div>
+            <div id="person-summary-result" class="generated-result" hidden></div>
           </div>
         </article>
       </div>
@@ -75,11 +81,18 @@
             <button id="merge-memories">合并所选</button>
             <button id="refresh-timeline">刷新</button>
             <button id="purge-all-memory" class="danger">删除全部人的全部记忆</button>
+            <a class="button-link" href="/api/admin/memory/export">导出记忆 JSON</a>
+            <label class="button-link">导入记忆<input id="import-memory-file" type="file" accept=".json" hidden></label>
           </div>
         </div>
         <p class="muted">旧说法被相同主题的新信息取代时会保留在时间线中并标记为“已取代”。选择两条记忆可以合并。</p>
         <div id="conflict-list" class="conflict-list"></div>
         <div id="memory-timeline" class="timeline-list"></div>
+        <div class="field-row settings-row">
+          <label>清理开始时间<input id="purge-range-start" type="datetime-local"></label>
+          <label>清理结束时间<input id="purge-range-end" type="datetime-local"></label>
+          <button id="purge-memory-range" class="danger">删除该时间段记忆</button>
+        </div>
       </article>
     </section>
 
@@ -132,11 +145,15 @@
           <label class="check"><input id="group-learning" type="checkbox"> 根据群氛围学习沉默倾向</label>
           <label class="check"><input id="quote-replies" type="checkbox"> 按语境引用消息</label>
           <label class="check"><input id="group-quote-mention" type="checkbox"> 引用机器人消息视为 @</label>
+          <label class="check"><input id="natural-pacing" type="checkbox"> 启用自然打字延迟与分段</label>
+          <label class="check"><input id="natural-split" type="checkbox"> 长回复随机分段</label>
         </div>
         <div class="field-row settings-row">
           <label>最低回复置信度<input id="group-confidence" type="number" min="0" max="1" step="0.01"></label>
           <label>回复冷却（秒）<input id="group-cooldown" type="number" min="0" max="3600" step="1"></label>
           <label>群聊参与模型<input id="group-model" placeholder="qwen3.8-flash"></label>
+          <label>最小打字延迟 ms<input id="natural-delay-min" type="number" min="0" max="10000"></label>
+          <label>最大打字延迟 ms<input id="natural-delay-max" type="number" min="0" max="10000"></label>
         </div>
         <div class="field-row settings-row">
           <label>群白名单<input id="group-allowlist" placeholder="留空表示允许所有群；多个群号用逗号分隔"></label>
@@ -175,6 +192,19 @@
         <div class="field-row settings-row">
           <label>本群触发前缀<input id="profile-prefixes" placeholder="/ai,/问"></label>
         </div>
+        <div class="field-row settings-row">
+          <label>戳一戳策略<select id="profile-poke-policy"><option value="allow">允许</option><option value="admin">仅管理员</option><option value="deny">禁止</option></select></label>
+          <label>引用策略<select id="profile-quote-mode"><option value="smart">按需引用</option><option value="reply_only">只引用回复</option><option value="never">从不引用</option></select></label>
+          <label>活跃时段<input id="profile-active-hours" placeholder="08:00-23:00；留空表示全天"></label>
+          <label>安静时段处理<input id="profile-quiet-note" value="非直接消息不回复" disabled></label>
+        </div>
+        <div class="field-row settings-row">
+          <label>屏蔽关键词<input id="profile-blocked-keywords" placeholder="多个词用逗号分隔"></label>
+          <label>最小打字延迟 ms<input id="profile-delay-min" type="number" min="0" max="10000"></label>
+          <label>最大打字延迟 ms<input id="profile-delay-max" type="number" min="0" max="10000"></label>
+          <label>公告总结周期小时<input id="profile-digest-hours" type="number" min="0" max="720"></label>
+        </div>
+        <label>新成员欢迎语<textarea id="profile-welcome-message" rows="2" placeholder="新成员入群时发送；留空不发送"></textarea></label>
         <label>本群专属发言规则
           <textarea id="profile-custom-prompt" rows="4" placeholder="例如：这个群只回答技术问题，少插话；不要接梗；每次最多两句……"></textarea>
         </label>
@@ -183,6 +213,47 @@
           <button id="reset-group-profile">恢复全局默认并清空行为学习</button>
         </div>
         <p id="group-profile-status" class="muted"></p>
+        <div class="section-box">
+          <h3>本群 FAQ / 规则 / 公告</h3>
+          <div class="field-row">
+            <select id="group-knowledge-kind"><option value="faq">FAQ</option><option value="rule">规则</option><option value="announcement">公告</option><option value="note">资料</option></select>
+            <input id="group-knowledge-title" placeholder="标题">
+          </div>
+          <textarea id="group-knowledge-content" rows="3" placeholder="只对这个群生效的内容"></textarea>
+          <button id="add-group-knowledge">添加群资料</button>
+          <div id="group-knowledge-list" class="source-list"></div>
+        </div>
+        <div class="section-box">
+          <h3>群成员偏好</h3>
+          <div class="field-row">
+            <input id="group-member-id" inputmode="numeric" placeholder="QQ 号">
+            <input id="group-member-name" placeholder="群昵称">
+            <label class="check"><input id="group-member-no-jokes" type="checkbox"> 不要开玩笑</label>
+            <input id="group-member-notes" placeholder="称呼、禁忌、偏好">
+            <button id="save-group-member">保存成员偏好</button>
+          </div>
+          <div id="group-member-list" class="source-list"></div>
+        </div>
+      </article>
+      <article class="panel">
+        <div class="detail-head">
+          <div><p class="eyebrow">CONVERSATION QUALITY</p><h2>回复质量评测</h2></div>
+          <button id="review-quality">评测最近回复</button>
+        </div>
+        <div id="quality-stats" class="cards compact"></div>
+        <div id="quality-list" class="source-list"></div>
+        <div class="section-box">
+          <h3>人格 / 模型回放</h3>
+          <label>回放消息<textarea id="replay-message" rows="3" placeholder="输入一句用户消息"></textarea></label>
+          <label>候选方案 JSON
+            <textarea id="replay-variants" rows="5">[
+  {"name":"当前人格","model":"qwen3.8-flash","system_prompt":""},
+  {"name":"更直接版本","model":"qwen3.8-flash","system_prompt":"回答更直接，最多两句话。"}
+]</textarea>
+          </label>
+          <button id="run-replay">运行对比</button>
+          <div id="replay-results" class="source-list"></div>
+        </div>
       </article>
       <article class="panel">
         <h2>模型费用与延迟</h2>

@@ -63,6 +63,14 @@ class SharedMemoryStore:
                     relationship_note TEXT NOT NULL DEFAULT '',
                     profile_updated_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS shared_profile_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    field_name TEXT NOT NULL,
+                    old_value TEXT NOT NULL DEFAULT '',
+                    new_value TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS shared_memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +129,7 @@ class SharedMemoryStore:
                     new_memory_id INTEGER NOT NULL,
                     reason TEXT NOT NULL,
                     resolution TEXT NOT NULL DEFAULT 'newer_wins',
+                    review_status TEXT NOT NULL DEFAULT 'pending',
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_memory_conflicts_subject
@@ -202,6 +211,8 @@ class SharedMemoryStore:
                 ("status", "TEXT NOT NULL DEFAULT 'active'"),
                 ("superseded_by", "INTEGER"),
                 ("superseded_at", "TEXT"),
+                ("follow_up_at", "TEXT"),
+                ("follow_up_status", "TEXT NOT NULL DEFAULT 'none'"),
             ):
                 if column not in memory_columns:
                     connection.execute(
@@ -257,6 +268,18 @@ class SharedMemoryStore:
                 """
             )
 
+            conflict_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(memory_conflicts)"
+                ).fetchall()
+            }
+            if "review_status" not in conflict_columns:
+                connection.execute(
+                    "ALTER TABLE memory_conflicts "
+                    "ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'"
+                )
+
             episode_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -298,6 +321,7 @@ class SharedMemoryStore:
         confidence: float = 0.7,
         source_episode_id: int | None = None,
         source_observation_id: int | None = None,
+        follow_up_at: str | None = None,
     ) -> int | None:
         fact = content.strip()
         if not fact:
@@ -360,9 +384,10 @@ class SharedMemoryStore:
                         subject_user_id, subject_name, content, visibility,
                         source_conversation, created_at, updated_at,
                         category, fact_key, confidence, source_episode_id,
-                        source_observation_id, status
+                        source_observation_id, follow_up_at,
+                        follow_up_status, status
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
                 """,
                 (
                     subject_user_id,
@@ -377,6 +402,8 @@ class SharedMemoryStore:
                     normalized_confidence,
                     source_episode_id,
                     source_observation_id,
+                    follow_up_at,
+                    "pending" if follow_up_at else "none",
                 ),
             )
             memory_id = int(cursor.lastrowid)
@@ -494,6 +521,36 @@ class SharedMemoryStore:
         relationship_note: str,
     ) -> bool:
         with self._lock, self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT style_profile, relationship_note
+                FROM shared_people WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            if existing is None:
+                return False
+            now = _utc_now()
+            if (
+                str(existing["relationship_note"])
+                != relationship_note.strip()
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO shared_profile_events
+                        (
+                            user_id, field_name, old_value,
+                            new_value, created_at
+                        )
+                    VALUES (?, 'relationship_note', ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        str(existing["relationship_note"]),
+                        relationship_note.strip(),
+                        now,
+                    ),
+                )
             cursor = connection.execute(
                 """
                 UPDATE shared_people
@@ -504,11 +561,26 @@ class SharedMemoryStore:
                 (
                     style_profile.strip()[:1000],
                     relationship_note.strip()[:1000],
-                    _utc_now(),
+                    now,
                     user_id,
                 ),
             )
             return cursor.rowcount > 0
+
+    def relationship_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT e.id, e.user_id, e.field_name, e.old_value,
+                       e.new_value, e.created_at, p.display_name
+                FROM shared_profile_events e
+                LEFT JOIN shared_people p ON p.user_id = e.user_id
+                ORDER BY e.id DESC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def episodes_for_speaker(
         self,
@@ -844,7 +916,7 @@ class SharedMemoryStore:
                 f"""
                 SELECT c.id, c.subject_user_id, c.old_memory_id,
                        c.new_memory_id, c.reason, c.resolution,
-                       c.created_at, p.display_name,
+                       c.review_status, c.created_at, p.display_name,
                        old.content AS old_content,
                        new.content AS new_content,
                        old.fact_key AS fact_key
@@ -871,6 +943,139 @@ class SharedMemoryStore:
                 (memory_id,),
             ).fetchall()
         return [int(row["old_memory_id"]) for row in rows]
+
+    def resolve_conflict(
+        self,
+        conflict_id: int,
+        *,
+        decision: str,
+    ) -> bool:
+        if decision not in {"keep_new", "revert_old", "dismiss"}:
+            raise ValueError("Invalid conflict decision")
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT old_memory_id, new_memory_id
+                FROM memory_conflicts
+                WHERE id = ?
+                """,
+                (conflict_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            old_id = int(row["old_memory_id"])
+            new_id = int(row["new_memory_id"])
+            now = _utc_now()
+            if decision == "keep_new":
+                connection.execute(
+                    """
+                    UPDATE shared_memories
+                    SET status = 'active', superseded_by = NULL,
+                        superseded_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, new_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE shared_memories
+                    SET status = 'superseded', superseded_by = ?,
+                        superseded_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (new_id, now, now, old_id),
+                )
+                resolution = "newer_wins"
+                review_status = "confirmed"
+            elif decision == "revert_old":
+                connection.execute(
+                    """
+                    UPDATE shared_memories
+                    SET status = 'active', superseded_by = NULL,
+                        superseded_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, old_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE shared_memories
+                    SET status = 'superseded', superseded_by = ?,
+                        superseded_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (old_id, now, now, new_id),
+                )
+                resolution = "manual_old_wins"
+                review_status = "reverted"
+            else:
+                resolution = "dismissed"
+                review_status = "dismissed"
+            connection.execute(
+                """
+                UPDATE memory_conflicts
+                SET resolution = ?, review_status = ?
+                WHERE id = ?
+                """,
+                (resolution, review_status, conflict_id),
+            )
+            return True
+
+    def due_followups(
+        self,
+        *,
+        user_id: int | None = None,
+        before: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        before = before or _utc_now()
+        where = """
+            follow_up_status = 'pending'
+            AND follow_up_at IS NOT NULL
+            AND follow_up_at <= ?
+        """
+        parameters: list[Any] = [before]
+        if user_id is not None:
+            where += " AND subject_user_id = ?"
+            parameters.append(user_id)
+        parameters.append(max(1, limit))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, subject_user_id, subject_name, content,
+                       category, follow_up_at, source_conversation
+                FROM shared_memories
+                WHERE status = 'active' AND {where}
+                ORDER BY follow_up_at ASC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_followup(
+        self,
+        memory_id: int,
+        *,
+        follow_up_at: str | None,
+        status: str = "pending",
+    ) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE shared_memories
+                SET follow_up_at = ?, follow_up_status = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    follow_up_at,
+                    status if follow_up_at else "none",
+                    _utc_now(),
+                    memory_id,
+                ),
+            )
+            return cursor.rowcount > 0
 
     def update_memory(
         self,
@@ -1647,6 +1852,159 @@ class SharedMemoryStore:
             )
         return counts
 
+    def export_data(self) -> dict[str, Any]:
+        tables = (
+            "shared_people",
+            "shared_memories",
+            "shared_episodes",
+            "shared_observations",
+            "shared_reflections",
+            "shared_growth",
+            "memory_conflicts",
+            "memory_events",
+            "mind_state",
+        )
+        with self._lock, self._connect() as connection:
+            return {
+                table: [
+                    dict(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table}"
+                    ).fetchall()
+                ]
+                for table in tables
+            }
+
+    def import_data(self, data: dict[str, Any]) -> dict[str, int]:
+        imported: dict[str, int] = {}
+        allowed_tables = {
+            "shared_people",
+            "shared_memories",
+            "shared_episodes",
+            "shared_observations",
+            "shared_reflections",
+            "shared_growth",
+            "memory_conflicts",
+            "memory_events",
+            "mind_state",
+        }
+        with self._lock, self._connect() as connection:
+            for table, rows in data.items():
+                if table not in allowed_tables or not isinstance(rows, list):
+                    continue
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        f"PRAGMA table_info({table})"
+                    ).fetchall()
+                }
+                count = 0
+                for item in rows[:100_000]:
+                    if not isinstance(item, dict):
+                        continue
+                    values = {
+                        key: value
+                        for key, value in item.items()
+                        if key in columns
+                    }
+                    if not values:
+                        continue
+                    placeholders = ",".join("?" for _ in values)
+                    names = ",".join(values)
+                    try:
+                        cursor = connection.execute(
+                            f"INSERT OR IGNORE INTO {table} "
+                            f"({names}) VALUES ({placeholders})",
+                            list(values.values()),
+                        )
+                    except sqlite3.IntegrityError:
+                        continue
+                    count += max(0, cursor.rowcount)
+                imported[table] = count
+        return imported
+
+    def purge_between(
+        self,
+        *,
+        start_at: str,
+        end_at: str,
+    ) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            memory_rows = connection.execute(
+                """
+                SELECT id FROM shared_memories
+                WHERE created_at >= ? AND created_at < ?
+                """,
+                (start_at, end_at),
+            ).fetchall()
+            memory_ids = {int(row["id"]) for row in memory_rows}
+            episode_rows = connection.execute(
+                """
+                SELECT id FROM shared_episodes
+                WHERE created_at >= ? AND created_at < ?
+                """,
+                (start_at, end_at),
+            ).fetchall()
+            episode_ids = {int(row["id"]) for row in episode_rows}
+            observation_count = 0
+            if memory_ids:
+                placeholders = ",".join("?" for _ in memory_ids)
+                connection.execute(
+                    f"DELETE FROM shared_memories WHERE id IN ({placeholders})",
+                    list(memory_ids),
+                )
+            if episode_ids:
+                placeholders = ",".join("?" for _ in episode_ids)
+                connection.execute(
+                    f"DELETE FROM shared_episodes WHERE id IN ({placeholders})",
+                    list(episode_ids),
+                )
+            observation_count = connection.execute(
+                """
+                DELETE FROM shared_observations
+                WHERE created_at >= ? AND created_at < ?
+                """,
+                (start_at, end_at),
+            ).rowcount
+            if memory_ids:
+                placeholders = ",".join("?" for _ in memory_ids)
+                connection.execute(
+                    f"""
+                    DELETE FROM memory_conflicts
+                    WHERE old_memory_id IN ({placeholders})
+                       OR new_memory_id IN ({placeholders})
+                    """,
+                    [*memory_ids, *memory_ids],
+                )
+                connection.execute(
+                    f"DELETE FROM memory_events "
+                    f"WHERE memory_id IN ({placeholders})",
+                    list(memory_ids),
+                )
+                for table in ("shared_reflections", "shared_growth"):
+                    stale_ids: list[int] = []
+                    for row in connection.execute(
+                        f"SELECT id, source_memory_ids FROM {table}"
+                    ).fetchall():
+                        if memory_ids.intersection(
+                            _source_ids(row["source_memory_ids"])
+                        ):
+                            stale_ids.append(int(row["id"]))
+                    if stale_ids:
+                        id_placeholders = ",".join(
+                            "?" for _ in stale_ids
+                        )
+                        connection.execute(
+                            f"DELETE FROM {table} "
+                            f"WHERE id IN ({id_placeholders})",
+                            stale_ids,
+                        )
+        return {
+            "memories": sorted(memory_ids),
+            "episodes": sorted(episode_ids),
+            "observations": observation_count,
+        }
+
     def stats(self) -> dict[str, int]:
         with self._lock, self._connect() as connection:
             counts: dict[str, int] = {}
@@ -1714,6 +2072,7 @@ class MemoryCandidate:
     category: str = "general"
     fact_key: str = ""
     confidence: float = 0.7
+    follow_up_days: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1810,13 +2169,16 @@ async def extract_memory_candidates(
         "“周末安排”“对某人的关系”；同一主题以后发生变化时必须沿用相同 fact_key。"
         "偏好、长期计划、关系、重要事件可记为 shareable；"
         "健康、财务、秘密、私人冲突、敏感身份信息记为 private。"
+        "若事实包含明确承诺、约定或可检查的项目节点，可填写 follow_up_days"
+        "表示多少天后适合自然询问进展；没有明确时间就返回 null。"
         "不要仅凭“我是某明星/某球员”、玩笑、角色扮演、假设、反问、"
         "玩梗或临时称呼提取稳定身份；必须结合明确语境。"
         "承诺必须是明确答应或计划执行的事情，不能把客套话当成承诺。"
         "证据不足时返回空数组。\n"
         "只返回 JSON："
         '{"memories":[{"content":"事实","visibility":"shareable",'
-        '"category":"preference","fact_key":"主题","confidence":0.8}]}\n'
+        '"category":"preference","fact_key":"主题","confidence":0.8,'
+        '"follow_up_days":null}]}\n'
         f"发言人：{speaker_name}（QQ {speaker_id}）\n"
         f"发言：{user_message}"
     )
@@ -2030,6 +2392,7 @@ def _parse_memory_candidates(reply: str) -> list[MemoryCandidate]:
         category = "general"
         fact_key = ""
         confidence = 0.7
+        follow_up_days: int | None = None
         if isinstance(item, str):
             content = item
             visibility = "private"
@@ -2044,6 +2407,11 @@ def _parse_memory_candidates(reply: str) -> list[MemoryCandidate]:
                 confidence = float(item.get("confidence", 0.7))
             except (TypeError, ValueError):
                 confidence = 0.7
+            try:
+                parsed_days = int(item.get("follow_up_days"))
+                follow_up_days = parsed_days if 0 < parsed_days <= 3650 else None
+            except (TypeError, ValueError):
+                follow_up_days = None
         else:
             continue
         if not isinstance(content, str) or not content.strip():
@@ -2055,6 +2423,7 @@ def _parse_memory_candidates(reply: str) -> list[MemoryCandidate]:
                 category,
                 fact_key,
                 min(1.0, max(0.0, confidence)),
+                follow_up_days,
             )
         )
     return result

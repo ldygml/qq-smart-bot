@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -35,6 +36,7 @@ class StickerStore:
                     image_source TEXT NOT NULL DEFAULT '',
                     category TEXT NOT NULL DEFAULT '未分类',
                     usage_hint TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '[]',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     seen_at TEXT NOT NULL,
                     use_count INTEGER NOT NULL DEFAULT 0,
@@ -52,6 +54,7 @@ class StickerStore:
                 ("image_source", "TEXT NOT NULL DEFAULT ''"),
                 ("category", "TEXT NOT NULL DEFAULT '未分类'"),
                 ("usage_hint", "TEXT NOT NULL DEFAULT ''"),
+                ("tags", "TEXT NOT NULL DEFAULT '[]'"),
                 ("enabled", "INTEGER NOT NULL DEFAULT 1"),
             ):
                 if column not in columns:
@@ -198,7 +201,7 @@ class StickerStore:
                 f"""
                 SELECT id, summary, emoji_id, emoji_package_id,
                        sticker_key, image_source, category, usage_hint,
-                       enabled, seen_at, use_count
+                       tags, enabled, seen_at, use_count
                 FROM sticker_catalog
                 {where}
                 ORDER BY seen_at DESC
@@ -206,7 +209,13 @@ class StickerStore:
                 """,
                 (max(1, limit),),
             ).fetchall()
-        return [dict(row) for row in rows]
+        result = [dict(row) for row in rows]
+        for item in result:
+            try:
+                item["tags"] = json.loads(str(item.get("tags") or "[]"))
+            except json.JSONDecodeError:
+                item["tags"] = []
+        return result
 
     def get_by_id(self, sticker_id: int) -> StickerSource | None:
         with self._lock, self._connect() as connection:
@@ -239,13 +248,20 @@ class StickerStore:
                 """
                 SELECT id, summary, emoji_id, emoji_package_id,
                        sticker_key, image_source, category, usage_hint,
-                       enabled, seen_at, use_count
+                       tags, enabled, seen_at, use_count
                 FROM sticker_catalog
                 WHERE id = ?
                 """,
                 (sticker_id,),
             ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            item["tags"] = json.loads(str(item.get("tags") or "[]"))
+        except json.JSONDecodeError:
+            item["tags"] = []
+        return item
 
     def update(
         self,
@@ -312,17 +328,19 @@ class StickerStore:
         *,
         category: str,
         usage_hint: str,
+        tags: tuple[str, ...] = (),
     ) -> bool:
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE sticker_catalog
-                SET category = ?, usage_hint = ?
+                SET category = ?, usage_hint = ?, tags = ?
                 WHERE id = ?
                 """,
                 (
                     category.strip()[:80] or "未分类",
                     usage_hint.strip()[:300],
+                    json.dumps(list(tags[:12]), ensure_ascii=False),
                     sticker_id,
                 ),
             )

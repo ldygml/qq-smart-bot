@@ -133,6 +133,7 @@ input, select {
   cursor: pointer;
 }
 button.danger { color: var(--danger); border-color: #e1b9b3 !important; }
+.button-link { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 9px; padding: 8px 12px; background: #fff; color: var(--ink); cursor: pointer; font-size: 13px; }
 .source { margin-top: 10px; color: var(--muted); font-size: 13px; }
 .source p { margin: 8px 0 0; line-height: 1.6; }
 .conflict-list { display: grid; gap: 10px; margin-bottom: 18px; }

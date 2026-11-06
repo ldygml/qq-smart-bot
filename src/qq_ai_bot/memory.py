@@ -129,6 +129,20 @@ class ChatMemory:
             ).fetchone()
         return int(row["total"]) if row is not None else 0
 
+    def last_message_at(self, conversation_id: str) -> str | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT created_at
+                FROM messages
+                WHERE conversation_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+        return str(row["created_at"]) if row else None
+
     def stats(self) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
             row = connection.execute(

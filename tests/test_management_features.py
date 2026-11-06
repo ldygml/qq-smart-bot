@@ -567,6 +567,34 @@ def test_group_profiles_are_independent(tmp_path) -> None:
     assert custom is not None
     refreshed = store.ensure(100, defaults=defaults, name="QQ 原群名")
     assert refreshed.name == "我的技术群"
+    store.update(
+        100,
+        values={
+            "poke_policy": "admin",
+            "active_hours": "08:00-23:00",
+            "blocked_keywords": "广告,刷屏",
+            "quote_mode": "reply_only",
+            "reply_delay_min_ms": 300,
+            "reply_delay_max_ms": 1200,
+        },
+    )
+    knowledge_id = store.add_knowledge(
+        100,
+        kind="faq",
+        title="群内规则",
+        content="技术问题可以回答，禁止广告。",
+    )
+    store.save_member_preference(
+        100,
+        222,
+        nickname="小明",
+        notes="不喜欢被叫全名",
+        no_jokes=True,
+    )
+    assert store.knowledge_context(100, query="群规则广告") != ""
+    member = store.member_preference(100, 222)
+    assert member is not None and member["no_jokes"] is True
+    assert store.delete_knowledge(100, knowledge_id)
     assert len(store.list_all()) == 2
 
 

@@ -359,6 +359,15 @@ class ControlStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS instance_model_routes (
+                    instance_id INTEGER NOT NULL,
+                    capability TEXT NOT NULL,
+                    primary_provider_id INTEGER NOT NULL,
+                    primary_model TEXT NOT NULL,
+                    fallbacks_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (instance_id, capability)
+                );
                 """
             )
 
@@ -691,6 +700,97 @@ class ControlStore:
             )
             return cursor.rowcount > 0
 
+    def model_routes(
+        self,
+        instance_id: int,
+        user_id: int,
+    ) -> list[dict[str, Any]]:
+        if self.instance(instance_id, user_id) is None:
+            raise ValueError("Instance not found")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT capability, primary_provider_id,
+                       primary_model, fallbacks_json, updated_at
+                FROM instance_model_routes
+                WHERE instance_id = ?
+                ORDER BY capability ASC
+                """,
+                (instance_id,),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["fallbacks"] = json.loads(
+                    str(item.pop("fallbacks_json"))
+                )
+            except json.JSONDecodeError:
+                item["fallbacks"] = []
+            result.append(item)
+        return result
+
+    def save_model_routes(
+        self,
+        instance_id: int,
+        user_id: int,
+        routes: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if self.instance(instance_id, user_id) is None:
+            raise ValueError("Instance not found")
+        capabilities = {
+            "chat",
+            "code",
+            "vision",
+            "ocr",
+            "audio",
+            "tts",
+            "embedding",
+            "reflection",
+        }
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM instance_model_routes WHERE instance_id = ?",
+                (instance_id,),
+            )
+            for item in routes:
+                capability = str(item.get("capability") or "")
+                if capability not in capabilities:
+                    raise ValueError(f"Unsupported capability: {capability}")
+                provider_id = int(item["primary_provider_id"])
+                provider = connection.execute(
+                    """
+                    SELECT id FROM provider_profiles
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (provider_id, user_id),
+                ).fetchone()
+                if provider is None:
+                    raise ValueError("Route provider not found")
+                fallbacks = item.get("fallbacks")
+                if not isinstance(fallbacks, list):
+                    fallbacks = []
+                connection.execute(
+                    """
+                    INSERT INTO instance_model_routes
+                        (
+                            instance_id, capability, primary_provider_id,
+                            primary_model, fallbacks_json, updated_at
+                        )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        instance_id,
+                        capability,
+                        provider_id,
+                        str(item.get("primary_model") or "").strip(),
+                        json.dumps(fallbacks, ensure_ascii=False),
+                        now,
+                    ),
+                )
+        return self.model_routes(instance_id, user_id)
+
 
 class ProviderPayload(BaseModel):
     id: int | None = None
@@ -862,6 +962,64 @@ def _import_current_config(
     return _instance_public(row)
 
 
+def _route_target(
+    user_id: int,
+    provider_id: int,
+    model: str,
+    *,
+    voice: str = "",
+) -> dict[str, Any]:
+    provider = store.provider(provider_id, user_id)
+    if provider is None:
+        raise ValueError("路由引用的 API 供应商不存在")
+    return {
+        "base_url": str(provider["base_url"]),
+        "api_key": secrets_box.decrypt(
+            str(provider["api_key_encrypted"])
+        ),
+        "model": model or str(provider["model"]),
+        "timeout_seconds": 90,
+        "trust_env": False,
+        "voice": voice,
+    }
+
+
+def _build_model_routes_env(
+    instance_id: int,
+    user_id: int,
+) -> str:
+    routes = store.model_routes(instance_id, user_id)
+    if not routes:
+        return ""
+    payload: dict[str, list[dict[str, Any]]] = {}
+    for route in routes:
+        capability = str(route["capability"])
+        targets = [
+            _route_target(
+                user_id,
+                int(route["primary_provider_id"]),
+                str(route["primary_model"]),
+            )
+        ]
+        for fallback in route.get("fallbacks") or []:
+            if not isinstance(fallback, dict):
+                continue
+            try:
+                provider_id = int(fallback.get("provider_id"))
+            except (TypeError, ValueError):
+                continue
+            targets.append(
+                _route_target(
+                    user_id,
+                    provider_id,
+                    str(fallback.get("model") or ""),
+                    voice=str(fallback.get("voice") or ""),
+                )
+            )
+        payload[capability] = targets[:8]
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 def _start_instance(instance_id: int, user_id: int) -> dict[str, Any]:
     row = store.instance(instance_id, user_id)
     if not row:
@@ -889,6 +1047,9 @@ def _start_instance(instance_id: int, user_id: int) -> dict[str, Any]:
             "VECTOR_MEMORY_ENABLED": "true",
         }
     )
+    routes_env = _build_model_routes_env(instance_id, user_id)
+    if routes_env:
+        env["MODEL_ROUTES_JSON"] = routes_env
     log_dir = RUNTIME_ROOT / "instances"
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout = (log_dir / f"{instance_id}.stdout.log").open("ab")
@@ -1128,6 +1289,41 @@ async def import_current(request: Request) -> dict[str, Any]:
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "instance": instance}
+
+
+@app.get("/api/instances/{instance_id}/model-routes")
+async def get_model_routes(
+    instance_id: int,
+    request: Request,
+) -> dict[str, Any]:
+    user = _request_user(request)
+    try:
+        routes = store.model_routes(instance_id, int(user["id"]))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"routes": routes}
+
+
+@app.post("/api/instances/{instance_id}/model-routes")
+async def save_model_routes(
+    instance_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    routes = payload.get("routes")
+    if not isinstance(routes, list):
+        raise HTTPException(status_code=400, detail="routes must be a list")
+    try:
+        saved = store.save_model_routes(
+            instance_id,
+            int(user["id"]),
+            routes,
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "routes": saved}
 
 
 @app.post("/api/backup")
@@ -1386,6 +1582,81 @@ async def instance_update_group_profile(
         int(user["id"]),
         f"/api/admin/group-profiles/{group_id}",
         method="PATCH",
+        json_body=payload,
+    )
+
+
+@app.get(
+    "/api/instances/{instance_id}/group-profiles/{group_id}/details"
+)
+async def instance_group_profile_details(
+    instance_id: int,
+    group_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/group-profiles/{group_id}/details",
+    )
+
+
+@app.post(
+    "/api/instances/{instance_id}/group-profiles/{group_id}/knowledge"
+)
+async def instance_add_group_knowledge(
+    instance_id: int,
+    group_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/group-profiles/{group_id}/knowledge",
+        method="POST",
+        json_body=payload,
+    )
+
+
+@app.delete(
+    "/api/instances/{instance_id}/group-profiles/{group_id}/knowledge/{knowledge_id}"
+)
+async def instance_delete_group_knowledge(
+    instance_id: int,
+    group_id: int,
+    knowledge_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/group-profiles/{group_id}/knowledge/{knowledge_id}",
+        method="DELETE",
+    )
+
+
+@app.post(
+    "/api/instances/{instance_id}/group-profiles/{group_id}/members"
+)
+async def instance_save_group_member(
+    instance_id: int,
+    group_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/group-profiles/{group_id}/members",
+        method="POST",
         json_body=payload,
     )
 
