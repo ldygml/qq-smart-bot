@@ -56,6 +56,7 @@ from .group_policy import (
 )
 from .group_behavior import GroupBehaviorStore
 from .group_profiles import GroupPolicy, GroupProfileStore
+from .grounded_qa import GroundedAnswer, grounded_lookup
 from .images import ImageLoader, ImageLoaderProtocol, ImageLoadError
 from .llm import ChatClient, CompatibleChatClient, LLMError
 from .memory import ChatMemory
@@ -1611,10 +1612,38 @@ def create_app(
             config.web_search_enabled and _needs_web_search(text)
         )
         if use_web_search:
-            system_prompt += (
-                "\n本次回答必须依据联网搜索结果，说明信息日期和来源；"
-                "不能把旧知识伪装成实时消息，也不能伪造来源。"
+            started = time.perf_counter()
+            try:
+                grounded = await grounded_lookup(
+                    client_for("chat"),
+                    model=config.llm_model,
+                    question=text,
+                    trust_env=config.llm_trust_env,
+                )
+            except LLMError as exc:
+                return JSONResponse({"detail": str(exc)}, status_code=502)
+            reply = grounded.formatted() if grounded.verified else (
+                grounded.reason
+                or "没有找到两个可交叉验证的可信来源，暂不下结论。"
             )
+            return {
+                "ok": True,
+                "status": "replied" if grounded.verified else "unverified",
+                "reason": grounded.reason,
+                "reply": format_qq_text(reply),
+                "model": config.llm_model,
+                "strategy": strategy,
+                "memory_count": 0,
+                "topic_count": 0,
+                "sources": [
+                    {"title": item.title, "url": item.url}
+                    for item in grounded.sources
+                ],
+                "latency_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    2,
+                ),
+            }
         started = time.perf_counter()
         try:
             reply = await client_for("chat").chat(
@@ -3653,6 +3682,77 @@ def create_app(
 
         conversation_id = target.conversation_id
         lock = get_conversation_lock(conversation_id)
+        if use_web_search:
+            async with semaphore, lock:
+                try:
+                    grounded: GroundedAnswer = await grounded_lookup(
+                        client_for("chat"),
+                        model=config.llm_model,
+                        question=text,
+                        trust_env=config.llm_trust_env,
+                    )
+                except LLMError as exc:
+                    await _safe_send(target, str(exc))
+                    return
+                trace.model = config.llm_model
+                trace.stage(
+                    "grounding",
+                    verified=grounded.verified,
+                    sources=[
+                        {"title": item.title, "url": item.url}
+                        for item in grounded.sources
+                    ],
+                    reason=grounded.reason,
+                )
+                if not grounded.verified:
+                    reply = (
+                        grounded.reason
+                        or "没有找到两个可交叉验证的可信来源，暂不下结论。"
+                    )
+                else:
+                    reply = grounded.formatted()
+                quality_id = quality.record(
+                    conversation_id=conversation_id,
+                    user_id=event.user_id,
+                    group_id=event.group_id,
+                    user_text=text,
+                    assistant_text=reply,
+                    model=config.llm_model,
+                    fact_status=(
+                        "verified"
+                        if grounded.verified
+                        else "unverified"
+                    ),
+                    sources=[
+                        {
+                            "title": item.title,
+                            "url": item.url,
+                            "quote": item.quote,
+                        }
+                        for item in grounded.sources
+                    ],
+                )
+                store.append_exchange(
+                    conversation_id,
+                    text,
+                    reply,
+                    max_rows=config.max_history_rows_per_chat,
+                )
+            await _send_long_reply(target, format_qq_text(reply))
+            _queue_topic_update(
+                target=target,
+                user_id=event.user_id,
+                user_text=text,
+                assistant_text=reply,
+            )
+            _queue_strategy_comparison(
+                target=target,
+                quality_id=quality_id,
+                user_text=text,
+                baseline_reply=reply,
+                is_task=True,
+            )
+            return
         async with semaphore, lock:
             loaded_images: list[str] = []
             if image_sources:
@@ -3666,7 +3766,9 @@ def create_app(
                     await _safe_send(target, str(exc))
                     return
 
-            history = store.history(conversation_id, config.history_messages)
+            history = quality.filter_history(
+                store.history(conversation_id, config.history_messages)
+            )
             last_activity = store.last_message_at(conversation_id)
             memory_context = ""
             if config.shared_memory_enabled:
@@ -5677,8 +5779,8 @@ def _social_only_reply(text: str) -> str | None:
         for char in value
     ):
         if any(char in value for char in ("👍", "👌", "👏", "🙏", "✅")):
-            return "嗯。"
-        return "？"
+            return random.choice(("嗯。", "行。", "收到。", "好。"))
+        return random.choice(("？", "咋了。", "怎么了？", "嗯？"))
     if compact in {
         "ok",
         "okay",
@@ -5690,11 +5792,17 @@ def _social_only_reply(text: str) -> str | None:
         "收到",
         "可以",
     }:
-        return "嗯。"
+        return random.choice(("嗯。", "行。", "收到。", "好。"))
     if compact in {"在吗", "在不在"}:
-        return "在。"
+        return random.choice(("在。", "在呢。", "嗯，在。"))
     if compact in {"你在干嘛", "你干嘛呢", "在干嘛", "干嘛呢"}:
-        return "没干嘛。你呢？"
+        return random.choice(
+            (
+                "没干嘛。你呢？",
+                "没干嘛，歇会儿。",
+                "看手机呢，你呢？",
+            )
+        )
     return None
 
 
@@ -6192,7 +6300,9 @@ def _looks_like_task_request(text: str) -> bool:
     value = text.strip()
     if value.startswith("/"):
         return True
-    return any(hint in value for hint in TASK_HINTS) or bool(
+    return _is_simple_fact_lookup(value) or any(
+        hint in value for hint in TASK_HINTS
+    ) or bool(
         re.search(
             r"第\s*[一二三四五六七八九十百\d]+\s*题"
             r"|(?:做|写|完成).{0,4}作业"
@@ -6206,11 +6316,15 @@ def _looks_like_task_request(text: str) -> bool:
 
 def _is_simple_fact_lookup(text: str) -> bool:
     value = text.strip()
+    if re.search(r"^(?:你是谁|你是不是\s*ai|你是机器人吗)", value, re.I):
+        return False
     return bool(
         re.search(
             r"(?:谁唱的|是谁唱的|原唱是谁|谁作词|谁作曲|哪张专辑|什么时候发行)"
             r"|(?:这首歌|歌曲|歌名).{0,10}(?:谁|哪|什么|什么时候)"
-            r"|(?:作者|发明人|创始人|主演|导演)是谁",
+            r"|(?:作者|发明人|创始人|主演|导演|出品方|发行方)是谁"
+            r"|(?:是谁的|是哪一年|是什么时候|在哪一年|哪个国家|哪个平台)"
+            r"|(?:谁|哪).{0,8}(?:唱|写|导演|主演|发明|创立|成立|发行)",
             value,
         )
     )
@@ -6218,6 +6332,8 @@ def _is_simple_fact_lookup(text: str) -> bool:
 
 def _needs_web_search(text: str) -> bool:
     value = text.lower()
+    if _is_simple_fact_lookup(value):
+        return True
     direct_markers = (
         "联网搜索",
         "新闻",
