@@ -211,6 +211,13 @@ TASK_HINTS = (
     "习题",
     "解答",
     "算一下",
+    "谁唱的",
+    "是谁唱的",
+    "原唱是谁",
+    "谁作词",
+    "谁作曲",
+    "哪张专辑",
+    "什么时候发行",
 )
 GROUP_SETTING_SPECS = {
     "enable_group": ("enable_group", "bool"),
@@ -1520,6 +1527,11 @@ def create_app(
             f"\n\n当前时间：{datetime.now(ZoneInfo(config.timezone)):%Y-%m-%d %H:%M}。"
             f"\n当前聊天对象显示名：{display_name}。不要每句话都叫名字。"
         )
+        if _is_simple_fact_lookup(text):
+            system_prompt += (
+                "\n这是简单事实查询：先直接给一句答案，只保留必要信息，"
+                "不要主动列出翻唱版本或展开长篇背景。"
+            )
         social_tone = _social_tone_hint(text)
         if social_tone:
             system_prompt += "\n" + social_tone
@@ -1595,6 +1607,14 @@ def create_app(
             if _looks_like_task_request(text)
             else config.casual_model
         )
+        use_web_search = (
+            config.web_search_enabled and _needs_web_search(text)
+        )
+        if use_web_search:
+            system_prompt += (
+                "\n本次回答必须依据联网搜索结果，说明信息日期和来源；"
+                "不能把旧知识伪装成实时消息，也不能伪造来源。"
+            )
         started = time.perf_counter()
         try:
             reply = await client_for("chat").chat(
@@ -1604,6 +1624,17 @@ def create_app(
                     {"role": "user", "content": text},
                 ],
                 model=model,
+                extra_payload=(
+                    {
+                        "enable_search": True,
+                        "search_options": {
+                            "forced_search": True,
+                            "enable_source": True,
+                        },
+                    }
+                    if use_web_search
+                    else None
+                ),
             )
         except LLMError as exc:
             return JSONResponse({"detail": str(exc)}, status_code=502)
@@ -3690,6 +3721,12 @@ def create_app(
                 if is_task_request or loaded_images or use_web_search
                 else config.casual_system_prompt
             )
+            if _is_simple_fact_lookup(text):
+                system_prompt += (
+                    "\n这是简单事实查询：第一句直接给出答案，通常只保留歌手、"
+                    "作品或年份等必要信息。不要主动列翻唱版本、背景故事或长清单；"
+                    "只有用户继续追问时才展开。"
+                )
             current_time = datetime.now(ZoneInfo(config.timezone)).strftime(
                 "%Y-%m-%d %H:%M"
             )
@@ -6159,7 +6196,21 @@ def _looks_like_task_request(text: str) -> bool:
         re.search(
             r"第\s*[一二三四五六七八九十百\d]+\s*题"
             r"|(?:做|写|完成).{0,4}作业"
-            r"|作业.{0,8}(?:题|答案|不会|怎么|帮我)",
+            r"|作业.{0,8}(?:题|答案|不会|怎么|帮我)"
+            r"|(?:谁唱的|是谁唱的|原唱是谁|谁作词|谁作曲|哪张专辑)"
+            r"|(?:这首歌|歌曲|歌名).{0,8}(?:谁|哪|什么|什么时候)",
+            value,
+        )
+    )
+
+
+def _is_simple_fact_lookup(text: str) -> bool:
+    value = text.strip()
+    return bool(
+        re.search(
+            r"(?:谁唱的|是谁唱的|原唱是谁|谁作词|谁作曲|哪张专辑|什么时候发行)"
+            r"|(?:这首歌|歌曲|歌名).{0,10}(?:谁|哪|什么|什么时候)"
+            r"|(?:作者|发明人|创始人|主演|导演)是谁",
             value,
         )
     )
@@ -6188,6 +6239,13 @@ def _needs_web_search(text: str) -> bool:
         "发生了什么",
         "帮我查",
         "查一下",
+        "谁唱的",
+        "是谁唱的",
+        "原唱是谁",
+        "谁作词",
+        "谁作曲",
+        "哪张专辑",
+        "什么时候发行",
     )
     if any(marker in value for marker in direct_markers):
         return True

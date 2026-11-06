@@ -11,7 +11,9 @@ from pydantic import SecretStr
 from qq_ai_bot.app import (
     _admin_access_signature,
     _clean_model_reply,
+    _is_simple_fact_lookup,
     _looks_like_task_request,
+    _needs_web_search,
     _reply_variety_hint,
     _social_only_reply,
     _social_tone_hint,
@@ -293,6 +295,9 @@ def test_social_short_turns_and_task_detection() -> None:
     assert _social_only_reply("🤔") == "？"
     assert _social_only_reply("你在干嘛") == "没干嘛。你呢？"
     assert _looks_like_task_request("做一下第五题")
+    assert _looks_like_task_request("连名带姓这首歌是谁唱的")
+    assert _is_simple_fact_lookup("连名带姓这首歌是谁唱的")
+    assert _needs_web_search("连名带姓这首歌是谁唱的")
     assert not _looks_like_task_request("换个话题")
     assert _clean_model_reply("自然回应：\n那就先歇会儿。") == "那就先歇会儿。"
 
@@ -1818,6 +1823,48 @@ async def test_current_news_request_enables_web_search(tmp_path) -> None:
     assert llm.extra_payloads[0]["enable_search"] is True
     assert llm.extra_payloads[0]["search_options"]["forced_search"] is True
     assert "当前时间" in llm.calls[0][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_song_fact_question_uses_task_and_search(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            llm_model="task-model",
+            casual_model="casual-model",
+            web_search_enabled=True,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2401,
+                "message": "连名带姓这首歌是谁唱的",
+            },
+        )
+        await _wait_for_condition(lambda: bool(llm.calls))
+
+    assert llm.models == ["task-model"]
+    assert llm.extra_payloads[0]["enable_search"] is True
+    assert "联网搜索结果" in llm.calls[0][0]["content"]
+    assert "简单事实查询" in llm.calls[0][0]["content"]
 
 
 @pytest.mark.asyncio
