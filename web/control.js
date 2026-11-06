@@ -53,6 +53,17 @@ async function loadProviders() {
 async function loadInstances() {
   const data = await api("/api/instances");
   instances = data.instances;
+  const adminTarget = instances.find((item) => item.status === "online")
+    || instances[0];
+  const topAdminLink = document.querySelector("#top-admin-link");
+  if (adminTarget) {
+    topAdminLink.href = `/api/instances/${adminTarget.id}/open-admin`;
+    topAdminLink.textContent = `打开完整后台 · ${adminTarget.name}`;
+    topAdminLink.hidden = false;
+  } else {
+    topAdminLink.hidden = true;
+    topAdminLink.removeAttribute("href");
+  }
   document.querySelector("#instance-count").textContent = instances.length;
   document.querySelector("#online-count").textContent = instances.filter((item) => item.status === "online").length;
   document.querySelector("#instances").innerHTML = instances.length ? instances.map((item) => `
