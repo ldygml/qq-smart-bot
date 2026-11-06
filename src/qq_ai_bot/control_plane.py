@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -15,7 +16,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 import psutil
@@ -1554,6 +1555,41 @@ async def _instance_admin_json(
             detail=data.get("detail") if isinstance(data, dict) else data,
         )
     return data
+
+
+def _instance_admin_entry_url(instance_id: int, user_id: int) -> str:
+    instance = store.instance(instance_id, user_id)
+    if not instance:
+        raise HTTPException(status_code=404, detail="instance not found")
+    token = secrets_box.decrypt(
+        str(instance["onebot_token_encrypted"])
+    )
+    expires = str(int(time.time()) + 180)
+    nonce = secrets.token_hex(16)
+    signature = hmac.new(
+        token.encode("utf-8"),
+        f"admin:{expires}:{nonce}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    query = urlencode(
+        {
+            "expires": expires,
+            "nonce": nonce,
+            "signature": signature,
+        }
+    )
+    return f"http://127.0.0.1:{instance['port']}/admin?{query}"
+
+
+@app.get("/api/instances/{instance_id}/open-admin")
+async def open_instance_admin(
+    instance_id: int,
+    request: Request,
+) -> Response:
+    user = _request_user(request)
+    return RedirectResponse(
+        _instance_admin_entry_url(instance_id, int(user["id"]))
+    )
 
 
 @app.get("/api/instances/{instance_id}/people")

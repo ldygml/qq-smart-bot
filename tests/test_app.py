@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from qq_ai_bot.app import (
+    _admin_access_signature,
     _reply_variety_hint,
     _social_tone_hint,
     create_app,
@@ -304,8 +305,27 @@ async def test_admin_routes_require_owner_token_when_enabled(tmp_path) -> None:
             "/api/admin/overview",
             headers={"X-Bot-Admin-Token": "test-secret"},
         )
+        expires = str(int(datetime.now().timestamp()) + 60)
+        nonce = "test-nonce"
+        signature = _admin_access_signature(
+            "test-secret",
+            expires,
+            nonce,
+        )
+        ticket = await client.get(
+            "/admin",
+            params={
+                "expires": expires,
+                "nonce": nonce,
+                "signature": signature,
+            },
+            follow_redirects=False,
+        )
+        page = await client.get("/admin")
     assert denied.status_code == 401
     assert allowed.status_code == 200
+    assert ticket.status_code == 307
+    assert page.status_code == 200
 
 
 @pytest.mark.asyncio

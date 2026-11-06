@@ -73,6 +73,13 @@ async def test_control_plane_auth_provider_and_instance(tmp_path, monkeypatch) -
         assert instance.status_code == 200
         assert instance.json()["instance"]["name"] == "测试实例"
         instance_id = instance.json()["instance"]["id"]
+        admin_entry = await client.get(
+            f"/api/instances/{instance_id}/open-admin",
+            follow_redirects=False,
+        )
+        assert admin_entry.status_code == 307
+        assert "signature=" in admin_entry.headers["location"]
+        assert "secret-onebot-token" not in admin_entry.headers["location"]
 
         routes = await client.post(
             f"/api/instances/{instance_id}/model-routes",

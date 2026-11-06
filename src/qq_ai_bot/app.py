@@ -20,7 +20,12 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import Body, FastAPI, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+)
 from pydantic import ValidationError
 
 from .audio import AudioLoader, AudioLoaderProtocol, AudioLoadError
@@ -115,6 +120,45 @@ current_message_trace: ContextVar[MessageTrace | None] = ContextVar(
     "current_message_trace",
     default=None,
 )
+ADMIN_ACCESS_COOKIE = "bot_admin_access"
+
+
+def _admin_access_signature(
+    token: str,
+    expires: str,
+    nonce: str,
+) -> str:
+    return hmac.new(
+        token.encode("utf-8"),
+        f"admin:{expires}:{nonce}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _valid_admin_access_ticket(
+    token: str,
+    expires: str,
+    nonce: str,
+    signature: str,
+) -> bool:
+    if not token or not expires or not nonce or not signature:
+        return False
+    try:
+        if int(expires) < int(time.time()):
+            return False
+    except ValueError:
+        return False
+    return hmac.compare_digest(
+        signature,
+        _admin_access_signature(token, expires, nonce),
+    )
+
+
+def _valid_admin_access_cookie(value: str, token: str) -> bool:
+    parts = value.split(":", 2)
+    if len(parts) != 3:
+        return False
+    return _valid_admin_access_ticket(token, *parts)
 MAX_WEBHOOK_BYTES = 1_048_576
 QQ_TRANSPORT_CHUNK_CHARS = 1500
 AI_COMMAND_PROMPTS = {
@@ -468,10 +512,49 @@ def create_app(
         if protected and config.admin_require_auth:
             supplied = request.headers.get("X-Bot-Admin-Token", "")
             expected = config.effective_admin_token
-            if not supplied or not expected or not hmac.compare_digest(
-                supplied,
+            header_valid = bool(
+                supplied
+                and expected
+                and hmac.compare_digest(supplied, expected)
+            )
+            cookie_valid = _valid_admin_access_cookie(
+                request.cookies.get(ADMIN_ACCESS_COOKIE, ""),
                 expected,
+            )
+            if (
+                path == "/admin"
+                and request.method == "GET"
+                and _valid_admin_access_ticket(
+                    expected,
+                    request.query_params.get("expires", ""),
+                    request.query_params.get("nonce", ""),
+                    request.query_params.get("signature", ""),
+                )
             ):
+                expires = request.query_params["expires"]
+                nonce = request.query_params["nonce"]
+                signature = request.query_params["signature"]
+                response = RedirectResponse("/admin")
+                response.set_cookie(
+                    ADMIN_ACCESS_COOKIE,
+                    f"{expires}:{nonce}:{signature}",
+                    max_age=1800,
+                    httponly=True,
+                    samesite="strict",
+                    path="/",
+                )
+                return response
+            if not header_valid and not cookie_valid:
+                if path == "/admin":
+                    return HTMLResponse(
+                        (
+                            "<h1>请从登录控制台打开完整后台</h1>"
+                            "<p>访问 <a href=\"http://127.0.0.1:8090/\">"
+                            "http://127.0.0.1:8090/</a>，在实例卡片中点击"
+                            "“打开完整后台”。</p>"
+                        ),
+                        status_code=401,
+                    )
                 return JSONResponse(
                     {"detail": "owner console authentication required"},
                     status_code=401,
