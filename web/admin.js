@@ -548,7 +548,7 @@ function renderGroupProfiles(profiles) {
   const select = $("#group-profile-select");
   const previous = select.value;
   select.innerHTML = profiles.length
-    ? profiles.map((item) => `<option value="${item.group_id}">${esc(item.name || "未命名群聊")} · ${item.group_id}</option>`).join("")
+    ? profiles.map((item) => `<option value="${item.group_id}">${esc(item.name || `群 ${item.group_id}`)} · ${item.group_id}</option>`).join("")
     : `<option value="">暂无群聊记录</option>`;
   if (previous && profiles.some((item) => String(item.group_id) === previous)) {
     select.value = previous;

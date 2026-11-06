@@ -296,6 +296,7 @@ def create_app(
     seen_message_ids: OrderedDict[str, None] = OrderedDict()
     reflection_lock = asyncio.Lock()
     group_histories: dict[int, deque[GroupMessage]] = {}
+    group_name_cache: dict[int, str] = {}
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -838,19 +839,63 @@ def create_app(
             }
         )
 
-    def _ensure_known_group_profiles() -> None:
+    group_names_loaded = False
+    group_names_last_refresh = 0.0
+    group_names_lock = asyncio.Lock()
+
+    async def _load_group_names(*, force: bool = False) -> None:
+        nonlocal group_names_loaded, group_names_last_refresh
+        if group_names_loaded and not force:
+            return
+        if (
+            force
+            and group_names_loaded
+            and time.monotonic() - group_names_last_refresh < 60
+        ):
+            return
+        async with group_names_lock:
+            if group_names_loaded and not force:
+                return
+            getter = getattr(sender, "get_group_list", None)
+            if callable(getter):
+                try:
+                    groups = await getter()
+                    for item in groups:
+                        if not isinstance(item, dict):
+                            continue
+                        group_id = _optional_int(item.get("group_id"))
+                        group_name = str(
+                            item.get("group_name") or ""
+                        ).strip()
+                        if group_id is not None and group_name:
+                            group_name_cache[group_id] = group_name[:120]
+                except Exception:
+                    logger.warning(
+                        "Could not load QQ group names",
+                        exc_info=True,
+                    )
+            group_names_loaded = True
+            group_names_last_refresh = time.monotonic()
+
+    async def _ensure_known_group_profiles() -> None:
+        await _load_group_names(force=True)
         known_ids = set(shared_memory.known_group_ids())
         known_ids.update(
             int(item["group_id"])
             for item in group_behavior.list_policies()
         )
+        known_ids.update(group_name_cache)
         defaults = _default_group_profile_values(config)
         for group_id in sorted(known_ids):
-            group_profiles.ensure(group_id, defaults=defaults)
+            group_profiles.ensure(
+                group_id,
+                defaults=defaults,
+                name=group_name_cache.get(group_id, ""),
+            )
 
     @app.get("/api/admin/group-profiles")
     async def admin_group_profiles() -> dict[str, Any]:
-        _ensure_known_group_profiles()
+        await _ensure_known_group_profiles()
         return {
             "groups": group_profiles.list_all(),
             "defaults": _default_group_profile_values(config),
@@ -1385,6 +1430,18 @@ def create_app(
         elif event.message_type == "group":
             if not config.enable_group or event.group_id is None:
                 return
+            event_group_name = str(
+                getattr(event, "group_name", "")
+                or (getattr(event, "model_extra", None) or {}).get(
+                    "group_name",
+                    "",
+                )
+                or ""
+            ).strip()
+            if event_group_name:
+                group_name_cache[event.group_id] = event_group_name[:120]
+            elif event.group_id not in group_name_cache:
+                await _load_group_names()
             existing_profile = group_profiles.get(event.group_id)
             if (
                 config.group_ids
@@ -1396,6 +1453,7 @@ def create_app(
             group_profile = group_profiles.ensure(
                 event.group_id,
                 defaults=_default_group_profile_values(config),
+                name=group_name_cache.get(event.group_id, ""),
             )
             if not group_profile.enabled:
                 return

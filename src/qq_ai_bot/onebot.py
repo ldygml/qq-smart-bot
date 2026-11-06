@@ -323,6 +323,42 @@ class OneBotClient:
         except (TypeError, ValueError):
             return None
 
+    async def get_group_list(self) -> list[dict[str, Any]]:
+        response = await self._client.post(
+            "get_group_list",
+            json={},
+            timeout=15.0,
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                "OneBot get_group_list returned non-JSON data"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            raise OneBotError("OneBot get_group_list failed")
+        groups = data.get("data")
+        if not isinstance(groups, list):
+            raise OneBotError("OneBot get_group_list returned no list")
+        result: list[dict[str, Any]] = []
+        for item in groups:
+            if not isinstance(item, dict):
+                continue
+            group_id = item.get("group_id") or item.get("groupId")
+            group_name = item.get("group_name") or item.get("groupName")
+            try:
+                normalized_id = int(group_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized_id > 0:
+                result.append(
+                    {
+                        "group_id": normalized_id,
+                        "group_name": str(group_name or "").strip(),
+                    }
+                )
+        return result
+
     async def close(self) -> None:
         await self._client.aclose()
 

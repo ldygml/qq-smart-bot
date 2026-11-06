@@ -71,7 +71,7 @@
       <h2>单个群聊管理</h2>
       <div class="group-add-row">
         <input id="profile-new-group-id" inputmode="numeric" placeholder="QQ 群号">
-        <input id="profile-new-group-name" placeholder="群备注">
+        <input id="profile-new-group-name" placeholder="群名称（可选）">
         <button id="profile-add-group">新增</button>
       </div>
       <label>选择群聊<select id="settings-profile-select"></select></label>
@@ -86,7 +86,7 @@
         <label class="check-row"><input id="profile-avoid-last" type="checkbox"> 避免连续收尾</label>
       </div>
       <div class="settings-fields">
-        <label>群备注<input id="profile-name"></label>
+        <label>群名称（可编辑，留空后下次同步会恢复 QQ 原群名）<input id="profile-name"></label>
         <label>最低回复置信度<input id="profile-confidence" type="number" min="0" max="1" step="0.01"></label>
         <label>回复冷却（秒）<input id="profile-cooldown" type="number" min="0" max="3600"></label>
         <label>每小时回复上限<input id="profile-hourly-limit" type="number" min="1" max="500"></label>

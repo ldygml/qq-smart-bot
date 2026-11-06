@@ -181,6 +181,37 @@ async def test_group_reply_includes_quote_segment() -> None:
     assert captured["message"][1]["data"]["text"] == "收到"
 
 
+@pytest.mark.asyncio
+async def test_get_group_list_returns_group_names() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/get_group_list")
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "retcode": 0,
+                "data": [
+                    {"group_id": 100, "group_name": "技术群"},
+                    {"group_id": "200", "group_name": "测试群"},
+                ],
+            },
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        groups = await client.get_group_list()
+    finally:
+        await client.close()
+    assert groups == [
+        {"group_id": 100, "group_name": "技术群"},
+        {"group_id": 200, "group_name": "测试群"},
+    ]
+
+
 def test_at_another_user_is_not_bot_mention() -> None:
     _, mentioned = extract_message_text(
         [{"type": "at", "data": {"qq": "20002"}}],

@@ -100,7 +100,9 @@ class GroupProfileStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(group_id) DO UPDATE SET
                     name = CASE
-                        WHEN excluded.name != '' THEN excluded.name
+                        WHEN group_profiles.name = ''
+                             AND excluded.name != ''
+                        THEN excluded.name
                         ELSE group_profiles.name
                     END
                 """,

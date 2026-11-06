@@ -53,6 +53,7 @@ class FakeOneBotClient:
         self.records: list[tuple[ReplyTarget, str]] = []
         self.stickers: list[tuple[ReplyTarget, StickerSource]] = []
         self.files: list[tuple[ReplyTarget, str, str]] = []
+        self.groups: list[dict[str, object]] = []
 
     async def send_text(self, target: ReplyTarget, text: str) -> None:
         self.sent.append((target, text))
@@ -62,6 +63,9 @@ class FakeOneBotClient:
 
     async def get_msg_sender_id(self, message_id: int | str) -> int | None:
         return self.quoted_sender_id
+
+    async def get_group_list(self) -> list[dict[str, object]]:
+        return list(self.groups)
 
     async def send_image(self, target: ReplyTarget, image: str) -> None:
         self.images.append((target, image))
@@ -1337,6 +1341,49 @@ async def test_admin_memory_bulk_purge_endpoints(tmp_path) -> None:
     assert shared.stats()["memories"] == 0
     assert shared.stats()["episodes"] == 0
     assert chat_memory.stats()["stored_messages"] == 0
+
+
+@pytest.mark.asyncio
+async def test_group_profiles_use_original_names_and_keep_custom_names(
+    tmp_path,
+) -> None:
+    sender = FakeOneBotClient()
+    sender.groups = [
+        {"group_id": 93001, "group_name": "原始测试群"},
+    ]
+    app = create_app(
+        settings=make_settings(tmp_path, enable_group=True),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        initial = await client.get("/api/admin/group-profiles")
+        profile = next(
+            item
+            for item in initial.json()["groups"]
+            if item["group_id"] == 93001
+        )
+        assert profile["name"] == "原始测试群"
+
+        renamed = await client.patch(
+            "/api/admin/group-profiles/93001",
+            json={"name": "我的自定义群名"},
+        )
+        assert renamed.status_code == 200
+        refreshed = await client.get("/api/admin/group-profiles")
+        profile = next(
+            item
+            for item in refreshed.json()["groups"]
+            if item["group_id"] == 93001
+        )
+        assert profile["name"] == "我的自定义群名"
 
 
 @pytest.mark.asyncio

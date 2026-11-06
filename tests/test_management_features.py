@@ -505,6 +505,10 @@ def test_group_profiles_are_independent(tmp_path) -> None:
     assert updated.require_mention is True
     assert updated.reply_cooldown_seconds == 300
     assert store.get(200).require_mention is False
+    custom = store.update(100, values={"name": "我的技术群"})
+    assert custom is not None
+    refreshed = store.ensure(100, defaults=defaults, name="QQ 原群名")
+    assert refreshed.name == "我的技术群"
     assert len(store.list_all()) == 2
 
 
