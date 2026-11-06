@@ -22,6 +22,7 @@ from qq_ai_bot.app import (
 from qq_ai_bot.audio import LoadedAudio
 from qq_ai_bot.config import Settings
 from qq_ai_bot.files import DocumentSection, ParsedDocument
+from qq_ai_bot.grounded_qa import GroundedAnswer, GroundedSource
 from qq_ai_bot.memory import ChatMemory
 from qq_ai_bot.onebot import ReplyTarget, StickerSource
 from qq_ai_bot.productivity import ProductivityStore
@@ -291,9 +292,13 @@ def test_reply_variety_hint_detects_repeated_openings() -> None:
 
 
 def test_social_short_turns_and_task_detection() -> None:
-    assert _social_only_reply("👌") == "嗯。"
-    assert _social_only_reply("🤔") == "？"
-    assert _social_only_reply("你在干嘛") == "没干嘛。你呢？"
+    assert _social_only_reply("👌") in {"嗯。", "行。", "收到。", "好。"}
+    assert _social_only_reply("🤔") in {"？", "咋了。", "怎么了？", "嗯？"}
+    assert _social_only_reply("你在干嘛") in {
+        "没干嘛。你呢？",
+        "没干嘛，歇会儿。",
+        "看手机呢，你呢？",
+    }
     assert _looks_like_task_request("做一下第五题")
     assert _looks_like_task_request("连名带姓这首歌是谁唱的")
     assert _is_simple_fact_lookup("连名带姓这首歌是谁唱的")
@@ -1688,7 +1693,7 @@ async def test_emoji_only_private_message_does_not_call_language_model(
         )
         await _wait_for_condition(lambda: bool(sender.sent))
 
-    assert sender.sent[0][1] == "？"
+    assert sender.sent[0][1] in {"？", "咋了。", "怎么了？", "嗯？"}
     assert llm.calls == []
 
 
@@ -1789,7 +1794,33 @@ async def test_auto_sticker_respects_per_conversation_cooldown(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_current_news_request_enables_web_search(tmp_path) -> None:
+async def test_current_news_request_enables_web_search(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def fake_grounded_lookup(*args, **kwargs):
+        assert kwargs["model"] == "fake-model"
+        return GroundedAnswer(
+            answer="最近有一场足球比赛。",
+            sources=(
+                GroundedSource(
+                    "新华网",
+                    "https://www.xinhuanet.com/sports/test",
+                    "足球比赛",
+                ),
+                GroundedSource(
+                    "人民网",
+                    "https://sports.people.com.cn/test",
+                    "足球比赛",
+                ),
+            ),
+            verified=True,
+        )
+
+    monkeypatch.setattr(
+        "qq_ai_bot.app.grounded_lookup",
+        fake_grounded_lookup,
+    )
     llm = FakeChatClient()
     sender = FakeOneBotClient()
     app = create_app(
@@ -1820,14 +1851,38 @@ async def test_current_news_request_enables_web_search(tmp_path) -> None:
         )
         await _wait_for_condition(lambda: bool(sender.sent))
 
-    assert llm.extra_payloads[0]["enable_search"] is True
-    assert llm.extra_payloads[0]["search_options"]["forced_search"] is True
-    assert "当前时间" in llm.calls[0][0]["content"]
+    assert "足球比赛" in sender.sent[0][1]
+    assert "xinhuanet.com" in sender.sent[0][1]
+    assert llm.calls == []
 
 
 @pytest.mark.asyncio
-async def test_song_fact_question_uses_task_and_search(tmp_path) -> None:
-    llm = FakeChatClient()
+async def test_song_fact_question_uses_task_and_search(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def fake_grounded_lookup(*args, **kwargs):
+        return GroundedAnswer(
+            answer="《连名带姓》由张惠妹演唱。",
+            sources=(
+                GroundedSource(
+                    "百度百科",
+                    "https://baike.baidu.com/item/test",
+                    "张惠妹演唱",
+                ),
+                GroundedSource(
+                    "维基百科",
+                    "https://zh.wikipedia.org/wiki/test",
+                    "张惠妹",
+                ),
+            ),
+            verified=True,
+        )
+
+    monkeypatch.setattr(
+        "qq_ai_bot.app.grounded_lookup",
+        fake_grounded_lookup,
+    )
     sender = FakeOneBotClient()
     app = create_app(
         settings=make_settings(
@@ -1836,7 +1891,7 @@ async def test_song_fact_question_uses_task_and_search(tmp_path) -> None:
             casual_model="casual-model",
             web_search_enabled=True,
         ),
-        chat_client=llm,
+        chat_client=FakeChatClient(),
         onebot_client=sender,
         memory=ChatMemory(tmp_path / "memory.db"),
         image_loader=FakeImageLoader(),
@@ -1859,12 +1914,11 @@ async def test_song_fact_question_uses_task_and_search(tmp_path) -> None:
                 "message": "连名带姓这首歌是谁唱的",
             },
         )
-        await _wait_for_condition(lambda: bool(llm.calls))
+        await _wait_for_condition(lambda: bool(sender.sent))
 
-    assert llm.models == ["task-model"]
-    assert llm.extra_payloads[0]["enable_search"] is True
-    assert "联网搜索结果" in llm.calls[0][0]["content"]
-    assert "简单事实查询" in llm.calls[0][0]["content"]
+    assert "张惠妹" in sender.sent[0][1]
+    assert "baike.baidu.com" in sender.sent[0][1]
+    assert "zh.wikipedia.org" in sender.sent[0][1]
 
 
 @pytest.mark.asyncio
