@@ -380,6 +380,53 @@ class OneBotClient:
                 )
         return result
 
+    async def get_group_files(
+        self,
+        group_id: int,
+        *,
+        folder_id: str = "",
+    ) -> dict[str, list[dict[str, Any]]]:
+        if folder_id:
+            action = "get_group_files_by_folder"
+            payload = {
+                "group_id": group_id,
+                "folder_id": folder_id,
+            }
+        else:
+            action = "get_group_root_files"
+            payload = {"group_id": group_id}
+        response = await self._client.post(action, json=payload, timeout=30.0)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                "OneBot get_group_files returned non-JSON data"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            retcode = data.get("retcode")
+            raise OneBotError(
+                f"OneBot {action} failed "
+                f"(HTTP {response.status_code}, retcode={retcode})"
+            )
+        result = data.get("data")
+        if not isinstance(result, dict):
+            raise OneBotError("OneBot get_group_files returned no data")
+        raw_files = result.get("files") or []
+        raw_folders = result.get("folders") or []
+        if not isinstance(raw_files, list) or not isinstance(raw_folders, list):
+            raise OneBotError("OneBot get_group_files returned invalid data")
+        files = [
+            _normalize_group_file(item)
+            for item in raw_files
+            if isinstance(item, dict)
+        ]
+        folders = [
+            _normalize_group_folder(item)
+            for item in raw_folders
+            if isinstance(item, dict)
+        ]
+        return {"folders": folders, "files": files}
+
     async def get_group_member_name(
         self,
         group_id: int,
@@ -426,6 +473,50 @@ _UNSUPPORTED_SEGMENTS = {
     "reply": "",
     "at": "",
 }
+
+
+def _normalize_group_file(item: dict[str, Any]) -> dict[str, Any]:
+    size_value = item.get("file_size", item.get("size"))
+    try:
+        size = int(size_value) if size_value is not None else 0
+    except (TypeError, ValueError):
+        size = 0
+    uploader = item.get("uploader_name") or item.get("uploader") or ""
+    return {
+        "file_id": str(item.get("file_id") or item.get("id") or ""),
+        "name": str(
+            item.get("file_name")
+            or item.get("name")
+            or item.get("file")
+            or "文件"
+        )[:240],
+        "size": max(0, size),
+        "uploader": str(uploader)[:120],
+        "busid": item.get("busid"),
+        "upload_time": item.get("upload_time"),
+        "modify_time": item.get("modify_time"),
+        "download_times": item.get("download_times", 0),
+    }
+
+
+def _normalize_group_folder(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "folder_id": str(
+            item.get("folder_id")
+            or item.get("folderId")
+            or item.get("id")
+            or ""
+        ),
+        "name": str(
+            item.get("folder_name")
+            or item.get("folderName")
+            or item.get("name")
+            or "文件夹"
+        )[:240],
+        "file_count": item.get("file_count", item.get("total_file_count", 0)),
+        "create_time": item.get("create_time"),
+        "modify_time": item.get("modify_time"),
+    }
 
 
 def extract_message_text(

@@ -269,6 +269,59 @@ async def test_get_group_member_name_uses_card_or_nickname() -> None:
     assert name == "群名片"
 
 
+@pytest.mark.asyncio
+async def test_get_group_root_files_normalizes_napcat_response() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/get_group_root_files")
+        assert json.loads(request.content) == {"group_id": 100}
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "folders": [
+                        {
+                            "folder_id": "folder-1",
+                            "folder_name": "课程资料",
+                            "total_file_count": 2,
+                        }
+                    ],
+                    "files": [
+                        {
+                            "file_id": "file-1",
+                            "file_name": "讲义.pdf",
+                            "file_size": 2048,
+                            "uploader_name": "小明",
+                        }
+                    ],
+                },
+            },
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.get_group_files(100)
+    finally:
+        await client.close()
+    assert result["folders"][0]["folder_id"] == "folder-1"
+    assert result["folders"][0]["name"] == "课程资料"
+    assert result["files"][0] == {
+        "file_id": "file-1",
+        "name": "讲义.pdf",
+        "size": 2048,
+        "uploader": "小明",
+        "busid": None,
+        "upload_time": None,
+        "modify_time": None,
+        "download_times": 0,
+    }
+
+
 def test_at_another_user_is_not_bot_mention() -> None:
     content = extract_message_content(
         [{"type": "at", "data": {"qq": "20002"}}],

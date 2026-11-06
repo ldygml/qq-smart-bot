@@ -212,6 +212,10 @@ async def test_control_plane_proxies_group_settings(tmp_path, monkeypatch) -> No
             headers={"X-CSRF-Token": csrf},
             json={"require_mention": True},
         )
+        files_response = await client.get(
+            "/api/instances/9/group-profiles/100/files",
+            params={"folder_id": "folder-1"},
+        )
         reset_response = await client.post(
             "/api/instances/9/group-profiles/100/reset",
             headers={"X-CSRF-Token": csrf},
@@ -233,10 +237,77 @@ async def test_control_plane_proxies_group_settings(tmp_path, monkeypatch) -> No
     assert calls[1][2] == "/api/admin/group-profiles/100"
     assert calls[1][3] == "PATCH"
     assert calls[1][4] == {"require_mention": True}
+    assert files_response.status_code == 200
+    assert calls[2][2] == (
+        "/api/admin/group-profiles/100/files?folder_id=folder-1"
+    )
     assert reset_response.status_code == 200
-    assert calls[2][2] == "/api/admin/group-profiles/100/reset"
+    assert calls[3][2] == "/api/admin/group-profiles/100/reset"
     assert purge_person.status_code == 200
-    assert calls[3][2] == "/api/admin/people/123/all-memory"
-    assert calls[3][3] == "DELETE"
+    assert calls[4][2] == "/api/admin/people/123/all-memory"
+    assert calls[4][3] == "DELETE"
     assert purge_all.status_code == 200
-    assert calls[4][2] == "/api/admin/memory/all"
+    assert calls[5][2] == "/api/admin/memory/all"
+
+
+def test_stop_instance_handles_stored_pid_and_listening_port(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = ControlStore(tmp_path / "control.db")
+    user_id = store.create_user("owner", "secure-password")
+    provider_id = store.save_provider(
+        user_id=user_id,
+        provider_id=None,
+        name="provider",
+        provider_type="custom",
+        base_url="https://api.example.com/v1",
+        model="chat",
+        api_key_encrypted="encrypted",
+    )
+    instance_id = store.save_instance(
+        user_id=user_id,
+        instance_id=None,
+        name="instance",
+        port=18081,
+        onebot_api_base="http://127.0.0.1:13000",
+        onebot_token_encrypted="encrypted",
+        provider_id=provider_id,
+        database_path="data/test.db",
+    )
+    store.set_instance_pid(instance_id, 12345)
+    terminated: list[int] = []
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def children(self, recursive: bool) -> list[FakeProcess]:
+            assert recursive is True
+            return []
+
+        def terminate(self) -> None:
+            terminated.append(self.pid)
+
+    monkeypatch.setattr(control_plane, "store", store)
+    monkeypatch.setattr(control_plane, "processes", {})
+    monkeypatch.setattr(control_plane.psutil, "Process", FakeProcess)
+
+    assert control_plane._stop_instance(instance_id, user_id) is True
+    assert terminated == [12345]
+    assert store.instance(instance_id, user_id)["pid"] is None
+
+    second_id = store.save_instance(
+        user_id=user_id,
+        instance_id=None,
+        name="manual-instance",
+        port=18082,
+        onebot_api_base="http://127.0.0.1:13000",
+        onebot_token_encrypted="encrypted",
+        provider_id=provider_id,
+        database_path="data/test-2.db",
+    )
+    monkeypatch.setattr(control_plane, "_listening_pid", lambda port: 67890)
+
+    assert control_plane._stop_instance(second_id, user_id) is True
+    assert terminated == [12345, 67890]

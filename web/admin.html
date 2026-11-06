@@ -224,6 +224,15 @@
           <div id="group-knowledge-list" class="source-list"></div>
         </div>
         <div class="section-box">
+          <h3>QQ 群文件</h3>
+          <p class="muted">从 NapCat 读取当前群的文件列表。填写文件夹 ID 可以进入子目录；文件内容仍通过发送给机器人来建立知识库。</p>
+          <div class="field-row">
+            <input id="group-folder-id" placeholder="文件夹 ID（留空为根目录）">
+            <button id="load-group-files">读取群文件</button>
+          </div>
+          <div id="group-file-list" class="source-list"></div>
+        </div>
+        <div class="section-box">
           <h3>群成员偏好</h3>
           <div class="field-row">
             <input id="group-member-id" inputmode="numeric" placeholder="QQ 号">
@@ -285,6 +294,7 @@
             <option value="document">Word 文档</option>
             <option value="file">Markdown / CSV / TXT</option>
             <option value="code">代码文件 / ZIP 项目</option>
+            <option value="voice">语音文件（千问 TTS）</option>
           </select>
         </label>
         <label>内容要求

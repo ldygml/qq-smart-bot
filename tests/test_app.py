@@ -54,6 +54,10 @@ class FakeOneBotClient:
         self.stickers: list[tuple[ReplyTarget, StickerSource]] = []
         self.files: list[tuple[ReplyTarget, str, str]] = []
         self.groups: list[dict[str, object]] = []
+        self.group_files: dict[str, list[dict[str, object]]] = {
+            "folders": [],
+            "files": [],
+        }
 
     async def send_text(self, target: ReplyTarget, text: str) -> None:
         self.sent.append((target, text))
@@ -66,6 +70,14 @@ class FakeOneBotClient:
 
     async def get_group_list(self) -> list[dict[str, object]]:
         return list(self.groups)
+
+    async def get_group_files(
+        self,
+        group_id: int,
+        *,
+        folder_id: str = "",
+    ) -> dict[str, list[dict[str, object]]]:
+        return self.group_files
 
     async def send_image(self, target: ReplyTarget, image: str) -> None:
         self.images.append((target, image))
@@ -138,6 +150,18 @@ class FakeTTS:
         return None
 
 
+class DataTTS(FakeTTS):
+    async def synthesize_styled(
+        self,
+        text: str,
+        *,
+        voice: str = "",
+        rate: float | None = None,
+    ) -> str:
+        assert rate is not None
+        return "data:audio/wav;base64,AAAA"
+
+
 class FakeWebReader:
     async def read(self, url: str) -> WebArticle:
         return WebArticle(
@@ -191,9 +215,11 @@ class FakeStickerDecider:
     def __init__(self, sticker_id: int | None) -> None:
         self.sticker_id = sticker_id
         self.calls = 0
+        self.last_kwargs: dict[str, object] = {}
 
     async def choose(self, **kwargs) -> int | None:
         self.calls += 1
+        self.last_kwargs = kwargs
         return self.sticker_id
 
 
@@ -930,19 +956,61 @@ async def test_voice_message_uses_audio_model(tmp_path) -> None:
                             "file_id": "voice-id",
                         },
                     },
+                    {
+                        "type": "record",
+                        "data": {
+                            "file": "voice-2.amr",
+                            "file_id": "voice-id-2",
+                        },
+                    },
                     {"type": "text", "data": {"text": "/转写"}},
                 ],
             },
         )
         await _wait_for_condition(lambda: len(sender.sent) == 2)
 
-    assert len(audio_loader.sources) == 1
+    assert len(audio_loader.sources) == 2
     assert llm.models == ["qwen3.8-omni-flash"]
     assert llm.extra_payloads[0]["modalities"] == ["text"]
     user_content = llm.calls[0][-1]["content"]
     assert isinstance(user_content, list)
     assert user_content[1]["type"] == "input_audio"
+    assert user_content[2]["type"] == "input_audio"
+    assert "2 段语音" in user_content[0]["text"]
     assert sender.sent[1][1] == "测试回复"
+
+
+@pytest.mark.asyncio
+async def test_admin_generates_downloadable_voice_file(tmp_path) -> None:
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            tts_enabled=True,
+            generated_media_dir=tmp_path / "generated",
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        tts_client=DataTTS(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = await client.post(
+            "/api/admin/generate",
+            json={"kind": "voice", "prompt": "今天状态不错"},
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["kind"] == "audio"
+        assert result["name"].endswith(".wav")
+        download = await client.get(result["download_url"])
+        assert download.status_code == 200
+        assert download.content == b"\x00\x00\x00"
 
 
 @pytest.mark.asyncio
@@ -1057,6 +1125,7 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()
     sticker_store = StickerStore(tmp_path / "stickers.db")
+    sticker_decider = FakeStickerDecider(1)
     app = create_app(
         settings=make_settings(tmp_path),
         chat_client=llm,
@@ -1066,7 +1135,7 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
         document_loader=FakeDocumentLoader(),
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
         sticker_store=sticker_store,
-        sticker_choice_decider=FakeStickerDecider(1),
+        sticker_choice_decider=sticker_decider,
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -1102,6 +1171,7 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     assert sender.sent[0][0].message_id is None
     assert sticker_store.count() == 1
     assert sender.stickers[0][1].summary == "奶龙"
+    assert "QQ：123" in str(sticker_decider.last_kwargs["contact_context"])
 
 
 @pytest.mark.asyncio
@@ -1584,6 +1654,66 @@ async def test_group_profiles_use_original_names_and_keep_custom_names(
             if item["group_id"] == 93001
         )
         assert profile["name"] == "我的自定义群名"
+
+
+@pytest.mark.asyncio
+async def test_group_files_are_available_in_admin_and_chat(tmp_path) -> None:
+    sender = FakeOneBotClient()
+    sender.group_files = {
+        "folders": [
+            {
+                "folder_id": "folder-1",
+                "name": "课程资料",
+                "file_count": 1,
+            }
+        ],
+        "files": [
+            {
+                "file_id": "file-1",
+                "name": "讲义.pdf",
+                "size": 2048,
+                "uploader": "小明",
+            }
+        ],
+    }
+    app = create_app(
+        settings=make_settings(tmp_path, enable_group=True),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        listing = await client.get(
+            "/api/admin/group-profiles/456/files?folder_id=folder-1"
+        )
+        assert listing.status_code == 200
+        assert listing.json()["files"][0]["name"] == "讲义.pdf"
+
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 999,
+                "user_id": 123,
+                "group_id": 456,
+                "message_id": 2950,
+                "message": "/群文件",
+                "sender": {"nickname": "测试用户"},
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    reply = sender.sent[-1][1]
+    assert "课程资料" in reply
+    assert "讲义.pdf" in reply
 
 
 @pytest.mark.asyncio

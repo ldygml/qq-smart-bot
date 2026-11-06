@@ -15,6 +15,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import psutil
@@ -883,6 +884,22 @@ def _instance_status(port: int) -> str:
         return "offline"
 
 
+def _listening_pid(port: int) -> int | None:
+    try:
+        connections = psutil.net_connections(kind="inet")
+    except (psutil.Error, OSError):
+        return None
+    for connection in connections:
+        if (
+            connection.status == psutil.CONN_LISTEN
+            and connection.laddr
+            and int(connection.laddr.port) == port
+            and connection.pid
+        ):
+            return int(connection.pid)
+    return None
+
+
 def _instance_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     pid = item.get("pid")
@@ -1090,15 +1107,18 @@ def _stop_instance(instance_id: int, user_id: int) -> bool:
     if not row:
         raise ValueError("Instance not found")
     process = processes.pop(instance_id, None)
+    target_pid = None
     if process and process.poll() is None:
         process.terminate()
         try:
             process.wait(timeout=8)
         except subprocess.TimeoutExpired:
             process.kill()
-    elif row["pid"]:
+    else:
+        target_pid = row["pid"] or _listening_pid(int(row["port"]))
+    if not process and target_pid:
         try:
-            proc = psutil.Process(int(row["pid"]))
+            proc = psutil.Process(int(target_pid))
             for child in proc.children(recursive=True):
                 child.terminate()
             proc.terminate()
@@ -1599,6 +1619,24 @@ async def instance_group_profile_details(
         instance_id,
         int(user["id"]),
         f"/api/admin/group-profiles/{group_id}/details",
+    )
+
+
+@app.get(
+    "/api/instances/{instance_id}/group-profiles/{group_id}/files"
+)
+async def instance_group_files(
+    instance_id: int,
+    group_id: int,
+    request: Request,
+    folder_id: str = "",
+) -> Any:
+    user = _request_user(request)
+    suffix = f"?folder_id={quote(folder_id)}" if folder_id else ""
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/group-profiles/{group_id}/files{suffix}",
     )
 
 

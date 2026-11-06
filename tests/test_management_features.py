@@ -595,7 +595,9 @@ def test_group_profiles_are_independent(tmp_path) -> None:
     member = store.member_preference(100, 222)
     assert member is not None and member["no_jokes"] is True
     assert store.delete_knowledge(100, knowledge_id)
-    assert len(store.list_all()) == 2
+    profiles = store.list_all()
+    assert len(profiles) == 2
+    assert profiles[0]["announcement_digest_hours"] == 24
 
 
 def test_encrypted_backup_round_trip_and_wrong_passphrase(tmp_path) -> None:

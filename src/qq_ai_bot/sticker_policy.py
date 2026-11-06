@@ -41,6 +41,7 @@ class LLMStickerOrganizer:
             "分类优先从：开心、无语、震惊、生气、委屈、嘲讽、赞同、"
             "疑惑、安慰、加油、日常 中选择，也可以使用更准确的中文短分类。"
             "usage_hint 要具体，例如“对方说了离谱的事情时使用”。"
+            "同时说明适合哪些熟悉程度、关系阶段或联系人，以及哪些严肃场景不应使用。"
             "不要在语境冲突时强行使用表情。\n\n"
             f"表情名称：{summary or '动画表情'}\n"
             f"表情图片：{'已提供，请直接识别画面和文字' if image_url else '无'}\n"
@@ -95,6 +96,7 @@ class StickerChoiceDecider(Protocol):
         assistant_text: str,
         candidates: list[dict[str, object]],
         explicit_request: bool,
+        contact_context: str = "",
     ) -> int | None: ...
 
 
@@ -118,6 +120,7 @@ class LLMStickerChoiceDecider:
         assistant_text: str,
         candidates: list[dict[str, object]],
         explicit_request: bool,
+        contact_context: str = "",
     ) -> int | None:
         if not candidates:
             return None
@@ -125,6 +128,7 @@ class LLMStickerChoiceDecider:
             f"id={item.get('id')}；名称={item.get('summary')}；"
             f"分类={item.get('category', '未分类')}；"
             f"适用场景={item.get('usage_hint') or '未设置'}；"
+            f"标签={','.join(str(tag) for tag in item.get('tags', [])[:8]) or '无'}；"
             f"已使用={item.get('use_count', 0)}次"
             for item in candidates[:30]
         )
@@ -136,9 +140,11 @@ class LLMStickerChoiceDecider:
             "判断是否发送一个 QQ 商城表情包。只能从给定表情库选择，不能编造 ID。"
             '返回 JSON：{"sticker_id":数字或null,"confidence":0到1}。\n'
             "只有在表情名称和当前语境明显匹配时才发送；没有合适表情就返回 null。"
+            "还必须适应当前联系人的关系、称呼和禁忌；对方不想开玩笑或语境严肃时宁可不发。"
             "用户明确要表情包时可以更积极，但不能选择语义冲突的表情。"
             "普通聊天不要为了活跃气氛强行发表情。\n\n"
             f"是否明确请求表情包：{'是' if explicit_request else '否'}\n"
+            f"联系人上下文：{contact_context or '无额外资料'}\n"
             f"最近对话：\n{recent or '无'}\n"
             f"用户最新消息：{user_text}\n"
             f"机器人刚回复：{assistant_text}\n"

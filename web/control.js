@@ -2,6 +2,7 @@ let csrf = "";
 let providers = [];
 let instances = [];
 let groupDetails = {knowledge: [], members: []};
+let groupFiles = [];
 
 async function api(path, options = {}) {
   const headers = {...(options.headers || {})};
@@ -394,8 +395,10 @@ document.querySelector("#settings-profile-select").addEventListener("change", as
 async function loadGroupDetails(instanceId, groupId) {
   const data = await api(`/api/instances/${instanceId}/group-profiles/${groupId}/details`);
   groupDetails = data;
+  groupFiles = [];
   renderGroupKnowledge();
   renderGroupMembers();
+  renderGroupFiles();
 }
 
 function renderGroupKnowledge() {
@@ -426,6 +429,20 @@ function renderGroupMembers() {
       ${item.no_jokes ? `<span class="tag">不要开玩笑</span>` : ""}
       <div class="row-meta">${esc(item.notes || "无额外偏好")}</div></div>`).join("")
     : `<div class="empty">暂无成员偏好</div>`;
+}
+
+function renderGroupFiles() {
+  const list = document.querySelector("#group-file-list");
+  list.innerHTML = groupFiles.length
+    ? groupFiles.map((item) => `
+      <article class="source-row">
+        <div><span class="tag">${item.kind === "folder" ? "文件夹" : "文件"}</span>
+        <strong>${esc(item.name)}</strong></div>
+        <div class="row-meta">${item.kind === "folder"
+          ? `ID: ${esc(item.folder_id)} · ${esc(item.file_count || 0)} 项`
+          : `${esc(item.size || 0)} 字节 · 上传者 ${esc(item.uploader || "未知")}`}</div>
+      </article>`).join("")
+    : `<div class="empty">尚未读取群文件</div>`;
 }
 
 document.querySelector("#profile-add-group").addEventListener("click", async () => {
@@ -541,6 +558,30 @@ document.querySelector("#save-group-member").addEventListener("click", async () 
     await loadGroupDetails(instanceId, groupId);
   } catch (err) {
     document.querySelector("#profile-error").textContent = err.message;
+  }
+});
+
+document.querySelector("#load-group-files").addEventListener("click", async () => {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const groupId = Number(document.querySelector("#settings-profile-select").value);
+  if (!instanceId || !groupId) return;
+  const button = document.querySelector("#load-group-files");
+  button.disabled = true;
+  button.textContent = "读取中…";
+  try {
+    const folderId = document.querySelector("#group-folder-id").value.trim();
+    const suffix = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : "";
+    const data = await api(`/api/instances/${instanceId}/group-profiles/${groupId}/files${suffix}`);
+    groupFiles = [
+      ...(data.folders || []).map((item) => ({...item, kind:"folder"})),
+      ...(data.files || []).map((item) => ({...item, kind:"file"})),
+    ];
+    renderGroupFiles();
+  } catch (err) {
+    document.querySelector("#profile-error").textContent = err.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = "读取群文件";
   }
 });
 

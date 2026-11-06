@@ -5,6 +5,7 @@ const state = {
   groupProfiles: [],
   groupKnowledge: [],
   groupMembers: [],
+  groupFiles: [],
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -777,8 +778,10 @@ async function loadGroupDetails(groupId) {
   const data = await api(`/api/admin/group-profiles/${groupId}/details`);
   state.groupKnowledge = data.knowledge;
   state.groupMembers = data.members;
+  state.groupFiles = [];
   renderGroupKnowledge();
   renderGroupMembers();
+  renderGroupFiles();
 }
 
 function renderGroupKnowledge() {
@@ -806,6 +809,25 @@ function renderGroupMembers() {
       ${item.no_jokes ? `<span class="tag">不要开玩笑</span>` : ""}
       <div class="row-meta">${esc(item.notes || "无额外偏好")}</div></div>`).join("")
     : `<div class="muted">暂无成员偏好</div>`;
+}
+
+function renderGroupFiles(data = null) {
+  if (data) {
+    state.groupFiles = [
+      ...(data.folders || []).map((item) => ({...item, kind: "folder"})),
+      ...(data.files || []).map((item) => ({...item, kind: "file"})),
+    ];
+  }
+  $("#group-file-list").innerHTML = state.groupFiles.length
+    ? state.groupFiles.map((item) => `
+      <article class="source-row">
+        <div><span class="tag">${item.kind === "folder" ? "文件夹" : "文件"}</span>
+        <strong>${esc(item.name)}</strong></div>
+        <div class="row-meta">${item.kind === "folder"
+          ? `ID: ${esc(item.folder_id)} · ${esc(item.file_count || 0)} 项`
+          : `${number(item.size)} 字节 · 上传者 ${esc(item.uploader || "未知")}`}</div>
+      </article>`).join("")
+    : `<div class="muted">尚未读取群文件。</div>`;
 }
 
 $("#group-profile-select").addEventListener("change", async (event) => {
@@ -928,6 +950,25 @@ $("#save-group-member").addEventListener("click", async () => {
     await loadGroupDetails(groupId);
   } catch (error) {
     $("#group-profile-status").textContent = error.message;
+  }
+});
+
+$("#load-group-files").addEventListener("click", async () => {
+  const groupId = Number($("#group-profile-select").value);
+  if (!groupId) return;
+  const button = $("#load-group-files");
+  button.disabled = true;
+  button.textContent = "读取中…";
+  try {
+    const folderId = $("#group-folder-id").value.trim();
+    const query = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : "";
+    const data = await api(`/api/admin/group-profiles/${groupId}/files${query}`);
+    renderGroupFiles(data);
+  } catch (error) {
+    $("#group-profile-status").textContent = error.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = "读取群文件";
   }
 });
 

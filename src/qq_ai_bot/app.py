@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import logging
 import random
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import Body, FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
@@ -23,6 +25,7 @@ from .audio import AudioLoader, AudioLoaderProtocol, AudioLoadError
 from .config import Settings
 from .content_tools import (
     ContentGenerationError,
+    GeneratedArtifact,
     generate_chart,
     generate_code,
     generate_document,
@@ -1447,6 +1450,28 @@ def create_app(
             "members": group_profiles.member_preferences(group_id),
         }
 
+    @app.get("/api/admin/group-profiles/{group_id}/files")
+    async def admin_group_files(
+        group_id: int,
+        folder_id: str = "",
+    ) -> dict[str, Any]:
+        getter = getattr(sender, "get_group_files", None)
+        if not callable(getter):
+            return JSONResponse(
+                {"detail": "当前 OneBot 客户端不支持读取群文件。"},
+                status_code=501,
+            )
+        try:
+            listing = await getter(group_id, folder_id=folder_id)
+        except OneBotError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=502)
+        return {
+            "ok": True,
+            "group_id": group_id,
+            "folder_id": folder_id,
+            **listing,
+        }
+
     @app.post("/api/admin/group-profiles/{group_id}/knowledge")
     async def admin_add_group_knowledge(
         group_id: int,
@@ -1572,16 +1597,18 @@ def create_app(
                     prompt=prompt,
                     output_dir=_generated_media_dir(),
                 )
+            elif kind == "voice":
+                artifact = await _render_voice_artifact(prompt)
             else:
                 return JSONResponse(
                     {
                         "detail": (
-                            "kind must be chart, document, file, or code"
+                            "kind must be chart, document, file, code, or voice"
                         )
                     },
                     status_code=400,
                 )
-        except (ContentGenerationError, LLMError) as exc:
+        except (ContentGenerationError, LLMError, TTSError) as exc:
             return JSONResponse({"detail": str(exc)}, status_code=502)
         return JSONResponse(
             {
@@ -1593,6 +1620,58 @@ def create_app(
                     f"/api/admin/generated/{artifact.path.name}"
                 ),
             }
+        )
+
+    async def _render_voice_artifact(prompt: str) -> GeneratedArtifact:
+        if not config.tts_enabled:
+            raise ContentGenerationError("语音合成功能目前没有开启。")
+        if len(prompt) > config.max_tts_chars:
+            raise ContentGenerationError(
+                f"语音文本不能超过 {config.max_tts_chars} 个字符。"
+            )
+        voice = _tts_voice_for_text(prompt, config)
+        rate = _tts_rate_for_text(prompt, config)
+        styled = getattr(tts, "synthesize_styled", None)
+        audio_url = (
+            await styled(prompt, voice=voice, rate=rate)
+            if callable(styled)
+            else await tts.synthesize(prompt)
+        )
+        try:
+            if audio_url.startswith("data:"):
+                encoded = audio_url.partition(",")[2]
+                audio_bytes = base64.b64decode(encoded, validate=True)
+            elif audio_url.startswith(("http://", "https://")):
+                async with httpx.AsyncClient(
+                    follow_redirects=True,
+                    trust_env=config.llm_trust_env,
+                    timeout=60.0,
+                ) as client:
+                    response = await client.get(audio_url)
+                    response.raise_for_status()
+                    audio_bytes = response.content
+            else:
+                audio_bytes = await asyncio.to_thread(
+                    Path(audio_url).read_bytes
+                )
+        except (OSError, ValueError, httpx.HTTPError) as exc:
+            raise ContentGenerationError(
+                "语音已经生成，但下载音频文件失败。"
+            ) from exc
+        if not audio_bytes:
+            raise ContentGenerationError("语音合成返回了空文件。")
+        suffix = ".mp3" if ".mp3" in audio_url.lower() else ".wav"
+        name = (
+            f"voice-{datetime.now(ZoneInfo(config.timezone)):%Y%m%d-%H%M%S}"
+            f"-{random.randrange(1000, 9999)}{suffix}"
+        )
+        path = _generated_media_dir() / name
+        await asyncio.to_thread(path.write_bytes, audio_bytes)
+        return GeneratedArtifact(
+            path=path,
+            name=name,
+            kind="audio",
+            summary=f"已生成 {len(prompt)} 字的语音文件。",
         )
 
     @app.get("/api/admin/generated/{file_name}")
@@ -1923,17 +2002,18 @@ def create_app(
         while True:
             try:
                 for profile in group_profiles.list_all():
-                    hours = profile.announcement_digest_hours
-                    if hours <= 0 or not profile.enabled:
+                    group_id = int(profile["group_id"])
+                    hours = int(profile["announcement_digest_hours"])
+                    if hours <= 0 or not profile["enabled"]:
                         continue
                     announcements = group_profiles.knowledge(
-                        profile.group_id,
+                        group_id,
                         kind="announcement",
                         limit=100,
                     )
                     if not announcements:
                         continue
-                    run_key = f"group_digest:{profile.group_id}:last_run"
+                    run_key = f"group_digest:{group_id}:last_run"
                     last_run = shared_memory.get_state(run_key, "")
                     if last_run:
                         try:
@@ -1946,7 +2026,7 @@ def create_app(
                         if elapsed_hours < hours:
                             continue
                     state_key = (
-                        f"group_digest:{profile.group_id}:last_updated"
+                        f"group_digest:{group_id}:last_updated"
                     )
                     latest = max(
                         str(item["updated_at"])
@@ -1972,7 +2052,7 @@ def create_app(
                         model=config.llm_model,
                     )
                     group_profiles.add_knowledge(
-                        profile.group_id,
+                        group_id,
                         kind="digest",
                         title=f"群公告定期总结 {datetime.now(ZoneInfo(config.timezone)):%Y-%m-%d %H:%M}",
                         content=format_qq_text(summary),
@@ -2337,7 +2417,7 @@ def create_app(
         text = text.replace("[图片]", "").replace("[语音]", "").strip()
         image_sources = content.image_sources[: max(0, config.max_images_per_message)]
         file_sources = content.file_sources[: max(0, config.max_files_per_message)]
-        audio_sources = content.audio_sources[:1]
+        audio_sources = content.audio_sources
         sticker_summaries = content.sticker_summaries[:3]
         sticker_sources = content.sticker_sources[:3]
         for sticker in sticker_sources:
@@ -2613,7 +2693,7 @@ def create_app(
             await _process_audio_request(
                 target=target,
                 text=text,
-                audio_source=audio_sources[0],
+                audio_sources=audio_sources,
             )
             return
 
@@ -3047,7 +3127,7 @@ def create_app(
         *,
         target: ReplyTarget,
         text: str,
-        audio_source: AudioSource,
+        audio_sources: Sequence[AudioSource],
     ) -> None:
         if not config.audio_enabled:
             await _safe_send(target, "语音识别功能目前没有开启。")
@@ -3056,18 +3136,43 @@ def create_app(
         conversation_id = target.conversation_id
         lock = get_conversation_lock(conversation_id)
         async with semaphore, lock:
-            await _safe_send(target, "收到语音，正在识别…")
-            try:
-                loaded = await audio.load(audio_source, sender)
-            except AudioLoadError as exc:
-                await _safe_send(target, str(exc))
-                return
-            except Exception:
-                logger.exception("Unexpected voice-loading failure")
-                await _safe_send(target, "语音下载时出现意外错误，请重新发送。")
+            count = len(audio_sources)
+            await _safe_send(
+                target,
+                (
+                    "收到语音，正在识别…"
+                    if count <= 1
+                    else f"收到 {count} 段语音，正在按发送顺序连续理解…"
+                ),
+            )
+            loaded_audio: list[Any] = []
+            load_errors: list[str] = []
+            for audio_source in audio_sources:
+                try:
+                    loaded_audio.append(await audio.load(audio_source, sender))
+                except AudioLoadError as exc:
+                    load_errors.append(str(exc))
+                except Exception:
+                    logger.exception("Unexpected voice-loading failure")
+                    load_errors.append("有一段语音下载时出现意外错误。")
+            if not loaded_audio:
+                await _safe_send(
+                    target,
+                    load_errors[-1] if load_errors else "没有取得可用语音。",
+                )
                 return
 
             instruction = _audio_instruction(text)
+            if len(loaded_audio) > 1:
+                instruction = (
+                    f"这是同一轮对话中按发送顺序提供的 {len(loaded_audio)} 段语音，"
+                    "请把它们作为连续语音完整理解后再处理。\n"
+                    f"{instruction}"
+                )
+            if load_errors:
+                instruction += (
+                    f"\n另有 {len(load_errors)} 段语音无法读取，不要臆测其内容。"
+                )
             messages = [
                 {
                     "role": "system",
@@ -3081,13 +3186,16 @@ def create_app(
                     "role": "user",
                     "content": [
                         {"type": "text", "text": instruction},
-                        {
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": loaded.data,
-                                "format": loaded.format,
-                            },
-                        },
+                        *(
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": loaded.data,
+                                    "format": loaded.format,
+                                },
+                            }
+                            for loaded in loaded_audio
+                        ),
                     ],
                 },
             ]
@@ -3114,7 +3222,7 @@ def create_app(
                 return
             store.append_exchange(
                 conversation_id,
-                f"[语音] {instruction}",
+                f"[语音×{len(loaded_audio)}] {instruction}",
                 reply,
                 max_rows=config.max_history_rows_per_chat,
             )
@@ -3463,6 +3571,7 @@ def create_app(
             "/发图",
             "/发文件",
             "/发表情",
+            "/群文件",
             "/生成图表",
             "/生成文档",
             "/生成文件",
@@ -3515,6 +3624,42 @@ def create_app(
 
         if not command:
             return False
+        if command == "/群文件":
+            if target.group_id is None:
+                await _safe_send(target, "这个命令只能在群聊中使用。")
+                return True
+            getter = getattr(sender, "get_group_files", None)
+            if not callable(getter):
+                await _safe_send(target, "当前 NapCat 连接不支持读取群文件。")
+                return True
+            try:
+                listing = await getter(
+                    target.group_id,
+                    folder_id=argument.strip(),
+                )
+            except OneBotError as exc:
+                await _safe_send(target, f"群文件读取失败：{exc}")
+                return True
+            folders = listing.get("folders") or []
+            files = listing.get("files") or []
+            if not folders and not files:
+                await _safe_send(target, "这个目录里没有群文件。")
+                return True
+            lines = ["群文件："]
+            lines.extend(
+                f"- [文件夹] {item['name']}（ID: {item['folder_id']}，"
+                f"{item.get('file_count', 0)} 项）"
+                for item in folders[:20]
+            )
+            lines.extend(
+                f"- {item['name']}（{_human_file_size(item.get('size'))}，"
+                f"上传者 {item.get('uploader') or '未知'}）"
+                for item in files[:30]
+            )
+            if len(folders) + len(files) > 50:
+                lines.append("列表较长，只显示前 50 项。")
+            await _safe_send(target, "\n".join(lines))
+            return True
         if (
             command.startswith("/发")
             and event.user_id != config.owner_qq
@@ -3651,7 +3796,7 @@ def create_app(
                     audio_url = await styled(
                         argument,
                         voice=selected_voice,
-                        rate=config.tts_rate,
+                        rate=_tts_rate_for_text(argument, config),
                     )
                 else:
                     audio_url = await tts.synthesize(argument)
@@ -3709,13 +3854,7 @@ def create_app(
                 )
                 return True
             sticker_context = value
-            if target.group_id is not None:
-                member_pref = group_profiles.member_preference(
-                    target.group_id,
-                    event.user_id,
-                )
-                if member_pref and member_pref.get("no_jokes"):
-                    sticker_context += "；该成员明确不接受玩笑和嘲讽"
+            contact_context = _sticker_contact_context(target)
             sticker_id = await sticker_decider.choose(
                 history=store.history(
                     target.conversation_id,
@@ -3725,6 +3864,7 @@ def create_app(
                 assistant_text="",
                 candidates=candidates,
                 explicit_request=True,
+                contact_context=contact_context,
             )
             sticker = stickers.get_by_id(sticker_id) if sticker_id else None
             if sticker is None:
@@ -3748,13 +3888,7 @@ def create_app(
         if not candidates:
             return False
         sticker_context = user_text
-        if target.group_id is not None:
-            member_pref = group_profiles.member_preference(
-                target.group_id,
-                target.user_id,
-            )
-            if member_pref and member_pref.get("no_jokes"):
-                sticker_context += "；该成员明确不接受玩笑和嘲讽"
+        contact_context = _sticker_contact_context(target)
         choice_id = await sticker_decider.choose(
             history=store.history(
                 target.conversation_id,
@@ -3764,6 +3898,7 @@ def create_app(
             assistant_text=assistant_text,
             candidates=candidates,
             explicit_request=explicit_request,
+            contact_context=contact_context,
         )
         sticker = stickers.get_by_id(choice_id) if choice_id else None
         if sticker is None:
@@ -3774,6 +3909,32 @@ def create_app(
         except Exception:
             logger.warning("Failed to send context-selected sticker", exc_info=True)
             return False
+
+    def _sticker_contact_context(target: ReplyTarget) -> str:
+        parts = [f"QQ：{target.user_id}"]
+        person = shared_memory.get_person(target.user_id) or {}
+        if person.get("display_name"):
+            parts.append(f"称呼：{person['display_name']}")
+        if person.get("style_profile"):
+            parts.append(f"聊天画像：{person['style_profile']}")
+        if person.get("relationship_note"):
+            parts.append(f"关系备注：{person['relationship_note']}")
+        if target.group_id is not None:
+            profile = group_profiles.get(target.group_id)
+            if profile is not None and profile.name:
+                parts.append(f"当前群：{profile.name}")
+            member = group_profiles.member_preference(
+                target.group_id,
+                target.user_id,
+            )
+            if member:
+                if member.get("nickname"):
+                    parts.append(f"群昵称：{member['nickname']}")
+                if member.get("notes"):
+                    parts.append(f"成员偏好：{member['notes']}")
+                if member.get("no_jokes"):
+                    parts.append("明确禁忌：不接受玩笑或阴阳怪气")
+        return "；".join(parts)
 
     async def _handle_web_request(
         target: ReplyTarget,
@@ -4344,6 +4505,21 @@ def _tts_voice_for_text(text: str, config: Settings) -> str:
     return config.tts_voice_calm
 
 
+def _tts_rate_for_text(text: str, config: Settings) -> float:
+    base = min(1.5, max(0.5, float(config.tts_rate)))
+    if any(
+        marker in text
+        for marker in ("难过", "低落", "遗憾", "告别", "失眠", "压力")
+    ):
+        return min(1.5, max(0.5, base * 0.94))
+    if any(
+        marker in text
+        for marker in ("开心", "太棒", "庆祝", "进球", "赢了", "哈哈")
+    ):
+        return min(1.5, max(0.5, base * 1.06))
+    return base
+
+
 def _coerce_group_setting(key: str, value: Any) -> Any:
     spec = GROUP_SETTING_SPECS.get(key)
     if spec is None:
@@ -4593,6 +4769,20 @@ def _audio_instruction(text: str) -> str:
         "请根据下面的要求处理这段语音；如果要求不明确，就先完整转写。"
         f"\n要求：{value}"
     )
+
+
+def _human_file_size(value: Any) -> str:
+    try:
+        size = max(0.0, float(value or 0))
+    except (TypeError, ValueError):
+        return "大小未知"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{size:.0f} B"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return "大小未知"
 
 
 def _wants_forced_research(text: str) -> bool:
