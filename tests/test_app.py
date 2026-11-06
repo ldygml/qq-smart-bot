@@ -10,7 +10,10 @@ from pydantic import SecretStr
 
 from qq_ai_bot.app import (
     _admin_access_signature,
+    _clean_model_reply,
+    _looks_like_task_request,
     _reply_variety_hint,
+    _social_only_reply,
     _social_tone_hint,
     create_app,
 )
@@ -268,6 +271,9 @@ def test_social_tone_hint_softens_requested_edge() -> None:
     hint = _social_tone_hint("你能不能温柔一点，别这么凶")
     assert "降低攻击性" in hint
     assert "不要辩解" in hint
+    invitation = _social_tone_hint("吃烧烤不")
+    assert "轻松邀约" in invitation
+    assert "旧任务" in invitation
 
 
 def test_reply_variety_hint_detects_repeated_openings() -> None:
@@ -280,6 +286,15 @@ def test_reply_variety_hint_detects_repeated_openings() -> None:
     hint = _reply_variety_hint(history)
     assert "最近重复较多的开头" in hint
     assert "行，" in hint
+
+
+def test_social_short_turns_and_task_detection() -> None:
+    assert _social_only_reply("👌") == "嗯。"
+    assert _social_only_reply("🤔") == "？"
+    assert _social_only_reply("你在干嘛") == "没干嘛。你呢？"
+    assert _looks_like_task_request("做一下第五题")
+    assert not _looks_like_task_request("换个话题")
+    assert _clean_model_reply("自然回应：\n那就先歇会儿。") == "那就先歇会儿。"
 
 
 @pytest.mark.asyncio
@@ -1633,6 +1648,82 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     assert sticker_store.count() == 1
     assert sender.stickers[0][1].summary == "奶龙"
     assert "QQ：123" in str(sticker_decider.last_kwargs["contact_context"])
+
+
+@pytest.mark.asyncio
+async def test_emoji_only_private_message_does_not_call_language_model(
+    tmp_path,
+) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2303,
+                "message": "🤔",
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert sender.sent[0][1] == "？"
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_question_number_uses_task_mode(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            llm_model="task-model",
+            casual_model="casual-model",
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2304,
+                "message": "做一下第五题",
+            },
+        )
+        await _wait_for_condition(lambda: bool(llm.calls))
+
+    assert llm.models == ["task-model"]
+    assert "任务模式" in llm.calls[0][0]["content"]
 
 
 @pytest.mark.asyncio
