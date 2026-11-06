@@ -60,7 +60,8 @@ async function loadInstances() {
       <div class="item-head"><b>${esc(item.name)}</b><span class="status ${item.status === "online" ? "online" : ""}"><i></i>${esc(item.status)}</span></div>
       <div class="item-meta">127.0.0.1:${item.port} · ${esc(item.provider_name || "未知供应商")}<br>${esc(item.onebot_api_base)}</div>
       <div class="item-actions">
-        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-unified="${item.id}">内容管理</button><button data-group-settings="${item.id}">群聊设置</button><button data-evolution="${item.id}">自适应与状态</button><button data-chat-test="${item.id}">对话测试</button><button data-traces="${item.id}">消息追踪</button><button data-model-routes="${item.id}">模型路由</button><a href="/api/instances/${item.id}/open-admin" target="_blank">打开完整后台</a>` : `<button data-start="${item.id}">启动</button>`}
+        ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-unified="${item.id}">内容管理</button><button data-group-settings="${item.id}">群聊设置</button><button data-evolution="${item.id}">自适应与状态</button><button data-chat-test="${item.id}">对话测试</button><button data-traces="${item.id}">消息追踪</button><button data-model-routes="${item.id}">模型路由</button>` : `<button data-start="${item.id}">启动</button>`}
+        <a href="/api/instances/${item.id}/open-admin" target="_blank">打开完整后台</a>
         <button data-edit-instance="${item.id}">编辑</button><button data-delete-instance="${item.id}">删除</button>
       </div>
     </article>`).join("") : `<div class="empty">还没有机器人实例</div>`;

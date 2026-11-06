@@ -1251,17 +1251,26 @@ async def portal_page(request: Request) -> Response:
     token = request.cookies.get(SESSION_COOKIE, "")
     if not token or not store.get_session(token):
         return RedirectResponse("/login")
-    return FileResponse(WEB_ROOT / "control_portal.html")
+    return FileResponse(
+        WEB_ROOT / "control_portal.html",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.get("/portal/control.css")
 async def control_css() -> FileResponse:
-    return FileResponse(WEB_ROOT / "control.css")
+    return FileResponse(
+        WEB_ROOT / "control.css",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.get("/portal/control.js")
 async def control_js() -> FileResponse:
-    return FileResponse(WEB_ROOT / "control.js")
+    return FileResponse(
+        WEB_ROOT / "control.js",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.get("/api/auth/status")
