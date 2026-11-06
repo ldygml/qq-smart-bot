@@ -40,11 +40,80 @@ class QualityStore:
                     issues TEXT NOT NULL DEFAULT '[]',
                     score REAL,
                     review_notes TEXT NOT NULL DEFAULT '',
+                    review_version INTEGER NOT NULL DEFAULT 0,
+                    review_scope TEXT NOT NULL DEFAULT '',
+                    fact_status TEXT NOT NULL DEFAULT 'not_checked',
+                    sources_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     reviewed_at TEXT
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(response_quality)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("review_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("review_scope", "TEXT NOT NULL DEFAULT ''"),
+                ("fact_status", "TEXT NOT NULL DEFAULT 'not_checked'"),
+                ("sources_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE response_quality "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS quality_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS polluted_replies (
+                    content TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            initialized = connection.execute(
+                """
+                SELECT value FROM quality_meta
+                WHERE key = 'style_review_v2_initialized'
+                """
+            ).fetchone()
+            if initialized is None:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO polluted_replies
+                        (content, created_at)
+                    SELECT assistant_text, ?
+                    FROM response_quality
+                    WHERE review_version < 2
+                    """,
+                    (_utc_now(),),
+                )
+                connection.execute(
+                    """
+                    UPDATE response_quality
+                    SET score = NULL, issues = '[]', review_notes = '',
+                        reviewed_at = NULL
+                    WHERE review_version < 2
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO quality_meta (key, value)
+                    VALUES ('style_review_v2_initialized', ?)
+                    """,
+                    (_utc_now(),),
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_response_quality_created
@@ -124,6 +193,8 @@ class QualityStore:
         user_text: str,
         assistant_text: str,
         model: str,
+        fact_status: str = "not_checked",
+        sources: list[dict[str, str]] | None = None,
     ) -> int:
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
@@ -131,9 +202,10 @@ class QualityStore:
                 INSERT INTO response_quality
                     (
                         conversation_id, user_id, group_id, user_text,
-                        assistant_text, model, created_at
+                        assistant_text, model, fact_status,
+                        sources_json, created_at
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation_id,
@@ -142,6 +214,8 @@ class QualityStore:
                     user_text[:4000],
                     assistant_text[:12000],
                     model[:200],
+                    fact_status[:40],
+                    json.dumps(sources or [], ensure_ascii=False)[:20000],
                     _utc_now(),
                 ),
             )
@@ -174,7 +248,7 @@ class QualityStore:
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id FROM response_quality
+                SELECT id, assistant_text FROM response_quality
                 WHERE conversation_id = ?
                 ORDER BY id DESC
                 LIMIT 1
@@ -204,6 +278,15 @@ class QualityStore:
                 """,
                 (status, int(row["id"])),
             )
+            if status == "corrected":
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO polluted_replies
+                        (content, created_at)
+                    VALUES (?, ?)
+                    """,
+                    (str(row["assistant_text"]), _utc_now()),
+                )
 
     def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
@@ -222,8 +305,30 @@ class QualityStore:
                 item["issues"] = json.loads(str(item["issues"]))
             except json.JSONDecodeError:
                 item["issues"] = []
+            try:
+                item["sources"] = json.loads(
+                    str(item.get("sources_json") or "[]")
+                )
+            except json.JSONDecodeError:
+                item["sources"] = []
             result.append(item)
         return result
+
+    def filter_history(
+        self,
+        history: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT content FROM polluted_replies"
+            ).fetchall()
+        polluted = {str(row["content"]) for row in rows}
+        return [
+            item
+            for item in history
+            if item.get("role") != "assistant"
+            or str(item.get("content") or "") not in polluted
+        ]
 
     def mark_review(
         self,
@@ -234,10 +339,18 @@ class QualityStore:
         notes: str,
     ) -> bool:
         with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT assistant_text FROM response_quality
+                WHERE id = ?
+                """,
+                (quality_id,),
+            ).fetchone()
             cursor = connection.execute(
                 """
                 UPDATE response_quality
                 SET score = ?, issues = ?, review_notes = ?,
+                    review_version = 2, review_scope = 'style',
                     reviewed_at = ?
                 WHERE id = ?
                 """,
@@ -249,6 +362,15 @@ class QualityStore:
                     quality_id,
                 ),
             )
+            if row is not None and float(score) < 0.55:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO polluted_replies
+                        (content, created_at)
+                    VALUES (?, ?)
+                    """,
+                    (str(row["assistant_text"]), _utc_now()),
+                )
             return cursor.rowcount > 0
 
     def pending_review(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -606,6 +728,8 @@ class QualityStore:
         }
         notes: list[str] = []
         for item in self.list_recent(limit=200):
+            if int(item.get("review_version") or 0) < 2:
+                continue
             if group_id is None:
                 if item.get("group_id") is not None:
                     continue
@@ -653,9 +777,11 @@ async def evaluate_quality(
             {
                 "role": "system",
                 "content": (
-                    "你是 QQ 对话质量评估器。严格输出 JSON，不要解释。"
+                    "你是 QQ 对话的纯文风评审器。严格输出 JSON，不要解释。"
+                    "你只能评价表达、结构和社交语气，不得判断歌手、人物、日期、"
+                    "数字、作品归属等事实是否正确，因为你没有可核验证据。"
                     "评估是否答非所问、重复、过长、语气不自然、群聊乱插话、"
-                    "事实依据不足，以及回复是否像客服模板、固定话术或为了显得有个性而"
+                    "是否像客服模板、固定话术或为了显得有个性而"
                     "过度冷嘲。普通问候被怼、正常请求被教育、连续使用相似开场，"
                     "都应明显降低评分。issues 优先使用 answer_drift、too_long、"
                     "repetition、tone_mismatch、canned_tone、overdone_edge、"
@@ -723,6 +849,7 @@ async def compare_replies(
                 "content": (
                     "比较两个 QQ 回复，判断哪一个更像正常熟人聊天。"
                     "更自然、贴合当前消息、少模板、少说教、没有过度攻击性的优先。"
+                    "不得判断事实真假，只比较表达和社交语气。"
                     "严格返回 JSON。"
                 ),
             },

@@ -683,6 +683,11 @@ function renderQuality(data) {
         <div class="row-meta">${esc(item.assistant_text)}<br>
           ${esc((item.issues || []).join("、") || item.review_notes || "尚无评测问题")}
         </div>
+        ${item.fact_status && item.fact_status !== "not_checked"
+          ? `<div class="row-meta">事实状态：${esc(item.fact_status)}</div>` : ""}
+        ${(item.sources || []).map((source) =>
+          `<div class="row-meta">来源：<a href="${esc(source.url)}" target="_blank" rel="noreferrer">${esc(source.title)}</a></div>`
+        ).join("")}
       </article>`).join("")
     : `<div class="empty">还没有质量记录。</div>`;
 }

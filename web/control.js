@@ -390,6 +390,11 @@ async function loadUnified(instanceId) {
           ${esc(item.user_text)}</div>
           <div class="row-meta">${esc(item.assistant_text)}</div>
           ${item.review_notes ? `<div class="row-meta">建议：${esc(item.review_notes)}</div>` : ""}
+          ${item.fact_status && item.fact_status !== "not_checked"
+            ? `<div class="row-meta">事实状态：${esc(item.fact_status)}</div>` : ""}
+          ${(item.sources || []).map((source) =>
+            `<div class="row-meta">来源：<a href="${esc(source.url)}" target="_blank" rel="noreferrer">${esc(source.title)}</a></div>`
+          ).join("")}
         </article>`).join("")
       : `<div class="empty">暂时没有质量记录</div>`;
   document.querySelector("#unified-sticker-list").innerHTML =
