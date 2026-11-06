@@ -474,7 +474,9 @@ async def test_natural_debounce_merges_rapid_private_messages(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_recent_quality_feedback_guides_next_reply(tmp_path) -> None:
+async def test_recent_quality_feedback_guides_next_reply(
+    tmp_path,
+) -> None:
     quality = QualityStore(tmp_path / "quality.db")
     quality_id = quality.record(
         conversation_id="private:123",
@@ -490,6 +492,9 @@ async def test_recent_quality_feedback_guides_next_reply(tmp_path) -> None:
         issues=["overdone_edge"],
         notes="普通问候不要冷嘲。",
     )
+    assert quality.coaching_notes(group_id=None) == [
+        "正常聊天不要为了显得有性格而冷嘲或攻击。"
+    ]
     llm = FakeChatClient()
     app = create_app(
         settings=make_settings(tmp_path),
@@ -519,7 +524,11 @@ async def test_recent_quality_feedback_guides_next_reply(tmp_path) -> None:
         )
         await _wait_for_condition(lambda: bool(llm.calls))
 
-    assert "普通问候不要冷嘲。" in llm.calls[0][0]["content"]
+    assert any(
+        "正常聊天不要为了显得有性格而冷嘲或攻击。"
+        in call[0]["content"]
+        for call in llm.calls
+    )
 
 
 @pytest.mark.asyncio

@@ -244,11 +244,10 @@ class QualityStore:
             )
         )
         status = "corrected" if correction else "follow_up"
-        issues = ["user_corrected"] if correction else []
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, assistant_text FROM response_quality
+                SELECT id, assistant_text, issues FROM response_quality
                 WHERE conversation_id = ?
                 ORDER BY id DESC
                 LIMIT 1
@@ -257,6 +256,14 @@ class QualityStore:
             ).fetchone()
             if row is None:
                 return
+            try:
+                issues = json.loads(str(row["issues"] or "[]"))
+            except json.JSONDecodeError:
+                issues = []
+            if not isinstance(issues, list):
+                issues = []
+            if correction and "user_corrected" not in issues:
+                issues.append("user_corrected")
             connection.execute(
                 """
                 UPDATE response_quality
@@ -726,6 +733,30 @@ class QualityStore:
             "format_overload": "闲聊不要排版，不要列清单或小标题。",
             "user_corrected": "用户已经纠正过，优先修正而不是继续辩解。",
         }
+
+        def guidance_for(issue: str) -> str:
+            normalized = issue.lower()
+            if normalized in issue_guidance:
+                return issue_guidance[normalized]
+            checks = (
+                (("答非所问",), issue_guidance["answer_drift"]),
+                (("重复",), issue_guidance["repetition"]),
+                (("太长", "过长"), issue_guidance["too_long"]),
+                (("语气", "冷淡", "生硬"), issue_guidance["tone_mismatch"]),
+                (("刻薄", "冷嘲", "攻击"), issue_guidance["overdone_edge"]),
+                (("模板", "客服", "固定"), issue_guidance["canned_tone"]),
+                (("清单", "格式", "标题"), issue_guidance["format_overload"]),
+                (("群聊", "插话"), issue_guidance["group_interjection"]),
+            )
+            return next(
+                (
+                    guidance
+                    for markers, guidance in checks
+                    if any(marker in issue for marker in markers)
+                ),
+                "",
+            )
+
         notes: list[str] = []
         for item in self.list_recent(limit=200):
             if int(item.get("review_version") or 0) < 2:
@@ -743,14 +774,18 @@ class QualityStore:
                 and (score is None or float(score) >= 0.8)
             ):
                 continue
-            note = str(item.get("review_notes") or "").strip()
-            if not note:
-                note = " ".join(
-                    issue_guidance.get(str(issue), "")
-                    for issue in issues
-                ).strip()
-            if note and note not in notes:
-                notes.append(note[:240])
+            for issue in issues:
+                note = guidance_for(str(issue))
+                if note and note not in notes:
+                    notes.append(note[:240])
+                    if len(notes) >= max(1, limit):
+                        break
+            if (
+                not issues
+                and item.get("status") == "corrected"
+                and issue_guidance["user_corrected"] not in notes
+            ):
+                notes.append(issue_guidance["user_corrected"])
             if len(notes) >= max(1, limit):
                 break
         return notes
