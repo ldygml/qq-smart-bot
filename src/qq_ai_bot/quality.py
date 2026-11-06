@@ -103,6 +103,13 @@ class QualityStore:
                 "没回答",
                 "太长了",
                 "别这么",
+                "太人机",
+                "不像人",
+                "太机械",
+                "别像机器人",
+                "太凶",
+                "刻薄",
+                "模板",
             )
         )
         status = "corrected" if correction else "follow_up"
@@ -218,6 +225,50 @@ class QualityStore:
             ),
         }
 
+    def coaching_notes(
+        self,
+        *,
+        group_id: int | None,
+        limit: int = 5,
+    ) -> list[str]:
+        issue_guidance = {
+            "answer_drift": "先直接回答当前问题，不要绕去别的话题。",
+            "too_long": "缩短回复，删掉复述、总结和多余建议。",
+            "repetition": "换一种表达，不要重复刚说过的结论或句式。",
+            "tone_mismatch": "匹配对方当前情绪，不要突然说教或卖弄犀利。",
+            "group_interjection": "群里没必要接的话就不接。",
+            "canned_tone": "避免客服腔、总结腔和固定模板。",
+            "overdone_edge": "正常聊天不要为了显得有性格而冷嘲或攻击。",
+            "format_overload": "闲聊不要排版，不要列清单或小标题。",
+            "user_corrected": "用户已经纠正过，优先修正而不是继续辩解。",
+        }
+        notes: list[str] = []
+        for item in self.list_recent(limit=200):
+            if group_id is None:
+                if item.get("group_id") is not None:
+                    continue
+            elif int(item.get("group_id") or 0) != group_id:
+                continue
+            score = item.get("score")
+            issues = item.get("issues") or []
+            if (
+                item.get("status") != "corrected"
+                and not issues
+                and (score is None or float(score) >= 0.8)
+            ):
+                continue
+            note = str(item.get("review_notes") or "").strip()
+            if not note:
+                note = " ".join(
+                    issue_guidance.get(str(issue), "")
+                    for issue in issues
+                ).strip()
+            if note and note not in notes:
+                notes.append(note[:240])
+            if len(notes) >= max(1, limit):
+                break
+        return notes
+
 
 async def evaluate_quality(
     chat_client: ChatClient,
@@ -234,7 +285,11 @@ async def evaluate_quality(
                 "content": (
                     "你是 QQ 对话质量评估器。严格输出 JSON，不要解释。"
                     "评估是否答非所问、重复、过长、语气不自然、群聊乱插话、"
-                    "事实依据不足。score 为 0 到 1。"
+                    "事实依据不足，以及回复是否像客服模板、固定话术或为了显得有个性而"
+                    "过度冷嘲。普通问候被怼、正常请求被教育、连续使用相似开场，"
+                    "都应明显降低评分。issues 优先使用 answer_drift、too_long、"
+                    "repetition、tone_mismatch、canned_tone、overdone_edge、"
+                    "format_overload、group_interjection。score 为 0 到 1。"
                 ),
             },
             {

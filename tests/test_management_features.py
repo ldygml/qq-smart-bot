@@ -238,10 +238,16 @@ async def test_group_settings_api_is_persistent_and_reloadable(tmp_path) -> None
                 "group_allowlist": "100,200",
                 "group_trigger_prefixes": "",
                 "quote_replies": False,
+                "natural_message_debounce_ms": 1200,
+                "auto_sticker_cooldown_seconds": 240,
             },
         )
         assert updated.status_code == 200
         assert updated.json()["settings"]["group_allowlist"] == "100,200"
+        assert (
+            updated.json()["settings"]["natural_message_debounce_ms"]
+            == 1200
+        )
 
         invalid = await client.patch(
             "/api/admin/group-settings",
@@ -287,6 +293,8 @@ async def test_group_settings_api_is_persistent_and_reloadable(tmp_path) -> None
     assert loaded.group_min_reply_confidence == 0.72
     assert loaded.quote_replies is False
     assert loaded.trigger_prefixes == ()
+    assert loaded.natural_message_debounce_ms == 1200
+    assert loaded.auto_sticker_cooldown_seconds == 240
     transport = httpx.ASGITransport(app=reloaded)
     async with httpx.AsyncClient(
         transport=transport,

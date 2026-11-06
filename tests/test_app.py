@@ -8,13 +8,18 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from qq_ai_bot.app import create_app
+from qq_ai_bot.app import (
+    _reply_variety_hint,
+    _social_tone_hint,
+    create_app,
+)
 from qq_ai_bot.audio import LoadedAudio
 from qq_ai_bot.config import Settings
 from qq_ai_bot.files import DocumentSection, ParsedDocument
 from qq_ai_bot.memory import ChatMemory
 from qq_ai_bot.onebot import ReplyTarget, StickerSource
 from qq_ai_bot.productivity import ProductivityStore
+from qq_ai_bot.quality import QualityStore
 from qq_ai_bot.shared_memory import SharedMemoryStore
 from qq_ai_bot.stickers import StickerStore
 from qq_ai_bot.vector_memory import VectorMemoryStore
@@ -256,6 +261,117 @@ def make_settings(tmp_path, **overrides) -> Settings:
     return Settings(_env_file=None, **values)
 
 
+def test_social_tone_hint_softens_requested_edge() -> None:
+    hint = _social_tone_hint("你能不能温柔一点，别这么凶")
+    assert "降低攻击性" in hint
+    assert "不要辩解" in hint
+
+
+def test_reply_variety_hint_detects_repeated_openings() -> None:
+    history = [
+        {"role": "assistant", "content": "行，我收着点。"},
+        {"role": "user", "content": "嗯"},
+        {"role": "assistant", "content": "行，那就算了。"},
+        {"role": "assistant", "content": "行，你说得对。"},
+    ]
+    hint = _reply_variety_hint(history)
+    assert "最近重复较多的开头" in hint
+    assert "行，" in hint
+
+
+@pytest.mark.asyncio
+async def test_natural_debounce_merges_rapid_private_messages(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            natural_pacing_enabled=True,
+            natural_message_debounce_ms=120,
+            natural_reply_delay_min_ms=0,
+            natural_reply_delay_max_ms=0,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        for message_id, text in ((801, "我今天有点烦"), (802, "先不聊学习了")):
+            await client.post(
+                "/onebot",
+                headers={"Authorization": "Bearer test-secret"},
+                json={
+                    "post_type": "message",
+                    "message_type": "private",
+                    "self_id": 999,
+                    "user_id": 123,
+                    "message_id": message_id,
+                    "message": text,
+                },
+            )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert len(llm.calls) == 1
+    assert llm.calls[0][-1]["content"] == (
+        "我今天有点烦\n先不聊学习了"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recent_quality_feedback_guides_next_reply(tmp_path) -> None:
+    quality = QualityStore(tmp_path / "quality.db")
+    quality_id = quality.record(
+        conversation_id="private:123",
+        user_id=123,
+        group_id=None,
+        user_text="你好",
+        assistant_text="少来这套。",
+        model="fake-model",
+    )
+    quality.mark_review(
+        quality_id,
+        score=0.3,
+        issues=["overdone_edge"],
+        notes="普通问候不要冷嘲。",
+    )
+    llm = FakeChatClient()
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=llm,
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        quality_store=quality,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 803,
+                "message": "今天过得还行",
+            },
+        )
+        await _wait_for_condition(lambda: bool(llm.calls))
+
+    assert "普通问候不要冷嘲。" in llm.calls[0][0]["content"]
+
+
 @pytest.mark.asyncio
 async def test_private_message_gets_ai_reply(tmp_path) -> None:
     llm = FakeChatClient()
@@ -493,6 +609,49 @@ async def test_group_can_reply_without_mention(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_no_mention_group_still_ignores_short_acknowledgements(
+    tmp_path,
+) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=False,
+            group_smart_participation=False,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 999,
+                "user_id": 123,
+                "group_id": 456,
+                "message_id": 1801,
+                "message": "谢谢",
+            },
+        )
+        await asyncio.sleep(0.1)
+
+    assert sender.sent == []
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
 async def test_image_message_uses_vision_model(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()
@@ -570,7 +729,7 @@ async def test_long_reply_is_not_truncated(tmp_path) -> None:
                 "message": "请写长一点",
             },
         )
-        await _wait_for_condition(lambda: len(sender.sent) == 4)
+        await _wait_for_condition(lambda: len(sender.sent) == 4, timeout=5.0)
 
     assert len(sender.sent) == 4
     assert "".join(text for _, text in sender.sent) == llm.reply
@@ -647,7 +806,11 @@ async def test_due_reminder_is_delivered(tmp_path) -> None:
         await _wait_for_condition(lambda: bool(sender.sent), timeout=3)
 
     assert sender.sent[0][0] == ReplyTarget("private", 123)
-    assert sender.sent[0][1] == "提醒：该复习了"
+    assert sender.sent[0][1] in {
+        "提醒你一下，该复习了",
+        "到点了，该复习了",
+        "之前说的，该复习了",
+    }
 
 
 @pytest.mark.asyncio
@@ -863,9 +1026,11 @@ async def test_incoming_poke_notice_makes_bot_respond(tmp_path) -> None:
     assert sender.poked[0].group_id == 500
     assert sender.sent[0][0].user_id == 123
     assert sender.sent[0][1] in {
-        "在，有话直说。",
-        "戳什么，说事。",
-        "行，戳回来了。",
+        "在呢。",
+        "嗯？",
+        "干嘛。",
+        "来了。",
+        "你戳我，有事？",
     }
 
 
@@ -1172,6 +1337,63 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     assert sticker_store.count() == 1
     assert sender.stickers[0][1].summary == "奶龙"
     assert "QQ：123" in str(sticker_decider.last_kwargs["contact_context"])
+
+
+@pytest.mark.asyncio
+async def test_auto_sticker_respects_per_conversation_cooldown(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    sticker_store = StickerStore(tmp_path / "stickers.db")
+    sticker_store.record(
+        StickerSource(
+            summary="笑死",
+            emoji_id="sticker-1",
+            emoji_package_id="pack-1",
+            key="sticker-key",
+        )
+    )
+    decider = FakeStickerDecider(1)
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            auto_sticker_enabled=True,
+            auto_sticker_cooldown_seconds=300,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        sticker_store=sticker_store,
+        sticker_choice_decider=decider,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        for message_id, text in ((2301, "笑死"), (2302, "这也太离谱了")):
+            before = len(sender.sent)
+            await client.post(
+                "/onebot",
+                headers={"Authorization": "Bearer test-secret"},
+                json={
+                    "post_type": "message",
+                    "message_type": "private",
+                    "self_id": 999,
+                    "user_id": 123,
+                    "message_id": message_id,
+                    "message": text,
+                },
+            )
+            await _wait_for_condition(
+                lambda: len(sender.sent) > before,
+                timeout=5.0,
+            )
+            await asyncio.sleep(0.05)
+
+    assert decider.calls == 1
+    assert len(sender.stickers) == 1
 
 
 @pytest.mark.asyncio

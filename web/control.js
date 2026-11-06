@@ -335,6 +335,8 @@ async function loadGroupSettings(instanceId) {
     document.querySelector("#settings-prefixes").value = settings.group_trigger_prefixes || "";
     document.querySelector("#settings-delay-min").value = settings.natural_reply_delay_min_ms ?? 200;
     document.querySelector("#settings-delay-max").value = settings.natural_reply_delay_max_ms ?? 900;
+    document.querySelector("#settings-debounce").value = settings.natural_message_debounce_ms ?? 0;
+    document.querySelector("#settings-sticker-cooldown").value = settings.auto_sticker_cooldown_seconds ?? 180;
     await loadGroupProfiles(instanceId);
   } catch (err) {
     error.textContent = err.message;
@@ -630,6 +632,8 @@ document.querySelector("#save-settings").addEventListener("click", async () => {
         natural_split_replies:document.querySelector("#settings-natural-split").checked,
         natural_reply_delay_min_ms:Number(document.querySelector("#settings-delay-min").value),
         natural_reply_delay_max_ms:Number(document.querySelector("#settings-delay-max").value),
+        natural_message_debounce_ms:Number(document.querySelector("#settings-debounce").value),
+        auto_sticker_cooldown_seconds:Number(document.querySelector("#settings-sticker-cooldown").value),
         group_min_reply_confidence:Number(document.querySelector("#settings-confidence").value),
         group_reply_cooldown_seconds:Number(document.querySelector("#settings-cooldown").value),
         group_participation_model:document.querySelector("#settings-model").value.trim(),

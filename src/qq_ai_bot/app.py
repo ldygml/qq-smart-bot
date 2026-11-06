@@ -164,6 +164,14 @@ GROUP_SETTING_SPECS = {
     ),
     "natural_pacing_enabled": ("natural_pacing_enabled", "bool"),
     "natural_split_replies": ("natural_split_replies", "bool"),
+    "natural_message_debounce_ms": (
+        "natural_message_debounce_ms",
+        "delay",
+    ),
+    "auto_sticker_cooldown_seconds": (
+        "auto_sticker_cooldown_seconds",
+        "cooldown",
+    ),
     "natural_reply_delay_min_ms": (
         "natural_reply_delay_min_ms",
         "delay",
@@ -369,7 +377,10 @@ def create_app(
     background_tasks: set[asyncio.Task[Any]] = set()
     sticker_organize_inflight: set[int] = set()
     last_poke_reply: dict[tuple[str, int, int], float] = {}
+    last_auto_sticker_at: dict[str, float] = {}
     seen_message_ids: OrderedDict[str, None] = OrderedDict()
+    pending_natural_events: dict[str, OneBotEvent] = {}
+    natural_event_versions: dict[str, int] = {}
     reflection_lock = asyncio.Lock()
     group_histories: dict[int, deque[GroupMessage]] = {}
     group_name_cache: dict[int, str] = {}
@@ -1754,8 +1765,52 @@ def create_app(
         task.add_done_callback(background_tasks.discard)
         return Response(status_code=204)
 
+    def _natural_event_text(event: OneBotEvent) -> str:
+        if event.message_type != "private":
+            return ""
+        content = extract_message_content(
+            event.message,
+            self_id=event.self_id,
+            raw_message=event.raw_message,
+        )
+        if (
+            content.image_sources
+            or content.file_sources
+            or content.audio_sources
+            or content.sticker_sources
+            or content.reply_id
+        ):
+            return ""
+        value = content.text.strip()
+        if not value or value.startswith("/"):
+            return ""
+        return value
+
     async def _run_event(event: OneBotEvent) -> None:
         try:
+            debounce_ms = min(5000, max(0, config.natural_message_debounce_ms))
+            text = _natural_event_text(event)
+            if config.natural_pacing_enabled and debounce_ms and text:
+                key = f"private:{event.user_id}"
+                previous = pending_natural_events.get(key)
+                if previous is not None:
+                    previous_text = _natural_event_text(previous)
+                    merged = "\n".join(
+                        part for part in (previous_text, text) if part
+                    )
+                    event = event.model_copy(
+                        update={
+                            "message": merged,
+                            "raw_message": merged,
+                        }
+                    )
+                pending_natural_events[key] = event
+                version = natural_event_versions.get(key, 0) + 1
+                natural_event_versions[key] = version
+                await asyncio.sleep(debounce_ms / 1000)
+                if natural_event_versions.get(key) != version:
+                    return
+                event = pending_natural_events.pop(key, event)
             await _process_event(event)
         except asyncio.CancelledError:
             raise
@@ -1918,9 +1973,11 @@ def create_app(
 
         await _safe_poke(target)
         replies = (
-            "在，有话直说。",
-            "戳什么，说事。",
-            "行，戳回来了。",
+            "在呢。",
+            "嗯？",
+            "干嘛。",
+            "来了。",
+            "你戳我，有事？",
         )
         await _safe_send(target, replies[int(now) % len(replies)])
 
@@ -1934,7 +1991,14 @@ def create_app(
                         reminder.user_id,
                         reminder.group_id,
                     )
-                    if await _safe_send(target, f"提醒：{reminder.content}"):
+                    line = random.choice(
+                        (
+                            f"提醒你一下，{reminder.content}",
+                            f"到点了，{reminder.content}",
+                            f"之前说的，{reminder.content}",
+                        )
+                    )
+                    if await _safe_send(target, line):
                         productivity.mark_reminder_delivered(reminder.id)
             except asyncio.CancelledError:
                 raise
@@ -2043,8 +2107,9 @@ def create_app(
                             {
                                 "role": "system",
                                 "content": (
-                                    "总结群公告，保留时间、行动项和重要变化，"
-                                    "不要编造，不要使用 Markdown。"
+                                    "像群友顺手提醒一样提炼公告重点。保留时间、"
+                                    "行动项和真正影响成员的变化，删掉官腔和重复铺陈；"
+                                    "不要编造，不要使用 Markdown，也不要逐条复述原文。"
                                 ),
                             },
                             {"role": "user", "content": content},
@@ -2573,7 +2638,6 @@ def create_app(
                 return
             if (
                 not group_profile.require_mention
-                and group_profile.smart_participation
                 and not directly_addressed
             ):
                 if obvious_ignore(text):
@@ -2604,16 +2668,17 @@ def create_app(
                 ):
                     group_behavior.record_ordinary_ignored(group_id)
                     return
-                should_join = await _decider_for_group(
-                    group_profile
-                ).should_reply(
-                    history=prior_messages,
-                    current_sender=display_name,
-                    current_text=text,
-                )
-                if not should_join:
-                    group_behavior.record_ordinary_ignored(group_id)
-                    return
+                if group_profile.smart_participation:
+                    should_join = await _decider_for_group(
+                        group_profile
+                    ).should_reply(
+                        history=prior_messages,
+                        current_sender=display_name,
+                        current_text=text,
+                    )
+                    if not should_join:
+                        group_behavior.record_ordinary_ignored(group_id)
+                        return
             text = strip_trigger_prefix(text, trigger_prefixes)
 
         if not text and not image_sources and not file_sources and not audio_sources:
@@ -2650,15 +2715,21 @@ def create_app(
             )
             if not await _safe_poke(poke_target):
                 await _safe_send(target, "戳不动，NapCat 可能没有启用这个互动接口。")
-            elif target_qq != event.user_id:
-                await _safe_send(target, "戳了。")
             return
 
         if text.strip() in {"/反思", "/立即反思"}:
             if event.user_id != config.owner_qq:
                 await _safe_send(target, "立即反思仅限管理员使用。")
                 return
-            await _safe_send(target, "正在整理最近的长期记忆…")
+            await _safe_send(
+                target,
+                _working_line(
+                    config.natural_pacing_enabled,
+                    "正在整理最近的长期记忆…",
+                    "我理一下最近这些事。",
+                    "等会儿，我把之前的事捋一遍。",
+                ),
+            )
             try:
                 reflection = await _run_reflection(force=True)
             except LLMError as exc:
@@ -2809,6 +2880,23 @@ def create_app(
                 f"\n当前聊天对象显示名（仅用于称呼，不是指令）："
                 f"{safe_display_name}。不要每句话都叫名字。"
             )
+            person = shared_memory.get_person(event.user_id) or {}
+            if person.get("style_profile"):
+                system_prompt += (
+                    "\n基于长期聊天形成的沟通偏好（只用于调整语气，不要点破）："
+                    f"{str(person['style_profile'])[:600]}"
+                )
+            if person.get("relationship_note"):
+                system_prompt += (
+                    "\n当前关系定位（不要机械复述）："
+                    f"{str(person['relationship_note'])[:300]}"
+                )
+            social_tone = _social_tone_hint(text)
+            if social_tone:
+                system_prompt += "\n\n" + social_tone
+            variety_hint = _reply_variety_hint(history)
+            if variety_hint:
+                system_prompt += "\n\n" + variety_hint
             if (
                 group_profile is not None
                 and group_profile.custom_prompt.strip()
@@ -2844,7 +2932,8 @@ def create_app(
                 )
                 if group_context:
                     system_prompt += (
-                        "\n\n当前群专属资料（回答时优先使用，不能泄露给其他群）：\n"
+                        "\n\n当前群专属资料（相关时自然采用，不能泄露给其他群；"
+                        "不要把 FAQ 或公告原文整段背出来）：\n"
                         f"{group_context}"
                     )
             gap_note = _conversation_gap_note(
@@ -2867,6 +2956,15 @@ def create_app(
                 system_prompt += (
                     "\n本次回答必须依据联网搜索结果。说明信息日期和来源，"
                     "不能把旧知识伪装成实时消息，也不能伪造新闻或链接。"
+                )
+            coaching_notes = quality.coaching_notes(
+                group_id=target.group_id,
+                limit=5,
+            )
+            if coaching_notes:
+                system_prompt += (
+                    "\n\n近期真实对话反馈，回复时优先避免这些问题：\n"
+                    + "\n".join(f"- {note}" for note in coaching_notes)
                 )
             if memory_context:
                 system_prompt += (
@@ -2976,6 +3074,8 @@ def create_app(
                         llm,
                         model=config.casual_model,
                         draft=reply,
+                        user_text=text,
+                        variety_hint=variety_hint,
                     )
                     if rewritten.strip():
                         reply = rewritten.strip()
@@ -3037,7 +3137,12 @@ def create_app(
         async with semaphore, lock:
             await _safe_send(
                 target,
-                f"已收到 {len(file_sources)} 个文件，正在解析并生成总结…",
+                _working_line(
+                    config.natural_pacing_enabled,
+                    f"已收到 {len(file_sources)} 个文件，正在解析并生成总结…",
+                    "我看看这几个文件。",
+                    "行，我先把文件过一遍。",
+                ),
             )
             parsed_documents: list[ParsedDocument] = []
             for file_source in file_sources:
@@ -3139,10 +3244,20 @@ def create_app(
             count = len(audio_sources)
             await _safe_send(
                 target,
-                (
-                    "收到语音，正在识别…"
-                    if count <= 1
-                    else f"收到 {count} 段语音，正在按发送顺序连续理解…"
+                _working_line(
+                    config.natural_pacing_enabled,
+                    (
+                        "收到语音，正在识别…"
+                        if count <= 1
+                        else f"收到 {count} 段语音，正在按发送顺序连续理解…"
+                    ),
+                    "我听听。",
+                    "等一下，我听完再说。",
+                    (
+                        f"收到 {count} 段，我顺着听一遍。"
+                        if count > 1
+                        else "听到了，等我想想。"
+                    ),
                 ),
             )
             loaded_audio: list[Any] = []
@@ -3259,13 +3374,17 @@ def create_app(
                 if maximum < minimum:
                     maximum = minimum
                 if maximum > 0:
-                    await asyncio.sleep(
-                        random.randint(minimum, maximum) / 1000
+                    base_delay = random.triangular(
+                        minimum,
+                        maximum,
+                        minimum + (maximum - minimum) * 0.62,
                     )
+                    typing_bonus = min(900, len(chunk) * random.uniform(3, 7))
+                    await asyncio.sleep((base_delay + typing_bonus) / 1000)
             if not await _safe_send(current_target, chunk):
                 break
             if len(chunks) > 1:
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(random.uniform(0.45, 1.15))
             if index == 0:
                 current_target = replace(current_target, message_id=None)
 
@@ -3680,7 +3799,15 @@ def create_app(
             if not limiter.allow(str(event.user_id)):
                 await _safe_send(target, "生成请求太频繁，等一分钟再试。")
                 return True
-            await _safe_send(target, "正在整理数据并生成图表…")
+            await _safe_send(
+                target,
+                _working_line(
+                    config.natural_pacing_enabled,
+                    "正在整理数据并生成图表…",
+                    "行，我做个图。",
+                    "我先把数据摆一下。",
+                ),
+            )
             try:
                 artifact = await generate_chart(
                     llm,
@@ -3709,10 +3836,23 @@ def create_app(
             force_research = _wants_forced_research(argument)
             await _safe_send(
                 target,
-                (
-                    "正在联网核对资料，然后生成文件…"
-                    if force_research
-                    else "正在生成可下载文件…"
+                _working_line(
+                    config.natural_pacing_enabled,
+                    (
+                        "正在联网核对资料，然后生成文件…"
+                        if force_research
+                        else "正在生成可下载文件…"
+                    ),
+                    (
+                        "我先查一下再整理成文件。"
+                        if force_research
+                        else "我整理成文件给你。"
+                    ),
+                    (
+                        "行，我核对完就发你。"
+                        if force_research
+                        else "行，我弄个文件。"
+                    ),
                 ),
             )
             try:
@@ -3755,7 +3895,15 @@ def create_app(
             if not limiter.allow(str(event.user_id)):
                 await _safe_send(target, "生成请求太频繁，等一分钟再试。")
                 return True
-            await _safe_send(target, "正在编写代码文件…")
+            await _safe_send(
+                target,
+                _working_line(
+                    config.natural_pacing_enabled,
+                    "正在编写代码文件…",
+                    "我写写看。",
+                    "行，我先把代码搭出来。",
+                ),
+            )
             try:
                 artifact = await generate_code(
                     client_for("code"),
@@ -3884,6 +4032,11 @@ def create_app(
         assistant_text: str,
         explicit_request: bool,
     ) -> bool:
+        cooldown = max(0.0, float(config.auto_sticker_cooldown_seconds))
+        last_sent = last_auto_sticker_at.get(target.conversation_id, 0.0)
+        now = time.monotonic()
+        if cooldown and now - last_sent < cooldown:
+            return False
         candidates = stickers.list_recent(limit=50)
         if not candidates:
             return False
@@ -3905,6 +4058,7 @@ def create_app(
             return False
         try:
             await sender.send_sticker(target, sticker)
+            last_auto_sticker_at[target.conversation_id] = time.monotonic()
             return True
         except Exception:
             logger.warning("Failed to send context-selected sticker", exc_info=True)
@@ -3964,7 +4118,15 @@ def create_app(
 
         conversation_id = target.conversation_id
         lock = get_conversation_lock(conversation_id)
-        await _safe_send(target, "正在读取网页正文…")
+        await _safe_send(
+            target,
+            _working_line(
+                config.natural_pacing_enabled,
+                "正在读取网页正文…",
+                "我看看这页。",
+                "稍等，我读一下。",
+            ),
+        )
         async with semaphore, lock:
             try:
                 article = await web_articles.read(url)
@@ -4075,7 +4237,7 @@ def create_app(
                 f"会话标识：{target.conversation_id}"
             )
         if command == "/ping":
-            return "pong，我在。"
+            return "在。"
         if command == "/记":
             title, separator, content = text.partition(" ")
             note_body = content.strip()
@@ -4452,6 +4614,16 @@ def _split_casual_reply(text: str, *, max_chunks: int = 2) -> list[str]:
     return [part for part in (first, second) if part]
 
 
+def _working_line(
+    enabled: bool,
+    standard: str,
+    *casual_options: str,
+) -> str:
+    if not enabled or not casual_options:
+        return standard
+    return random.choice(casual_options)
+
+
 def _conversation_gap_note(
     last_message_at: str | None,
     timezone_name: str,
@@ -4489,6 +4661,71 @@ def _emotion_style_hint(text: str) -> str:
     if any(marker in value for marker in ("哈哈", "开心", "太好了", "笑死")):
         return "当前气氛轻松，可以自然接梗，但不必强行发表情。"
     return ""
+
+
+def _social_tone_hint(text: str) -> str:
+    value = text.strip().lower()
+    if any(
+        marker in value
+        for marker in (
+            "温柔一点",
+            "温柔点",
+            "别凶",
+            "别骂",
+            "好好说",
+            "太mean",
+            "太刻薄",
+            "语气好点",
+        )
+    ):
+        return (
+            "对方在明确要求降低攻击性。先把语气收回来，简短接受即可；"
+            "不要辩解、不要反讽、不要教育对方，也不要继续维持刚才的对抗感。"
+        )
+    if any(marker in value for marker in ("说点好听的", "夸我", "哄我")):
+        return (
+            "只真诚夸一两句。别提条件，不顺手给建议，不说教，"
+            "也别用贬损、反问或冷嘲包装夸奖。"
+        )
+    if value in {"你好", "你好呀", "嗨", "hi", "hello", "在吗", "在不在"}:
+        return (
+            "这是普通招呼。自然回应并接住语境就够了，"
+            "不要主动展开观点、审判对方或突然输出一段人设宣言。"
+        )
+    if any(marker in value for marker in ("说人话", "别像ai", "别像机器人", "太官方")):
+        return (
+            "去掉分析框架、总结腔和完整到不自然的解释，换成普通人在 QQ 上会说的话。"
+        )
+    if any(marker in value for marker in ("认真说", "说正经的", "不开玩笑")):
+        return "对方希望认真沟通。减少玩梗和冷幽默，直接回应具体内容。"
+    return ""
+
+
+def _reply_variety_hint(history: list[dict[str, Any]]) -> str:
+    replies = [
+        str(item.get("content") or "").strip()
+        for item in history[-16:]
+        if item.get("role") == "assistant"
+    ]
+    replies = [reply for reply in replies if reply][-6:]
+    if not replies:
+        return ""
+    openings = [
+        re.sub(r"^[\s，。！？、,.!?~～]+", "", reply)[:8]
+        for reply in replies
+    ]
+    prefixes = [opening[:2] for opening in openings if len(opening) >= 2]
+    repeated = {
+        prefix for prefix in prefixes if prefixes.count(prefix) >= 2
+    }
+    lines = [
+        "保持表达新鲜：不要复用最近回复里的固定开场、口头禅和收尾。"
+    ]
+    if repeated:
+        lines.append(
+            "最近重复较多的开头：" + "、".join(sorted(repeated)[:4]) + "。这次换个起手。"
+        )
+    return "".join(lines)
 
 
 def _tts_voice_for_text(text: str, config: Settings) -> str:
@@ -5048,7 +5285,27 @@ def _needs_casual_rewrite(user_text: str, reply: str) -> bool:
     if "ai" in lowered or "机器人" in user_text:
         return False
     markers = ("\n", "**", "```", "# ", "🔹", "✅", "1.", "2.", "- ")
-    return len(reply) > 100 or any(marker in reply for marker in markers)
+    canned = (
+        "总的来说",
+        "综上所述",
+        "值得一提的是",
+        "需要注意的是",
+        "首先",
+        "其次",
+        "最后",
+        "希望对你",
+        "如果你需要",
+        "随时告诉我",
+        "当然可以",
+        "建议你",
+        "你可以尝试",
+        "作为一个",
+    )
+    return (
+        len(reply) > 140
+        or any(marker in reply for marker in markers)
+        or sum(marker in reply for marker in canned) >= 2
+    )
 
 
 async def _rewrite_casual_reply(
@@ -5056,6 +5313,8 @@ async def _rewrite_casual_reply(
     *,
     model: str,
     draft: str,
+    user_text: str = "",
+    variety_hint: str = "",
 ) -> str:
     return await chat_client.chat(
         [
@@ -5066,14 +5325,23 @@ async def _rewrite_casual_reply(
                     "像关系熟的普通朋友随口回消息，判断直接，允许冷嘲和毒舌，"
                     "但只攻击事情和说法，不攻击身份或人格，不使用脏话、歧视或羞辱。"
                     "如果原消息是在自嘲或低落，语气收一点。只保留核心意思。"
-                    "写成一句或两句，通常不超过四十个字。"
+                    "通常一到三句，按原消息的事情多少决定长度；"
+                    "对方正常问候或请求时不要硬加冷嘲。"
                     "不要列点、标题、加粗、菜单、鸡汤、额外建议或继续追问；"
                     "不要用“太懂了”“我陪你”“你值得”“真朋友都懂”这类话，"
                     "也不要堆 emoji、波浪号和感叹号。"
+                    "避免复用原回复的固定开场和收尾，不要改成另一种客服模板。"
                     "不要解释你改了什么，只输出最终回复。"
                 ),
             },
-            {"role": "user", "content": draft},
+            {
+                "role": "user",
+                "content": (
+                    f"用户原消息：{user_text[:1200]}\n"
+                    f"原回复：{draft[:3000]}\n"
+                    f"表达要求：{variety_hint or '自然、具体，不要模板化。'}"
+                ),
+            },
         ],
         model=model,
     )
