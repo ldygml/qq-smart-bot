@@ -8,6 +8,7 @@ import logging
 import random
 import re
 import time
+import unicodedata
 from collections import OrderedDict, deque
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
@@ -203,6 +204,13 @@ TASK_HINTS = (
     "文件",
     "文档",
     "资料",
+    "题目",
+    "做题",
+    "这道题",
+    "那道题",
+    "习题",
+    "解答",
+    "算一下",
 )
 GROUP_SETTING_SPECS = {
     "enable_group": ("enable_group", "bool"),
@@ -1477,6 +1485,19 @@ def create_app(
                         "reason": "群聊参与判断认为不需要插话",
                         "reply": "",
                     }
+        social_reply = _social_only_reply(text)
+        if social_reply is not None:
+            return {
+                "ok": True,
+                "status": "replied",
+                "reason": "",
+                "reply": social_reply,
+                "model": "local-social",
+                "strategy": "baseline",
+                "memory_count": 0,
+                "topic_count": 0,
+                "latency_ms": 0,
+            }
         raw_history = payload.get("history")
         history: list[dict[str, str]] = []
         if isinstance(raw_history, list):
@@ -1499,6 +1520,15 @@ def create_app(
             f"\n\n当前时间：{datetime.now(ZoneInfo(config.timezone)):%Y-%m-%d %H:%M}。"
             f"\n当前聊天对象显示名：{display_name}。不要每句话都叫名字。"
         )
+        social_tone = _social_tone_hint(text)
+        if social_tone:
+            system_prompt += "\n" + social_tone
+        emotion_note = _emotion_style_hint(text)
+        if emotion_note:
+            system_prompt += "\n" + emotion_note
+        variety_hint = _reply_variety_hint(history)
+        if variety_hint:
+            system_prompt += "\n" + variety_hint
         if group_profile is not None and group_profile.custom_prompt.strip():
             system_prompt += (
                 "\n当前群专属规则："
@@ -3469,6 +3499,11 @@ def create_app(
                 trace.skip("表情库为空或自动表情已关闭")
             return
 
+        social_reply = _social_only_reply(text)
+        if social_reply is not None:
+            await _safe_send(target, social_reply)
+            return
+
         poke_text = text.strip()
         if _is_poke_command_text(poke_text):
             if (
@@ -3905,6 +3940,7 @@ def create_app(
             if not reply:
                 await _safe_send(target, "模型这次没有生成可用回复，请换个问法试试。")
                 return
+            reply = _clean_model_reply(reply)
             if (
                 not is_task_request
                 and not loaded_images
@@ -5560,6 +5596,26 @@ def _social_tone_hint(text: str) -> str:
             "只真诚夸一两句。别提条件，不顺手给建议，不说教，"
             "也别用贬损、反问或冷嘲包装夸奖。"
         )
+    invitation_markers = (
+        "吃",
+        "去",
+        "来",
+        "一起",
+        "烧烤",
+        "火锅",
+        "奶茶",
+        "看电影",
+        "打球",
+    )
+    if (
+        len(value) <= 18
+        and any(marker in value for marker in invitation_markers)
+        and value.rstrip("？?。.!！").endswith(("不", "吗", "么", "嘛"))
+    ):
+        return (
+            "这更像轻松邀约或试探。用一到两句自然接住，不要分析饭点、日程或是否值得去，"
+            "不要突然扯到无关的旧任务；可以 playful，但不要假装已经真的在线下赴约。"
+        )
     if value in {"你好", "你好呀", "嗨", "hi", "hello", "在吗", "在不在"}:
         return (
             "这是普通招呼。自然回应并接住语境就够了，"
@@ -5572,6 +5628,37 @@ def _social_tone_hint(text: str) -> str:
     if any(marker in value for marker in ("认真说", "说正经的", "不开玩笑")):
         return "对方希望认真沟通。减少玩梗和冷幽默，直接回应具体内容。"
     return ""
+
+
+def _social_only_reply(text: str) -> str | None:
+    value = re.sub(r"\s+", "", text.strip().lower())
+    compact = re.sub(r"[\W_]+", "", value, flags=re.UNICODE)
+    if value and all(
+        unicodedata.category(char).startswith(("So", "Sk"))
+        or char in "，。！？!?,.~～"
+        or char == "\ufe0f"
+        for char in value
+    ):
+        if any(char in value for char in ("👍", "👌", "👏", "🙏", "✅")):
+            return "嗯。"
+        return "？"
+    if compact in {
+        "ok",
+        "okay",
+        "嗯",
+        "嗯嗯",
+        "好",
+        "好的",
+        "行",
+        "收到",
+        "可以",
+    }:
+        return "嗯。"
+    if compact in {"在吗", "在不在"}:
+        return "在。"
+    if compact in {"你在干嘛", "你干嘛呢", "在干嘛", "干嘛呢"}:
+        return "没干嘛。你呢？"
+    return None
 
 
 def _reply_variety_hint(history: list[dict[str, Any]]) -> str:
@@ -6068,7 +6155,14 @@ def _looks_like_task_request(text: str) -> bool:
     value = text.strip()
     if value.startswith("/"):
         return True
-    return any(hint in value for hint in TASK_HINTS)
+    return any(hint in value for hint in TASK_HINTS) or bool(
+        re.search(
+            r"第\s*[一二三四五六七八九十百\d]+\s*题"
+            r"|(?:做|写|完成).{0,4}作业"
+            r"|作业.{0,8}(?:题|答案|不会|怎么|帮我)",
+            value,
+        )
+    )
 
 
 def _needs_web_search(text: str) -> bool:
@@ -6179,6 +6273,24 @@ def _needs_casual_rewrite(user_text: str, reply: str) -> bool:
         or any(marker in reply for marker in markers)
         or sum(marker in reply for marker in canned) >= 2
     )
+
+
+def _clean_model_reply(reply: str) -> str:
+    value = reply.strip()
+    value = re.sub(
+        r"(?m)^\s*(?:自然回应|正式回复|回复|回答)\s*[：:]\s*",
+        "",
+        value,
+    )
+    value = re.sub(
+        r"^\s*(?:关键内容|我看到|画面内容)\s*[：:]\s*",
+        "",
+        value,
+    )
+    value = value.replace("•", "-")
+    value = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
 
 
 async def _rewrite_casual_reply(
