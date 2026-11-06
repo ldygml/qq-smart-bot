@@ -33,6 +33,24 @@ def test_quality_store_marks_follow_up_and_correction(tmp_path) -> None:
     item = store.list_recent()[0]
     assert item["status"] == "corrected"
     assert "user_corrected" in item["issues"]
+    second = store.record(
+        conversation_id="private:2",
+        user_id=2,
+        group_id=None,
+        user_text="问题",
+        assistant_text="语气太凶的回复",
+        model="model",
+    )
+    store.mark_review(
+        second,
+        score=0.3,
+        issues=["overdone_edge"],
+        notes="",
+    )
+    store.mark_follow_up("private:2", "我还有另一个问题")
+    reviewed = store.list_recent()[0]
+    assert reviewed["status"] == "follow_up"
+    assert "overdone_edge" in reviewed["issues"]
 
 
 def test_quality_store_turns_reviews_into_scoped_coaching(tmp_path) -> None:
@@ -66,8 +84,12 @@ def test_quality_store_turns_reviews_into_scoped_coaching(tmp_path) -> None:
         notes="按群里当前话题回答。",
     )
 
-    assert store.coaching_notes(group_id=None) == ["普通问候不要冷嘲。"]
-    assert store.coaching_notes(group_id=2) == ["按群里当前话题回答。"]
+    assert store.coaching_notes(group_id=None) == [
+        "正常聊天不要为了显得有性格而冷嘲或攻击。"
+    ]
+    assert store.coaching_notes(group_id=2) == [
+        "先直接回答当前问题，不要绕去别的话题。"
+    ]
 
 
 def test_legacy_reviews_are_cleared_before_style_recoaching(tmp_path) -> None:
