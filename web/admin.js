@@ -541,8 +541,9 @@ async function loadStickers() {
   $("#sticker-list").innerHTML = data.stickers.length
     ? data.stickers.map((item) => `
       <article class="sticker">
-        <div class="sticker-preview">${item.image_source ? `<img src="${esc(item.image_source)}" alt="${esc(item.summary)}" loading="lazy">` : `<span>${esc(item.summary)}</span>`}</div>
+        <div class="sticker-preview">${item.asset_url || item.image_source ? `<img src="${esc(item.asset_url || item.image_source)}" alt="${esc(item.summary)}" loading="lazy">` : `<span>${esc(item.summary)}</span>`}</div>
         <strong>${esc(item.summary)}</strong>
+        <div class="row-meta">${item.has_local_asset ? "本地文件已保存" : (item.asset_error ? "保存失败，可稍后补齐" : "等待补存图片")}</div>
         <div class="row-meta">emoji ${esc(item.emoji_id || "-")} · 使用 ${esc(item.use_count)} 次</div>
         <div class="row-meta">${(item.tags || []).map((tag) => `#${esc(tag)}`).join(" ") || "暂无识别标签"}</div>
         <label>分类<input data-sticker-category="${item.id}" value="${esc(item.category || "未分类")}"></label>
@@ -553,6 +554,22 @@ async function loadStickers() {
     : `<div class="empty">表情库为空。先让别人给机器人发几个表情包。</div>`;
   bindStickerActions();
 }
+
+$("#repair-sticker-assets").addEventListener("click", async () => {
+  const button = $("#repair-sticker-assets");
+  button.disabled = true;
+  button.textContent = "正在补存…";
+  try {
+    const data = await api("/api/admin/stickers/repair-assets", {method:"POST"});
+    alert(`检查 ${data.candidates} 个表情，成功补存 ${data.repaired} 个，失败 ${data.failed} 个。`);
+    await loadStickers();
+  } catch (error) {
+    alert(`补存失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = "补齐本地表情图片";
+  }
+});
 
 $("#organize-stickers").addEventListener("click", async () => {
   const button = $("#organize-stickers");
@@ -1043,6 +1060,9 @@ $("#save-group-settings").addEventListener("click", async () => {
       group_allowlist: $("#group-allowlist").value.trim(),
       group_trigger_prefixes: $("#group-prefixes").value.trim(),
     });
+    if ($("#apply-group-settings-all").checked) {
+      await api("/api/admin/group-settings/apply-to-all", {method:"POST"});
+    }
     renderGroupSettings(data.settings);
     status.textContent = "设置已保存并立即生效。";
   } catch (error) {

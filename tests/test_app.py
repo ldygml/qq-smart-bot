@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -28,7 +29,7 @@ from qq_ai_bot.onebot import ReplyTarget, StickerSource
 from qq_ai_bot.productivity import ProductivityStore
 from qq_ai_bot.quality import QualityStore
 from qq_ai_bot.shared_memory import SharedMemoryStore
-from qq_ai_bot.stickers import StickerStore
+from qq_ai_bot.stickers import StickerAssetStore, StickerStore
 from qq_ai_bot.topics import TopicCandidate, TopicStore
 from qq_ai_bot.tracing import MessageTraceStore
 from qq_ai_bot.vector_memory import VectorMemoryStore
@@ -265,6 +266,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
         "private_allowlist": "",
         "enable_group": False,
         "vector_memory_enabled": False,
+          "sticker_download_enabled": False,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -1803,6 +1805,62 @@ async def test_auto_sticker_respects_per_conversation_cooldown(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_casual_reply_can_trigger_contextual_sticker_without_keywords(
+    tmp_path,
+) -> None:
+    sender = FakeOneBotClient()
+    sticker_store = StickerStore(tmp_path / "stickers.db")
+    sticker_store.record(
+        StickerSource(
+            summary="安慰",
+            emoji_id="sticker-1",
+            emoji_package_id="pack-1",
+            key="sticker-key",
+        )
+    )
+    decider = FakeStickerDecider(1)
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            auto_sticker_enabled=True,
+            auto_sticker_cooldown_seconds=0,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        sticker_store=sticker_store,
+        sticker_choice_decider=decider,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2305,
+                "message": "最近工作有点累",
+            },
+        )
+        await _wait_for_condition(
+            lambda: bool(sender.sent and sender.stickers),
+            timeout=5.0,
+        )
+
+    assert decider.calls == 1
+    assert decider.last_kwargs["explicit_request"] is False
+    assert sender.stickers[0][1].summary == "安慰"
+
+
+@pytest.mark.asyncio
 async def test_current_news_request_enables_web_search(
     tmp_path,
     monkeypatch,
@@ -2150,6 +2208,143 @@ async def test_image_only_animation_sticker_is_collected_and_organized(
     assert metadata is not None
     assert metadata["category"] == "无语"
     assert metadata["usage_hint"]
+
+
+@pytest.mark.asyncio
+async def test_incoming_sticker_is_saved_locally_and_previewed(
+    tmp_path,
+) -> None:
+    gif_bytes = b"GIF89a" + b"\x00" * 32
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/sticker.gif"
+        return httpx.Response(
+            200,
+            content=gif_bytes,
+            headers={"content-type": "image/gif"},
+        )
+
+    asset_store = StickerAssetStore(
+        tmp_path / "sticker-assets",
+        transport=httpx.MockTransport(handler),
+    )
+    sticker_store = StickerStore(
+        tmp_path / "stickers.db",
+        asset_dir=asset_store.asset_dir,
+    )
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            sticker_download_enabled=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        sticker_store=sticker_store,
+        sticker_asset_store=asset_store,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2760,
+                "message": [
+                    {
+                        "type": "image",
+                        "data": {
+                            "sub_type": "1",
+                            "summary": "开心",
+                            "url": "https://example.com/sticker.gif",
+                        },
+                    }
+                ],
+            },
+        )
+        await _wait_for_condition(
+            lambda: bool(
+                sticker_store.list_recent()[0].get("has_local_asset")
+            )
+        )
+        sticker_id = int(sticker_store.list_recent()[0]["id"])
+        preview = await client.get(
+            f"/api/admin/stickers/{sticker_id}/asset"
+        )
+
+    assert preview.status_code == 200
+    assert preview.content == gif_bytes
+    sticker = sticker_store.get_by_id(sticker_id)
+    assert sticker is not None
+    assert Path(sticker.local_path).is_file()
+    assert Path(sticker.local_path).read_bytes() == gif_bytes
+    assert sticker.mime_type == "image/gif"
+
+
+@pytest.mark.asyncio
+async def test_existing_sticker_assets_can_be_repaired_from_admin(
+    tmp_path,
+) -> None:
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=png_bytes,
+            headers={"content-type": "image/png"},
+        )
+
+    asset_store = StickerAssetStore(
+        tmp_path / "assets",
+        transport=httpx.MockTransport(handler),
+    )
+    sticker_store = StickerStore(
+        tmp_path / "stickers.db",
+        asset_dir=asset_store.asset_dir,
+    )
+    sticker_store.record(
+        StickerSource(
+            summary="旧表情",
+            image_source="https://example.com/old.png",
+        )
+    )
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            sticker_download_enabled=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        sticker_store=sticker_store,
+        sticker_asset_store=asset_store,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = await client.post(
+            "/api/admin/stickers/repair-assets"
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["candidates"] == 1
+    assert payload["repaired"] == 1
+    assert payload["stickers"][0]["has_local_asset"] is True
+    assert Path(payload["stickers"][0]["local_path"]).is_file()
 
 
 @pytest.mark.asyncio

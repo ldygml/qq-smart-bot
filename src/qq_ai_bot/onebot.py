@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -65,6 +66,10 @@ class StickerSource:
     emoji_package_id: str = ""
     key: str = ""
     image_source: str = ""
+    local_path: str = ""
+    asset_sha256: str = ""
+    mime_type: str = ""
+    asset_verified_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -171,30 +176,82 @@ class OneBotClient:
         target: ReplyTarget,
         sticker: StickerSource,
     ) -> None:
-        if (
-            sticker.image_source
-            and not sticker.emoji_id
-            and not sticker.emoji_package_id
-            and not sticker.key
-        ):
-            await self._send_segment(
+        local_path = (
+            Path(sticker.local_path)
+            if sticker.local_path and Path(sticker.local_path).is_file()
+            else None
+        )
+        send_error: OneBotError | None = None
+        if local_path is not None:
+            try:
+                await self._send_sticker_image(
+                    target,
+                    str(local_path),
+                    sticker.summary,
+                )
+                return
+            except OneBotError as exc:
+                send_error = exc
+                logger.warning(
+                    "Saved sticker image could not be sent; trying original "
+                    "OneBot metadata",
+                    exc_info=True,
+                )
+
+        has_mface_metadata = bool(
+            sticker.emoji_id or sticker.emoji_package_id or sticker.key
+        )
+        if has_mface_metadata:
+            data: dict[str, Any] = {"summary": sticker.summary}
+            if sticker.emoji_id:
+                data["emoji_id"] = sticker.emoji_id
+            if sticker.emoji_package_id:
+                data["emoji_package_id"] = sticker.emoji_package_id
+            if sticker.key:
+                data["key"] = sticker.key
+            try:
+                await self._send_segment(target, "mface", data)
+                return
+            except OneBotError as exc:
+                send_error = exc
+                if not sticker.image_source and local_path is None:
+                    raise
+                logger.warning(
+                    "Original mface metadata failed; falling back to the "
+                    "collected image source",
+                    exc_info=True,
+                )
+
+        if sticker.image_source:
+            await self._send_sticker_image(
                 target,
-                "image",
-                {
-                    "file": sticker.image_source,
-                    "sub_type": 1,
-                    "summary": sticker.summary,
-                },
+                sticker.image_source,
+                sticker.summary,
             )
             return
-        data: dict[str, Any] = {"summary": sticker.summary}
-        if sticker.emoji_id:
-            data["emoji_id"] = sticker.emoji_id
-        if sticker.emoji_package_id:
-            data["emoji_package_id"] = sticker.emoji_package_id
-        if sticker.key:
-            data["key"] = sticker.key
-        await self._send_segment(target, "mface", data)
+
+        if send_error is not None:
+            raise OneBotError(
+                f"Sticker was collected but every send method failed: "
+                f"{send_error}"
+            ) from send_error
+        raise OneBotError("Sticker has no sendable image or mface metadata")
+
+    async def _send_sticker_image(
+        self,
+        target: ReplyTarget,
+        source: str,
+        summary: str,
+    ) -> None:
+        await self._send_segment(
+            target,
+            "image",
+            {
+                "file": source,
+                "sub_type": 1,
+                "summary": summary,
+            },
+        )
 
     async def upload_file(
         self,

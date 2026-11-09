@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     auto_sticker_enabled: bool = True
     sticker_model: str = "qwen3.8-flash"
     sticker_min_confidence: float = 0.7
+    sticker_download_enabled: bool = True
+    sticker_asset_dir: Path = Path("data/sticker_assets")
+    sticker_download_timeout_seconds: float = 45.0
     admin_web_enabled: bool = True
     shared_memory_enabled: bool = False
     memory_model: str = "qwen3.8-flash"
@@ -97,7 +100,7 @@ class Settings(BaseSettings):
     group_trigger_prefixes: str = "/ai,/问"
     group_smart_participation: bool = True
     group_participation_model: str = "qwen3.8-flash"
-    group_min_reply_confidence: float = 0.65
+    group_min_reply_confidence: float = 0.58
     group_reply_cooldown_seconds: float = 90.0
     group_behavior_learning: bool = True
     group_poke_policy: str = "allow"

@@ -90,7 +90,8 @@ AI 聊天机器人。它不是单纯的关键词回复脚本，而是一套包�
 
 - 私聊可直接自然语言对话。
 - 群聊支持“必须 @”和“免 @ 智能参与”。
-- 智能参与会跳过寒暄、感谢、短确认、群友互相聊天和没有补充价值的话题。
+- 智能参与会像正常群友一样偶尔接话，支持自然接梗、补充观点、纠错和大家讨论的问题；同时跳过寒暄、短确认、已经聊完或明显不适合插话的内容。
+- 明确问题不会被群聊参与模型误杀；模型超时或返回异常时，会用本地问题识别规则兜底。
 - 可以识别 @、引用机器人消息、机器人名字、触发前缀和明确任务请求。
 - 支持每个群独立配置，不会把一个群的策略套到另一个群。
 - 每个群可以设置独立模型、冷却时间、每小时回复上限、最低置信度和专属提示词。
@@ -151,7 +152,9 @@ AI 聊天机器人。它不是单纯的关键词回复脚本，而是一套包�
 ### 8. 表情包
 
 - 收到 QQ 商城表情、`mface` 或 `sub_type=1` 的图片型动画表情时会自动收藏。
-- 即使 NapCat 没有提供 `emoji_id/key`，也会用图片地址生成唯一收藏标识。
+- 收到表情后会立即下载 PNG、JPG、GIF、WebP 或 BMP 原始文件，保存到 `data/sticker_assets/`，不再只记录会过期的 QQ 临时链接。
+- 文件按 SHA-256 去重并保留动画帧；发送时优先使用本地文件，mface 元数据发送失败会自动回退到已保存图片。
+- 后台“表情包”页可以直接预览本地文件，并用“补齐本地表情图片”把旧收藏重新落盘。
 - 新表情会在后台自动生成分类和适用场景；后台也提供“自动整理未分类表情”。
 - 不把表情包误判为普通题目图片。
 - 自动用视觉模型识别画面、文字和梗，并生成“无语、嘲讽、庆祝”等标签。
@@ -903,6 +906,9 @@ todo_web.zip
 | `TTS_RATE` | `1.0` | 可配置语速 |
 | `MAX_TTS_CHARS` | `800` | 单次 TTS 字符数 |
 | `GENERATED_MEDIA_DIR` | `data/generated` | 生成文件目录 |
+| `STICKER_DOWNLOAD_ENABLED` | `true` | 收到表情包后保存原始图片文件 |
+| `STICKER_ASSET_DIR` | `data/sticker_assets` | 表情包本地文件目录 |
+| `STICKER_DOWNLOAD_TIMEOUT_SECONDS` | `45` | 下载表情图片的超时秒数 |
 | `AUTO_STICKER_COOLDOWN_SECONDS` | `180` | 同一会话自动发表情的最小间隔 |
 
 ### 记忆与反思
@@ -931,7 +937,7 @@ todo_web.zip
 | `GROUP_TRIGGER_PREFIXES` | `/ai,/问` | 全局触发前缀 |
 | `GROUP_SMART_PARTICIPATION` | `true` | 智能参与 |
 | `GROUP_PARTICIPATION_MODEL` | `qwen3.8-flash` | 参与判断模型 |
-| `GROUP_MIN_REPLY_CONFIDENCE` | `0.65` | 最低回复置信度 |
+| `GROUP_MIN_REPLY_CONFIDENCE` | `0.58` | 最低回复置信度 |
 | `GROUP_REPLY_COOLDOWN_SECONDS` | `90` | 默认回复冷却 |
 | `GROUP_BEHAVIOR_LEARNING` | `true` | 学习群内沉默倾向 |
 | `GROUP_POKE_POLICY` | `allow` | 新群默认戳一戳策略 |
@@ -980,7 +986,8 @@ data/
 ├─ bot.db                机器人消息、记忆、表情、任务和用量
 ├─ control.db            控制台账号、供应商和实例配置
 ├─ instances/            多实例数据库（如果使用）
-└─ generated/            已生成的图表、文档和代码
+├─ generated/            已生成的图表、文档和代码
+└─ sticker_assets/       自动收藏并去重的表情包原始文件
 
 .runtime/
 ├─ control-master.key    控制台密钥加密主密钥

@@ -105,7 +105,7 @@ from .vector_memory import (
     VectorChunk,
     VectorMemoryStore,
 )
-from .stickers import StickerStore
+from .stickers import StickerAssetError, StickerAssetStore, StickerStore
 from .sticker_policy import (
     LLMStickerChoiceDecider,
     LLMStickerOrganizer,
@@ -275,6 +275,7 @@ def create_app(
     shared_memory_store: SharedMemoryStore | None = None,
     tts_client: TTSClient | None = None,
     sticker_store: StickerStore | None = None,
+    sticker_asset_store: StickerAssetStore | None = None,
     web_reader: WebArticleReader | None = None,
     embedding_client: EmbeddingClient | None = None,
     vector_store: VectorMemoryStore | None = None,
@@ -393,7 +394,20 @@ def create_app(
             timeout_seconds=config.llm_timeout_seconds,
             trust_env=config.llm_trust_env,
         )
-    stickers = sticker_store or StickerStore(config.database_path)
+    sticker_asset_dir = config.sticker_asset_dir
+    if not sticker_asset_dir.is_absolute():
+        sticker_asset_dir = Path.cwd() / sticker_asset_dir
+    if sticker_store is not None:
+        sticker_asset_dir = sticker_store.asset_dir
+    sticker_assets = sticker_asset_store or StickerAssetStore(
+        sticker_asset_dir,
+        timeout_seconds=config.sticker_download_timeout_seconds,
+        trust_env=True,
+    )
+    stickers = sticker_store or StickerStore(
+        config.database_path,
+        asset_dir=sticker_assets.asset_dir,
+    )
     web_articles = web_reader or WebArticleReader(
         timeout_seconds=config.web_reader_timeout_seconds,
         trust_env=config.llm_trust_env,
@@ -455,6 +469,7 @@ def create_app(
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
     conversation_locks: dict[str, asyncio.Lock] = {}
     background_tasks: set[asyncio.Task[Any]] = set()
+    sticker_asset_inflight: set[int] = set()
     sticker_organize_inflight: set[int] = set()
     last_poke_reply: dict[tuple[str, int, int], float] = {}
     last_auto_sticker_at: dict[str, float] = {}
@@ -507,6 +522,7 @@ def create_app(
             if embeddings is not None:
                 await embeddings.close()
             await tts.close()
+            await sticker_assets.close()
             await web_articles.close()
 
     app = FastAPI(
@@ -516,6 +532,8 @@ def create_app(
     )
     app.state.settings = config
     app.state.memory = store
+    app.state.stickers = stickers
+    app.state.sticker_assets = sticker_assets
 
     @app.middleware("http")
     async def protect_admin_routes(request: Request, call_next):
@@ -1135,7 +1153,61 @@ def create_app(
                 include_disabled=True,
             ),
             "categories": stickers.categories(),
+            "download_enabled": config.sticker_download_enabled,
         }
+
+    @app.post("/api/admin/stickers/repair-assets")
+    async def admin_repair_sticker_assets() -> dict[str, Any]:
+        candidates = stickers.list_repair_candidates(limit=200)
+        gate = asyncio.Semaphore(3)
+
+        async def repair(item: dict[str, object]) -> tuple[bool, str]:
+            async with gate:
+                source = str(item.get("image_source") or "")
+                if not source:
+                    return False, "缺少原始图片地址"
+                saved = await _persist_sticker_asset(
+                    int(item["id"]),
+                    source,
+                )
+                return saved, "" if saved else str(
+                    item.get("summary") or item["id"]
+                )
+
+        results = await asyncio.gather(
+            *(repair(item) for item in candidates)
+        )
+        repaired = sum(saved for saved, _ in results)
+        failed = [name for saved, name in results if not saved]
+        return {
+            "ok": True,
+            "candidates": len(candidates),
+            "repaired": repaired,
+            "failed": len(failed),
+            "failed_items": failed[:20],
+            "stickers": stickers.list_recent(
+                limit=100,
+                include_disabled=True,
+            ),
+        }
+
+    @app.get("/api/admin/stickers/{sticker_id}/asset")
+    async def admin_sticker_asset(sticker_id: int) -> Response:
+        path = stickers.local_asset_path(sticker_id)
+        if path is None or not sticker_assets.contains(path):
+            return JSONResponse(
+                {"detail": "sticker asset not found"},
+                status_code=404,
+            )
+        metadata = stickers.get_metadata(sticker_id) or {}
+        media_type = str(metadata.get("mime_type") or "") or None
+        return FileResponse(
+            path,
+            filename=path.name,
+            media_type=media_type,
+            content_disposition_type="inline",
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
 
     @app.post("/api/admin/stickers/organize")
     async def admin_organize_stickers() -> dict[str, Any]:
@@ -1785,6 +1857,38 @@ def create_app(
                 "settings": _group_settings_snapshot(config),
             }
         )
+
+    @app.post("/api/admin/group-settings/apply-to-all")
+    async def admin_apply_group_settings_to_all() -> dict[str, Any]:
+        defaults = _default_group_profile_values(config)
+        shared_keys = (
+            "require_mention",
+            "smart_participation",
+            "behavior_learning",
+            "min_reply_confidence",
+            "reply_cooldown_seconds",
+            "participation_model",
+            "trigger_prefixes",
+            "quote_replies",
+            "quote_counts_as_mention",
+            "avoid_last_word",
+        )
+        values = {key: defaults[key] for key in shared_keys}
+        groups = group_profiles.list_all()
+        updated = 0
+        for group in groups:
+            result = group_profiles.update(
+                int(group["group_id"]),
+                values=values,
+            )
+            if result is not None:
+                updated += 1
+        return {
+            "ok": True,
+            "updated": updated,
+            "settings": _group_settings_snapshot(config),
+            "groups": group_profiles.list_all(),
+        }
 
     group_names_loaded = False
     group_names_last_refresh = 0.0
@@ -2880,6 +2984,47 @@ def create_app(
                 "conflicts": harvest["conflicts"],
             }
 
+    async def _persist_sticker_asset(
+        sticker_id: int,
+        sticker_source: str,
+    ) -> bool:
+        try:
+            asset = await sticker_assets.persist(sticker_source)
+        except (StickerAssetError, OSError, httpx.HTTPError) as exc:
+            stickers.mark_asset_failed(sticker_id, str(exc))
+            logger.warning(
+                "Could not save sticker asset %s: %s",
+                sticker_id,
+                exc,
+            )
+            return False
+        return stickers.attach_asset(
+            sticker_id,
+            local_path=asset.path,
+            sha256=asset.sha256,
+            mime_type=asset.mime_type,
+        )
+
+    def _queue_sticker_asset(
+        sticker_id: int,
+        sticker_source: str,
+    ) -> None:
+        if not config.sticker_download_enabled or not sticker_source:
+            return
+        if sticker_id in sticker_asset_inflight:
+            return
+        sticker_asset_inflight.add(sticker_id)
+
+        async def collect() -> None:
+            try:
+                await _persist_sticker_asset(sticker_id, sticker_source)
+            finally:
+                sticker_asset_inflight.discard(sticker_id)
+
+        task = asyncio.create_task(collect())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
     def _queue_sticker_organization(
         sticker_id: int,
         *,
@@ -3310,6 +3455,7 @@ def create_app(
         for sticker in sticker_sources:
             sticker_id = stickers.record(sticker)
             if sticker_id is not None:
+                _queue_sticker_asset(sticker_id, sticker.image_source)
                 _queue_sticker_organization(
                     sticker_id,
                     summary=sticker.summary,
@@ -4134,10 +4280,7 @@ def create_app(
                 else config.auto_sticker_enabled
             )
             and stickers.count() > 0
-            and (
-                bool(sticker_sources)
-                or _has_sticker_context(text, reply)
-            )
+            and not is_task_request
         ):
             await _maybe_send_sticker(
                 target=target,

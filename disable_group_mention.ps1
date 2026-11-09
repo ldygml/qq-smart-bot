@@ -46,6 +46,20 @@ if (-not (Test-Path -LiteralPath $envPath)) {
 
 $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
 $content = [System.IO.File]::ReadAllText($envPath, $strictUtf8)
+$adminToken = [regex]::Match(
+    $content,
+    "(?m)^ADMIN_API_TOKEN=(.+)$"
+).Groups[1].Value.Trim()
+if (-not $adminToken) {
+    $adminToken = [regex]::Match(
+        $content,
+        "(?m)^ONEBOT_TOKEN=(.+)$"
+    ).Groups[1].Value.Trim()
+}
+$adminHeaders = @{}
+if ($adminToken) {
+    $adminHeaders["X-Bot-Admin-Token"] = $adminToken
+}
 $content = Set-EnvValue -Content $content -Name "ENABLE_GROUP" -Value "true"
 $content = Set-EnvValue -Content $content -Name "GROUP_REQUIRE_MENTION" -Value "false"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -110,12 +124,14 @@ $groupSettingsBody = @{
 Invoke-RestMethod `
     -Uri "http://127.0.0.1:8080/api/admin/group-settings" `
     -Method Patch `
+    -Headers $adminHeaders `
     -ContentType "application/json; charset=utf-8" `
     -Body ([System.Text.Encoding]::UTF8.GetBytes($groupSettingsBody)) `
     -TimeoutSec 10 | Out-Null
 
 $profiles = Invoke-RestMethod `
     -Uri "http://127.0.0.1:8080/api/admin/group-profiles" `
+    -Headers $adminHeaders `
     -TimeoutSec 10
 foreach ($group in @($profiles.groups)) {
     $profileBody = @{
@@ -126,6 +142,7 @@ foreach ($group in @($profiles.groups)) {
     Invoke-RestMethod `
         -Uri "http://127.0.0.1:8080/api/admin/group-profiles/$($group.group_id)" `
         -Method Patch `
+        -Headers $adminHeaders `
         -ContentType "application/json; charset=utf-8" `
         -Body ([System.Text.Encoding]::UTF8.GetBytes($profileBody)) `
         -TimeoutSec 10 | Out-Null
@@ -134,11 +151,17 @@ foreach ($group in @($profiles.groups)) {
 $health = Invoke-RestMethod -Uri "http://127.0.0.1:8080/healthz" -TimeoutSec 5
 $profiles = Invoke-RestMethod `
     -Uri "http://127.0.0.1:8080/api/admin/group-profiles" `
+    -Headers $adminHeaders `
     -TimeoutSec 10
 if (
     -not $health.group_enabled -or
     $health.group_require_mention -or
-    @($profiles.groups | Where-Object { $_.require_mention }).Count -gt 0
+    @(
+        $profiles.groups |
+            Where-Object {
+                $_.require_mention -or -not $_.smart_participation
+            }
+    ).Count -gt 0
 ) {
     throw "The new group configuration did not take effect for every group."
 }

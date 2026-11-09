@@ -213,6 +213,84 @@ async def test_image_only_sticker_is_sent_as_image_segment() -> None:
 
 
 @pytest.mark.asyncio
+async def test_saved_sticker_uses_local_file_instead_of_expired_url(
+    tmp_path,
+) -> None:
+    captured = {}
+    asset = tmp_path / "saved.gif"
+    asset.write_bytes(b"GIF89a" + b"\x00" * 16)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"status": "ok", "retcode": 0, "data": {"message_id": 1}},
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await client.send_sticker(
+            ReplyTarget("private", 123),
+            StickerSource(
+                summary="动画表情",
+                image_source="https://expired.example/sticker.gif",
+                local_path=str(asset),
+                emoji_id="abc",
+            ),
+        )
+    finally:
+        await client.close()
+
+    assert captured["message"][0]["type"] == "image"
+    assert captured["message"][0]["data"]["file"] == str(asset)
+    assert captured["message"][0]["data"]["sub_type"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mface_failure_falls_back_to_collected_remote_image() -> None:
+    segment_types = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        segment = payload["message"][0]
+        segment_types.append(segment["type"])
+        if segment["type"] == "mface":
+            return httpx.Response(
+                200,
+                json={"status": "failed", "retcode": 1200},
+            )
+        return httpx.Response(
+            200,
+            json={"status": "ok", "retcode": 0, "data": {"message_id": 1}},
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await client.send_sticker(
+            ReplyTarget("private", 123),
+            StickerSource(
+                summary="doge",
+                emoji_id="abc",
+                emoji_package_id="pack",
+                key="key",
+                image_source="https://example.com/sticker.gif",
+            ),
+        )
+    finally:
+        await client.close()
+
+    assert segment_types == ["mface", "image"]
+
+
+@pytest.mark.asyncio
 async def test_get_group_list_returns_group_names() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/get_group_list")

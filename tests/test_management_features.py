@@ -313,6 +313,67 @@ async def test_group_settings_api_is_persistent_and_reloadable(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_group_settings_can_be_applied_to_all_existing_profiles(
+    tmp_path,
+) -> None:
+    database = tmp_path / "bot.db"
+    profiles = GroupProfileStore(database)
+    profiles.ensure(
+        90001,
+        defaults={
+            "enabled": True,
+            "require_mention": True,
+            "smart_participation": False,
+            "min_reply_confidence": 0.72,
+        },
+    )
+    profiles.update(
+        90001,
+        values={"custom_prompt": "保留这个群自己的额外要求"},
+    )
+    app = create_app(
+        settings=Settings(
+            _env_file=None,
+            onebot_token=SecretStr("test"),
+            database_path=database,
+            enable_group=True,
+            group_require_mention=True,
+            group_smart_participation=False,
+            group_min_reply_confidence=0.72,
+            vector_memory_enabled=False,
+        ),
+        chat_client=FeatureChat(),
+        onebot_client=NoopSender(),
+        group_profile_store=profiles,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        saved = await client.patch(
+            "/api/admin/group-settings",
+            json={
+                "group_require_mention": False,
+                "group_smart_participation": True,
+                "group_min_reply_confidence": 0.58,
+            },
+        )
+        assert saved.status_code == 200
+        applied = await client.post(
+            "/api/admin/group-settings/apply-to-all"
+        )
+
+    assert applied.status_code == 200
+    assert applied.json()["updated"] == 1
+    profile = applied.json()["groups"][0]
+    assert profile["require_mention"] is False
+    assert profile["smart_participation"] is True
+    assert profile["min_reply_confidence"] == 0.58
+    assert profile["custom_prompt"] == "保留这个群自己的额外要求"
+
+
+@pytest.mark.asyncio
 async def test_content_generation_creates_real_artifacts(tmp_path) -> None:
     client = FeatureChat()
     chart = await generate_chart(
