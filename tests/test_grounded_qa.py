@@ -5,7 +5,11 @@ import json
 import httpx
 import pytest
 
-from qq_ai_bot.grounded_qa import grounded_lookup, music_catalog_lookup
+from qq_ai_bot.grounded_qa import (
+    _grounding_prompt,
+    grounded_lookup,
+    music_catalog_lookup,
+)
 
 
 class GroundingChat:
@@ -31,6 +35,131 @@ class SequenceChat:
 
     async def close(self) -> None:
         return None
+
+
+class SynthesisChat:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        self.calls += 1
+        if self.calls == 1:
+            return json.dumps(
+                {
+                    "answer": "政策A发布，产品B更新。",
+                    "sources": [
+                        {
+                            "title": "政府公告",
+                            "url": "https://www.gov.cn/news/a",
+                            "quote": "政策A发布",
+                        },
+                        {
+                            "title": "百科资料",
+                            "url": "https://baike.baidu.com/item/b",
+                            "quote": "产品B更新",
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        return "1. 政策A正式发布。\n2. 产品B完成更新。"
+
+    async def close(self) -> None:
+        return None
+
+
+class LiveSearchChat:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        self.calls += 1
+        return json.dumps(
+            {
+                "answer": "1. 政策A正式发布。\n2. 产品B完成更新。",
+                "source_ids": [1, 2],
+            },
+            ensure_ascii=False,
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+def test_grounding_prompt_requests_an_organized_answer() -> None:
+    prompt = _grounding_prompt(
+        "联网搜索最近的人工智能新闻，整理三条",
+        strict=False,
+    )
+    assert "2 到 5 条" in prompt
+    assert "不要只回一句话" in prompt
+
+
+@pytest.mark.asyncio
+async def test_explicit_search_uses_real_search_result_urls() -> None:
+    chat = LiveSearchChat()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "www.so.com":
+            return httpx.Response(
+                200,
+                text=(
+                    '<html><body>'
+                    '<a data-mdurl="https://www.gov.cn/policy" '
+                    'href="#">政策A正式发布</a>'
+                    '<a data-mdurl="https://www.chinanews.com/tech" '
+                    'href="#">产品B完成更新</a>'
+                    '<a data-mdurl="https://example.com/untrusted" '
+                    'href="#">自媒体猜测</a>'
+                    '</body></html>'
+                ),
+            )
+        return httpx.Response(
+            200,
+            text=(
+                "<html><body>人工智能政策A正式发布，"
+                "人工智能产品B完成更新，相关措施已开始实施。"
+                + "政策细则覆盖研发、应用和安全评估。" * 12
+                + "</body></html>"
+            ),
+        )
+
+    result = await grounded_lookup(
+        chat,
+        model="test",
+        question="联网搜索人工智能最新政策，整理两条",
+        transport=httpx.MockTransport(handler),
+    )
+    assert result.verified is True
+    assert result.verification_level == "live_search_pages"
+    assert {source.url for source in result.sources} == {
+        "https://www.gov.cn/policy",
+        "https://www.chinanews.com/tech",
+    }
+    assert chat.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_grounded_search_organizes_verified_page_content() -> None:
+    chat = SynthesisChat()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="<html><body>政策A发布，产品B更新。</body></html>",
+        )
+
+    result = await grounded_lookup(
+        chat,
+        model="test",
+        question="联网搜索最近AI政策，整理两条",
+        transport=httpx.MockTransport(handler),
+    )
+    assert chat.calls == 2
+    assert result.verified is True
+    assert result.answer.startswith("1. 政策A")
+    assert "2. 产品B" in result.answer
+    assert "来源：" in result.formatted()
 
 
 @pytest.mark.asyncio
@@ -183,6 +312,39 @@ async def test_grounded_lookup_falls_back_to_domain_cross_check() -> None:
     )
     assert result.verified is True
     assert result.verification_level == "domain_cross_checked"
+
+
+@pytest.mark.asyncio
+async def test_grounded_lookup_rejects_missing_invented_urls() -> None:
+    chat = GroundingChat(
+        {
+            "answer": "政策正式发布。",
+            "sources": [
+                {
+                    "title": "政府公告",
+                    "url": "https://www.gov.cn/fake-a",
+                    "quote": "政策正式发布",
+                },
+                {
+                    "title": "百科资料",
+                    "url": "https://baike.baidu.com/fake-b",
+                    "quote": "政策正式发布",
+                },
+            ],
+        }
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="not found")
+
+    result = await grounded_lookup(
+        chat,
+        model="test",
+        question="联网搜索这个政策",
+        transport=httpx.MockTransport(handler),
+    )
+    assert result.verified is False
+    assert "无法访问" in result.reason
 
 
 @pytest.mark.asyncio

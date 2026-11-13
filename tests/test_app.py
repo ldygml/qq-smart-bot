@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,8 +13,12 @@ from pydantic import SecretStr
 from qq_ai_bot.app import (
     _admin_access_signature,
     _clean_model_reply,
+    _history_for_current_turn,
     _is_simple_fact_lookup,
     _looks_like_task_request,
+    _metric_inference_is_unsupported,
+    _needs_casual_rewrite,
+    _needs_claim_review,
     _needs_web_search,
     _reply_variety_hint,
     _social_only_reply,
@@ -57,6 +62,32 @@ class FakeChatClient:
 
     async def close(self) -> None:
         return None
+
+
+class ClaimReviewChat(FakeChatClient):
+    async def chat(
+        self,
+        messages: Sequence[dict[str, str]],
+        *,
+        model: str | None = None,
+        extra_payload=None,
+    ) -> str:
+        self.calls.append(list(messages))
+        self.models.append(model)
+        self.extra_payloads.append(extra_payload)
+        if "事实与一致性审查员" in str(messages[0].get("content") or ""):
+            return json.dumps(
+                {
+                    "changed": True,
+                    "reply": (
+                        "单看这些指标，只能说明产出和引用情况，"
+                        "不能直接判断学术水平。"
+                    ),
+                    "issues": ["unsupported_causal_claim"],
+                },
+                ensure_ascii=False,
+            )
+        return "h指数38配100篇说明引用没被灌水，水平肯定靠谱。"
 
 
 class FakeOneBotClient:
@@ -279,6 +310,9 @@ def test_social_tone_hint_softens_requested_edge() -> None:
     invitation = _social_tone_hint("吃烧烤不")
     assert "轻松邀约" in invitation
     assert "旧任务" in invitation
+    fake = _social_tone_hint("回答得好假")
+    assert "关心模板" in fake
+    assert "不要长篇道歉" in fake
 
 
 def test_reply_variety_hint_detects_repeated_openings() -> None:
@@ -296,17 +330,93 @@ def test_reply_variety_hint_detects_repeated_openings() -> None:
 def test_social_short_turns_and_task_detection() -> None:
     assert _social_only_reply("👌") in {"嗯。", "行。", "收到。", "好。"}
     assert _social_only_reply("🤔") in {"？", "咋了。", "怎么了？", "嗯？"}
-    assert _social_only_reply("你在干嘛") in {
-        "没干嘛。你呢？",
-        "没干嘛，歇会儿。",
-        "看手机呢，你呢？",
-    }
+    assert _social_only_reply("你在干嘛") is None
     assert _looks_like_task_request("做一下第五题")
     assert _looks_like_task_request("连名带姓这首歌是谁唱的")
     assert _is_simple_fact_lookup("连名带姓这首歌是谁唱的")
     assert _needs_web_search("连名带姓这首歌是谁唱的")
+    assert _needs_web_search("帮我上网查一下最近的人工智能新闻")
+    assert _needs_web_search("现查一下这个政策")
+    assert not _needs_web_search("比赛")
     assert not _looks_like_task_request("换个话题")
+    assert not _looks_like_task_request("比赛")
+    assert _needs_casual_rewrite(
+        "比赛",
+        "比赛挺累的吧？歇会儿，喝口水。",
+    )
+    assert _needs_claim_review(
+        "h指数38配100篇说明引用没被灌水。"
+    )
+    assert _needs_claim_review(
+        "他应该就是川大那位，身份对得上。"
+    )
+    assert _metric_inference_is_unsupported(
+        "他有100篇论文，h指数38",
+        "100篇能撑到h指数38，不像临时凑的。",
+    )
+    assert not _needs_claim_review("刚比完？赢没赢。")
     assert _clean_model_reply("自然回应：\n那就先歇会儿。") == "那就先歇会儿。"
+
+
+def test_old_private_history_is_not_reused_for_a_new_topic() -> None:
+    old = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    history = [
+        {"role": "user", "content": "成都蓉城今晚踢球"},
+        {"role": "assistant", "content": "立冬快乐，蓉城今晚有比赛"},
+        {"role": "user", "content": "你联网查啊"},
+        {"role": "assistant", "content": "我这边没有实时赛程"},
+    ]
+
+    assert _history_for_current_turn(
+        history,
+        old,
+        "累了？",
+        "Asia/Shanghai",
+    ) == []
+    assert _history_for_current_turn(
+        history,
+        old,
+        "上次说的那个比赛呢",
+        "Asia/Shanghai",
+    ) == history[-4:]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_claim_is_rewritten_before_sending(tmp_path) -> None:
+    llm = ClaimReviewChat()
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2951,
+                "message": "他有100篇论文，h指数38，说明水平怎么样？",
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert sender.sent[0][1] == (
+        "这些数字能确认的是产出和引用表现。"
+        "至于学术水平、引用质量或是不是凑数，还得看具体论文和同行评价。"
+    )
+    assert len(llm.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -675,7 +785,7 @@ async def test_private_message_gets_ai_reply(tmp_path) -> None:
     assert sender.sent[0][1] == "测试回复"
     assert sender.sent[0][0].user_id == 123
     assert llm.calls[0][-1] == {"role": "user", "content": "你好"}
-    assert "足球迷" in llm.calls[0][0]["content"]
+    assert "没有预设的固定爱好" in llm.calls[0][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -2724,6 +2834,75 @@ async def test_smart_group_mode_can_stay_silent(tmp_path) -> None:
 
     assert sender.sent == []
     assert decider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_web_search_bypasses_group_participation_skip(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def fake_grounded_lookup(*args, **kwargs):
+        return GroundedAnswer(
+            answer="第一条新闻。第二条新闻。",
+            sources=(
+                GroundedSource(
+                    "新华网",
+                    "https://www.xinhuanet.com/test",
+                    "人工智能新闻",
+                ),
+                GroundedSource(
+                    "人民网",
+                    "https://www.people.com.cn/test",
+                    "人工智能新闻",
+                ),
+            ),
+            verified=True,
+        )
+
+    monkeypatch.setattr(
+        "qq_ai_bot.app.grounded_lookup",
+        fake_grounded_lookup,
+    )
+    sender = FakeOneBotClient()
+    decider = FakeGroupDecider(False)
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=False,
+            group_smart_participation=True,
+            web_search_enabled=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        group_reply_decider=decider,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 999,
+                "user_id": 123,
+                "group_id": 456,
+                "message_id": 2920,
+                "message": "联网搜索最近的人工智能新闻，整理两条",
+                "sender": {"nickname": "测试用户"},
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert decider.calls == 0
+    assert "第二条新闻" in sender.sent[0][1]
 
 
 @pytest.mark.asyncio

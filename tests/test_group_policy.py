@@ -60,7 +60,7 @@ async def test_group_decider_accepts_confident_request() -> None:
         current_text="日志在下面，帮我看看",
     )
     assert result is True
-    assert "足球" in chat.prompts[0]
+    assert "个人偏好" in chat.prompts[0]
 
 
 @pytest.mark.asyncio

@@ -330,12 +330,34 @@ class QualityStore:
                 "SELECT content FROM polluted_replies"
             ).fetchall()
         polluted = {str(row["content"]) for row in rows}
-        return [
-            item
-            for item in history
-            if item.get("role") != "assistant"
-            or str(item.get("content") or "") not in polluted
-        ]
+        result: list[dict[str, Any]] = []
+        index = 0
+        while index < len(history):
+            item = history[index]
+            role = str(item.get("role") or "")
+            content = str(item.get("content") or "")
+            if role == "user" and index + 1 < len(history):
+                reply = history[index + 1]
+                reply_role = str(reply.get("role") or "")
+                reply_content = str(reply.get("content") or "")
+                if (
+                    reply_role == "assistant"
+                    and (
+                        reply_content in polluted
+                        or _reply_looks_unprompted(content, reply_content)
+                    )
+                ):
+                    index += 2
+                    continue
+            if (
+                role == "assistant"
+                and content in polluted
+            ):
+                index += 1
+                continue
+            result.append(item)
+            index += 1
+        return result
 
     def mark_review(
         self,
@@ -924,6 +946,23 @@ async def compare_replies(
         "challenger_score": score("challenger_score"),
         "reason": str(data.get("reason") or "")[:300],
     }
+
+
+def _reply_looks_unprompted(user_text: str, reply: str) -> bool:
+    templates = (
+        "喝口水",
+        "歇会儿",
+        "别硬撑",
+        "我在这",
+        "随时接话",
+        "不想瞎编",
+        "立冬快乐",
+        "没挂实时赛程",
+    )
+    return any(
+        marker in reply and marker not in user_text
+        for marker in templates
+    )
 
 
 def _parse_json(reply: str) -> dict[str, Any]:

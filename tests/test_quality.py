@@ -153,9 +153,28 @@ def test_low_quality_reply_is_removed_from_model_history(tmp_path) -> None:
         ]
     )
     assert filtered == [
-        {"role": "user", "content": "你好"},
         {"role": "assistant", "content": "你好，咋了？"},
     ]
+
+
+def test_unprompted_care_templates_are_removed_with_their_turn(
+    tmp_path,
+) -> None:
+    store = QualityStore(tmp_path / "bot.db")
+    history = [
+        {"role": "user", "content": "累了？"},
+        {
+            "role": "assistant",
+            "content": "立冬快乐。蓉城今晚有比赛，你自己看。",
+        },
+        {"role": "user", "content": "比赛"},
+        {
+            "role": "assistant",
+            "content": "比赛挺累的吧？歇会儿，喝口水。",
+        },
+    ]
+
+    assert store.filter_history(history) == []
 
 
 @pytest.mark.asyncio

@@ -92,6 +92,28 @@ def test_shared_context_respects_visibility(tmp_path) -> None:
     assert "睡眠不好" in unrestricted_context
 
 
+def test_unrelated_short_chat_does_not_pull_old_topics(tmp_path) -> None:
+    store = SharedMemoryStore(tmp_path / "memory.db")
+    store.record_person(222, "小明")
+    store.add_episode(
+        conversation_id="group:100:user:222",
+        message_type="group",
+        group_id=100,
+        speaker_user_id=222,
+        speaker_name="小明",
+        user_content="周末去看利物浦的比赛",
+        assistant_content="别又看完输球",
+    )
+    context = store.context_for(
+        current_user_id=222,
+        current_user_name="小明",
+        query="又不理我",
+        current_conversation_id="private:222",
+    )
+    assert "利物浦" not in context
+    assert "周末去看" not in context
+
+
 def test_memory_parser_accepts_top_level_array() -> None:
     memories = _parse_memory_candidates(
         '[{"fact":"长期在北京工作","visibility":"shareable"},'

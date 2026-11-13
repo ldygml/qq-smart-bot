@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import random
 import re
@@ -1394,7 +1395,12 @@ def create_app(
         conversation_id = str(
             payload.get("conversation_id") or "replay"
         )
-        history = store.history(conversation_id, config.history_messages)
+        history = _history_for_current_turn(
+            store.history(conversation_id, config.history_messages),
+            store.last_message_at(conversation_id),
+            user_message,
+            config.timezone,
+        )
         raw_variants = payload.get("variants")
         variants = raw_variants if isinstance(raw_variants, list) else []
         if not variants:
@@ -1538,6 +1544,10 @@ def create_app(
                 mentioned
                 or text.startswith("/")
                 or config.bot_name in text
+                or (
+                    _wants_forced_research(text)
+                    and not group_profile.require_mention
+                )
                 or any(text.lower().startswith(p.lower()) for p in prefixes)
             )
             if group_profile.require_mention and not directly_addressed:
@@ -1739,12 +1749,19 @@ def create_app(
             )
         except LLMError as exc:
             return JSONResponse({"detail": str(exc)}, status_code=502)
+        reply, claim_issues = await _review_reply_claims(
+            user_text=text,
+            reply=reply,
+            history=history,
+            evidence=memory_context,
+        )
         return {
             "ok": True,
             "status": "replied",
             "reason": "",
             "reply": format_qq_text(reply),
             "model": model,
+            "claim_issues": claim_issues,
             "strategy": strategy,
             "memory_count": len(memory_context.splitlines()) if memory_context else 0,
             "topic_count": len(topics.active(scope_key, limit=10)),
@@ -3005,6 +3022,82 @@ def create_app(
             mime_type=asset.mime_type,
         )
 
+    async def _review_reply_claims(
+        *,
+        user_text: str,
+        reply: str,
+        history: list[dict[str, str]],
+        evidence: str = "",
+    ) -> tuple[str, list[str]]:
+        if not _needs_claim_review(reply):
+            return reply, []
+        recent = "\n".join(
+            f"{item.get('role')}: {str(item.get('content') or '')[:500]}"
+            for item in history[-8:]
+        )
+        prompt = (
+            "审查候选回复是否经得起推敲。只检查事实、依据、前后矛盾和过度推断，"
+            "不要评价文风，也不要迎合用户。\n"
+            "检查项："
+            "1. 数字、年份、日期、人物身份、机构关系、政策和链接是否有依据；"
+            "2. 是否把用户给的数据继续外推成学术水平、人品、动机或因果结论；"
+            "3. 是否把可能、推测、传闻说成确定事实；"
+            "4. 是否与用户当前消息或最近对话矛盾；"
+            "5. 是否假装自己看过、查过、经历过并未提供的内容。\n"
+            "修订时不能新增任何事实、数字、身份或链接。"
+            "有风险就删掉无依据部分，改成更保守、更短但自然的说法。"
+            "如果候选回复已经稳妥，保持原文。"
+            '只返回 JSON：{"changed":true/false,'
+            '"reply":"最终回复","issues":["问题类型"]}。\n\n'
+            f"用户消息：{user_text[:2000]}\n"
+            f"最近对话：\n{recent or '无'}\n"
+            f"可用依据：{evidence[:6000] or '除当前对话外无额外依据'}\n"
+            f"候选回复：{reply[:5000]}"
+        )
+        try:
+            reviewed = await client_for("chat").chat(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是严格的事实与一致性审查员，不是润色助手。"
+                            "宁可删除结论，也不允许补造依据。"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                model=config.llm_model,
+                extra_payload={
+                    "reasoning_effort": "none",
+                    "response_format": {"type": "json_object"},
+                },
+            )
+            value = re.sub(
+                r"^```(?:json)?\s*|\s*```$",
+                "",
+                reviewed.strip(),
+                flags=re.IGNORECASE,
+            )
+            data = json.loads(value)
+        except (json.JSONDecodeError, LLMError, TypeError, ValueError):
+            return reply, ["claim_review_failed"]
+        revised = str(data.get("reply") or "").strip()
+        issues = [
+            str(item)[:80]
+            for item in (data.get("issues") or [])
+            if str(item).strip()
+        ][:8]
+        if _metric_inference_is_unsupported(user_text, reply) or (
+            revised
+            and _metric_inference_is_unsupported(user_text, revised)
+        ):
+            return _conservative_metric_reply(), list(
+                dict.fromkeys([*issues, "unsupported_metric_inference"])
+            )[:8]
+        if data.get("changed") is True and revised:
+            return revised[:5000], issues or ["unsupported_claim"]
+        return reply, issues
+
     def _queue_sticker_asset(
         sticker_id: int,
         sticker_source: str,
@@ -3598,6 +3691,10 @@ def create_app(
                 or text.startswith("/")
                 or poke_command
                 or (
+                    _wants_forced_research(text)
+                    and not group_profile.require_mention
+                )
+                or (
                     natural_generation
                     and not group_profile.require_mention
                 )
@@ -3912,10 +4009,15 @@ def create_app(
                     await _safe_send(target, str(exc))
                     return
 
-            history = quality.filter_history(
-                store.history(conversation_id, config.history_messages)
-            )
             last_activity = store.last_message_at(conversation_id)
+            history = _history_for_current_turn(
+                quality.filter_history(
+                    store.history(conversation_id, config.history_messages)
+                ),
+                last_activity,
+                text,
+                config.timezone,
+            )
             memory_context = ""
             if config.shared_memory_enabled:
                 memory_context = shared_memory.context_for(
@@ -4243,6 +4345,35 @@ def create_app(
                         reply = rewritten.strip()
                 except LLMError:
                     logger.warning("Casual reply rewrite failed; using original reply.")
+            claim_evidence = "\n".join(
+                part
+                for part in (
+                    memory_context,
+                    *(
+                        f"{item.title} {item.location}：{item.content}"
+                        for item in semantic_matches
+                    ),
+                    *(
+                        f"{item.title} {item.location}：{item.content}"
+                        for item in knowledge_matches
+                    ),
+                )
+                if part
+            )
+            reviewed_reply, claim_issues = await _review_reply_claims(
+                user_text=text,
+                reply=reply,
+                history=history,
+                evidence=claim_evidence,
+            )
+            claim_changed = reviewed_reply.strip() != reply.strip()
+            reply = reviewed_reply
+            if claim_issues:
+                trace.stage(
+                    "claim_review",
+                    issues=claim_issues,
+                    changed=claim_changed,
+                )
             reply = format_qq_text(reply)
             quality_id = quality.record(
                 conversation_id=conversation_id,
@@ -4251,6 +4382,12 @@ def create_app(
                 user_text=text,
                 assistant_text=reply,
                 model=response_model,
+                fact_status=(
+                    "reviewed"
+                    if claim_issues
+                    and "claim_review_failed" not in claim_issues
+                    else "not_checked"
+                ),
             )
             store.append_exchange(
                 conversation_id,
@@ -5840,6 +5977,44 @@ def _conversation_gap_note(
     return ""
 
 
+def _history_for_current_turn(
+    history: list[dict[str, Any]],
+    last_message_at: str | None,
+    current_text: str,
+    timezone_name: str,
+) -> list[dict[str, Any]]:
+    if not history or not last_message_at:
+        return history
+    try:
+        parsed = datetime.fromisoformat(last_message_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        elapsed = (
+            datetime.now(ZoneInfo(timezone_name)) - parsed
+        ).total_seconds()
+    except (ValueError, TypeError):
+        return history
+    if elapsed < 30 * 60:
+        return history
+
+    value = current_text.strip()
+    refers_to_past = any(
+        marker in value
+        for marker in (
+            "刚才",
+            "刚刚",
+            "上次",
+            "之前",
+            "继续",
+            "你说过",
+            "我们聊",
+        )
+    )
+    if elapsed >= 6 * 3600:
+        return history[-4:] if refers_to_past else []
+    return history[-6:] if refers_to_past else history[-2:]
+
+
 def _emotion_style_hint(text: str) -> str:
     value = text.strip()
     if any(
@@ -5856,6 +6031,14 @@ def _emotion_style_hint(text: str) -> str:
 
 def _social_tone_hint(text: str) -> str:
     value = text.strip().lower()
+    if any(
+        marker in value
+        for marker in ("好假", "太假", "不像真人", "像机器人")
+    ):
+        return (
+            "对方明确觉得回复太假。不要长篇道歉、解释系统或承诺以后改进；"
+            "直接用普通人接话的方式回应眼前内容，去掉关心模板、套话和强行续聊。"
+        )
     if any(
         marker in value
         for marker in (
@@ -5915,6 +6098,8 @@ def _social_tone_hint(text: str) -> str:
 def _social_only_reply(text: str) -> str | None:
     value = re.sub(r"\s+", "", text.strip().lower())
     compact = re.sub(r"[\W_]+", "", value, flags=re.UNICODE)
+    if compact in {"你在干嘛", "你干嘛呢", "在干嘛", "干嘛呢"}:
+        return None
     if value and all(
         unicodedata.category(char).startswith(("So", "Sk"))
         or char in "，。！？!?,.~～"
@@ -5984,7 +6169,7 @@ def _tts_voice_for_text(text: str, config: Settings) -> str:
         return config.tts_voice_sad or config.tts_voice_calm
     if any(
         marker in text
-        for marker in ("开心", "太棒", "庆祝", "进球", "赢了", "哈哈")
+        for marker in ("开心", "太棒", "庆祝", "成功", "哈哈")
     ):
         return config.tts_voice_lively or config.tts_voice_calm
     return config.tts_voice_calm
@@ -5999,7 +6184,7 @@ def _tts_rate_for_text(text: str, config: Settings) -> float:
         return min(1.5, max(0.5, base * 0.94))
     if any(
         marker in text
-        for marker in ("开心", "太棒", "庆祝", "进球", "赢了", "哈哈")
+        for marker in ("开心", "太棒", "庆祝", "成功", "哈哈")
     ):
         return min(1.5, max(0.5, base * 1.06))
     return base
@@ -6277,6 +6462,8 @@ def _wants_forced_research(text: str) -> bool:
         for marker in (
             "联网搜索",
             "联网核对",
+            "联网查",
+            "联网找",
             "先搜索",
             "先联网",
             "搜索后再",
@@ -6284,6 +6471,11 @@ def _wants_forced_research(text: str) -> bool:
             "核实后再",
             "网上查",
             "上网查",
+            "帮我搜",
+            "搜一下",
+            "搜索一下",
+            "现查",
+            "查资料",
             "查一下再",
             "核实一下",
         )
@@ -6443,6 +6635,19 @@ def _looks_like_task_request(text: str) -> bool:
     value = text.strip()
     if value.startswith("/"):
         return True
+    if value in {
+        "比赛",
+        "比分",
+        "赛程",
+        "转会",
+        "伤病",
+        "新闻",
+        "文件",
+        "文档",
+        "资料",
+        "政策",
+    }:
+        return False
     return _is_simple_fact_lookup(value) or any(
         hint in value for hint in TASK_HINTS
     ) or bool(
@@ -6475,10 +6680,19 @@ def _is_simple_fact_lookup(text: str) -> bool:
 
 def _needs_web_search(text: str) -> bool:
     value = text.lower()
+    if _wants_forced_research(value):
+        return True
     if _is_simple_fact_lookup(value):
         return True
     direct_markers = (
         "联网搜索",
+        "联网查",
+        "联网找",
+        "上网查",
+        "网上查",
+        "帮我搜",
+        "搜索一下",
+        "现查",
         "新闻",
         "最新",
         "实时",
@@ -6585,10 +6799,109 @@ def _needs_casual_rewrite(user_text: str, reply: str) -> bool:
         "你可以尝试",
         "作为一个",
     )
+    fake_care = (
+        "喝口水",
+        "歇会儿",
+        "别硬撑",
+        "我在这",
+        "随时接话",
+        "陪着你",
+        "陪你聊",
+        "你值得被",
+        "别想太多",
+    )
     return (
         len(reply) > 140
         or any(marker in reply for marker in markers)
+        or any(marker in reply for marker in fake_care)
         or sum(marker in reply for marker in canned) >= 2
+    )
+
+
+def _needs_claim_review(reply: str) -> bool:
+    if len(reply.strip()) < 8:
+        return False
+    factual_markers = (
+        "h指数",
+        "引用",
+        "论文",
+        "研究",
+        "报告",
+        "统计",
+        "排名",
+        "政策",
+        "法规",
+        "法律",
+        "发布",
+        "收购",
+        "融资",
+        "票房",
+        "赛程",
+        "比分",
+        "出生",
+        "去世",
+        "历史",
+        "同名",
+        "身份",
+        "本人",
+        "认人",
+    )
+    overclaim_markers = (
+        "说明",
+        "证明",
+        "意味着",
+        "可见",
+        "肯定",
+        "一定",
+        "绝对",
+        "必然",
+        "显然",
+        "从来",
+        "根本",
+        "应该就是",
+        "大概率是",
+    )
+    return bool(
+        re.search(r"https?://", reply)
+        or re.search(r"\d+(?:\.\d+)?\s*(?:%|万|亿|年|月|日|篇|人|次|元)?", reply)
+        or any(marker in reply for marker in factual_markers)
+        or any(marker in reply for marker in overclaim_markers)
+    )
+
+
+def _metric_inference_is_unsupported(
+    user_text: str,
+    reply: str,
+) -> bool:
+    user_metrics = sum(
+        marker in user_text
+        for marker in ("h指数", "引用", "论文", "篇", "影响因子")
+    )
+    if user_metrics < 2:
+        return False
+    return any(
+        marker in reply
+        for marker in (
+            "说明",
+            "证明",
+            "能撑",
+            "撑到",
+            "不像",
+            "没被灌水",
+            "水平",
+            "靠谱",
+            "很硬",
+            "顶尖",
+            "很强",
+            "质量高",
+        )
+    )
+
+
+def _conservative_metric_reply() -> str:
+    return (
+        "这些数字能确认的是产出和引用表现。"
+        "至于学术水平、引用质量或是不是凑数，还得看具体论文和同行评价。"
     )
 
 
@@ -6632,6 +6945,10 @@ async def _rewrite_casual_reply(
                     "不要列点、标题、加粗、菜单、鸡汤、额外建议或继续追问；"
                     "不要用“太懂了”“我陪你”“你值得”“真朋友都懂”这类话，"
                     "也不要堆 emoji、波浪号和感叹号。"
+                    "不要用“喝口水、歇会儿、别硬撑、我在这、随时接话”这类关心模板。"
+                    "不要猜用户没提到的比赛、节日、工作、项目或情绪；"
+                    "原回复里凭空补出的背景必须删掉。"
+                    "用户只发一个词或半句话时，按字面回应，必要时只问一个很短的问题。"
                     "避免复用原回复的固定开场和收尾，不要改成另一种客服模板。"
                     "不要解释你改了什么，只输出最终回复。"
                 ),

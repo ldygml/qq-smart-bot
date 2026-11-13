@@ -613,6 +613,7 @@ class SharedMemoryStore:
         current_conversation_id: str = "",
     ) -> str:
         mentioned = self.mentioned_people(query)
+        broad_query = _is_broad_memory_query(query)
         selected: dict[int, tuple[float, sqlite3.Row]] = {}
         with self._lock, self._connect() as connection:
             own_rows = connection.execute(
@@ -627,6 +628,11 @@ class SharedMemoryStore:
                 (current_user_id,),
             ).fetchall()
             for row in own_rows:
+                if not broad_query and not _text_matches_query(
+                    str(row["content"]),
+                    query,
+                ):
+                    continue
                 selected[int(row["id"])] = (
                     _memory_effective_score(row, query) + 0.12,
                     row,
@@ -667,6 +673,11 @@ class SharedMemoryStore:
                 (1 if include_private else 0,),
             ).fetchall()
             for row in recent_rows:
+                if not broad_query and not _text_matches_query(
+                    str(row["content"]),
+                    query,
+                ):
+                    continue
                 selected[int(row["id"])] = (
                     _memory_effective_score(row, query),
                     row,
@@ -716,8 +727,22 @@ class SharedMemoryStore:
                 f"- {subject_name}（{row['visibility']}，"
                 f"可靠度 {reliability:.2f}{caution}）：{row['content']}"
             )
-        reflections = self.reflection_summary(limit=4)
-        growth = self.growth_summary(limit=4)
+        include_abstract = bool(mentioned) or any(
+            marker in query
+            for marker in ("关系", "反思", "成长", "变化", "你怎么看")
+        )
+        reflections = [
+            item
+            for item in self.reflection_summary(limit=12)
+            if (broad_query and include_abstract)
+            or _text_matches_query(str(item["content"]), query)
+        ][:4]
+        growth = [
+            item
+            for item in self.growth_summary(limit=12)
+            if (broad_query and include_abstract)
+            or _text_matches_query(str(item["content"]), query)
+        ][:4]
         if reflections:
             lines.append("长期反思（只是推测，不要说得比证据更确定）：")
             for reflection in reflections:
@@ -748,6 +773,17 @@ class SharedMemoryStore:
                     1 if include_private else 0,
                 ),
             ).fetchall()
+        episode_rows = [
+            row
+            for row in episode_rows
+            if (
+                broad_query
+                or _text_matches_query(
+                    f"{row['user_content']} {row['assistant_content']}",
+                    query,
+                )
+            )
+        ][:4]
         if episode_rows:
             lines.append("最近其他会话片段（只在相关时自然引用）：")
             for row in episode_rows:
@@ -779,6 +815,12 @@ class SharedMemoryStore:
                     1 if include_private else 0,
                 ),
             ).fetchall()
+        observation_rows = [
+            row
+            for row in observation_rows
+            if broad_query
+            or _text_matches_query(str(row["content"]), query)
+        ][:4]
         if observation_rows:
             lines.append("最近未回复的其他群聊消息（只在相关时参考）：")
             for row in observation_rows:
@@ -2581,6 +2623,54 @@ def _memory_half_life(category: str) -> float:
         "preference": 240.0,
         "profile": 365.0,
     }.get(category, 120.0)
+
+
+def _is_broad_memory_query(query: str) -> bool:
+    compact = re.sub(r"\s+", "", query)
+    return any(
+        marker in compact
+        for marker in (
+            "最近怎么样",
+            "最近如何",
+            "最近好吗",
+            "最近在忙什么",
+            "最近忙什么",
+            "最近有什么安排",
+            "近况",
+            "有什么新情况",
+            "另一个群",
+            "群里有人",
+            "有人说了什么",
+            "最近聊了什么",
+            "住哪",
+            "住在哪",
+            "哪里住",
+            "在哪工作",
+            "做什么工作",
+            "是谁",
+            "叫什么",
+            "生日",
+            "电话",
+            "邮箱",
+        )
+    )
+
+
+def _text_matches_query(text: str, query: str) -> bool:
+    compact = re.sub(
+        r"[^\u4e00-\u9fffA-Za-z0-9]",
+        "",
+        query.lower(),
+    )
+    if len(compact) < 2:
+        return False
+    terms = {
+        compact[index : index + 2]
+        for index in range(len(compact) - 1)
+        if compact[index : index + 2] not in _COMMON_TERM_STOPS
+    }
+    lowered = text.lower()
+    return any(term in lowered for term in terms)
 
 
 def _memory_effective_score(row: sqlite3.Row, query: str) -> float:
