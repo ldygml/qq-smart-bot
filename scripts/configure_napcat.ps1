@@ -32,15 +32,24 @@ if ($installations.Count -ne 1) {
     throw "Expected exactly one NapCat installation under $runtimeRoot."
 }
 
-$configDirectories = @(
+$configDirectories = @()
+$rootConfig = Join-Path $installations[0].FullName "config"
+if (Test-Path -LiteralPath $rootConfig) {
+    $configDirectories += $rootConfig
+}
+$configDirectories += @(
     Get-ChildItem -LiteralPath $installations[0].FullName -Recurse -Directory |
-        Where-Object { $_.FullName -match "\\resources\\app\\napcat\\config$" }
+        Where-Object {
+            $_.Name -eq "config" -and
+            $_.FullName -match "\\napcat\\config$"
+        } |
+        Select-Object -ExpandProperty FullName
 )
 if ($configDirectories.Count -ne 1) {
     throw "Could not find the NapCat config directory."
 }
 
-$configDirectory = $configDirectories[0].FullName
+$configDirectory = $configDirectories[0]
 
 $config = [ordered]@{
     network = [ordered]@{
@@ -78,8 +87,8 @@ $config = [ordered]@{
 
 $json = $config | ConvertTo-Json -Depth 10
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-$configPaths = @(
-    Join-Path $configDirectory "onebot11.json"
+$configPaths = @(Join-Path $configDirectory "onebot11.json")
+$configPaths += @(
     Get-ChildItem -LiteralPath $configDirectory -File -Filter "onebot11_*.json" |
         Select-Object -ExpandProperty FullName
 )

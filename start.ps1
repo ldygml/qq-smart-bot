@@ -81,21 +81,38 @@ if ($installations.Count -ne 1) {
     throw "NapCat portable installation was not found under $runtimeRoot."
 }
 $napcatDirectory = $installations[0].FullName
-$napcatLauncher = Join-Path $napcatDirectory "napcat.bat"
-if (-not (Test-Path -LiteralPath $napcatLauncher)) {
-    throw "NapCat launcher was not found: $napcatLauncher"
+$launcherCandidates = @(
+    (Join-Path $napcatDirectory "napcat.bat"),
+    (Join-Path $napcatDirectory "launcher.bat"),
+    (Join-Path $napcatDirectory "launcher-user.bat"),
+    (Join-Path $napcatDirectory "launcher-win10-user.bat")
+)
+$napcatLauncher = $launcherCandidates |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Select-Object -First 1
+if (-not $napcatLauncher) {
+    throw "NapCat launcher was not found under $napcatDirectory."
 }
 
-$configDirectories = @(
+$configDirectories = @()
+$rootConfig = Join-Path $napcatDirectory "config"
+if (Test-Path -LiteralPath $rootConfig) {
+    $configDirectories += $rootConfig
+}
+$configDirectories += @(
     Get-ChildItem -LiteralPath $napcatDirectory -Recurse -Directory |
-        Where-Object { $_.FullName -match "\\resources\\app\\napcat\\config$" }
+        Where-Object {
+            $_.Name -eq "config" -and
+            $_.FullName -match "\\napcat\\config$"
+        } |
+        Select-Object -ExpandProperty FullName
 )
 if ($configDirectories.Count -ne 1) {
     throw "Could not find the NapCat config directory."
 }
 $qqAccount = $null
 $accountConfig = Get-ChildItem `
-    -LiteralPath $configDirectories[0].FullName `
+    -LiteralPath $configDirectories[0] `
     -File `
     -Filter "onebot11_*.json" |
     Select-Object -First 1
@@ -140,19 +157,27 @@ if (-not (Wait-LocalPort -Port 3000 -TimeoutSeconds 20)) {
     Write-Host "QQ login confirmation is required."
     Write-Host "A NapCat WebUI tab will be opened. Scan the QR code with the small account."
 
-    $webUiConfigPath = Join-Path $configDirectories[0].FullName "webui.json"
+    $webUiConfigPath = Join-Path $configDirectories[0] "webui.json"
+    $webUiDeadline = (Get-Date).AddSeconds(20)
+    while (
+        -not (Test-Path -LiteralPath $webUiConfigPath) -and
+        -not (Test-LocalPort -Port 6099) -and
+        (Get-Date) -lt $webUiDeadline
+    ) {
+        Start-Sleep -Seconds 1
+    }
+    $webUiUrl = "http://127.0.0.1:6099/webui"
     if (Test-Path -LiteralPath $webUiConfigPath) {
         $webUiConfig = [System.IO.File]::ReadAllText(
             $webUiConfigPath,
             [System.Text.Encoding]::UTF8
         ) | ConvertFrom-Json
-        $webUiUrl = "http://127.0.0.1:6099/webui"
         if (-not [string]::IsNullOrWhiteSpace($webUiConfig.token)) {
             $webUiUrl += "?token=" + [Uri]::EscapeDataString($webUiConfig.token)
         }
-        Set-Clipboard -Value $webUiUrl
-        Start-Process $webUiUrl
     }
+    Set-Clipboard -Value $webUiUrl
+    Start-Process $webUiUrl
 
     if (-not (Wait-LocalPort -Port 3000 -TimeoutSeconds 180)) {
         throw "QQ login was not completed. Run the script again after scanning."

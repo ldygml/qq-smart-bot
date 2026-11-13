@@ -268,6 +268,33 @@ NapCat + QQNT
 
 ## 快速开始
 
+### 0. 一键安装（推荐）
+
+双击 [一键安装.cmd](一键安装.cmd)，或在 PowerShell 中运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+脚本会逐步完成：
+
+1. 检查 Windows 和 PowerShell。
+2. 自动安装 `uv`。
+3. 自动安装 QQNT。
+4. 检测或解压 NapCat。
+5. 生成本地 `.env`、随机 OneBot Token 和 NapCat OneBot 配置。
+6. 隐藏输入模型 API Key。
+7. 打开 NapCat WebUI，等待 QQ 小号扫码。
+8. 启动机器人、控制台并打开浏览器。
+
+由于 NapCat 官方仓库当前已经停止发布公开 Release，自动下载源不可用时，首次安装需要先把官方 `NapCat.Shell.zip` 放到项目根目录，脚本会自动继续。安装完成后，以后登录只需要运行启动脚本并扫码。
+
+也可以手动指定安装包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -NapCatZip "D:\downloads\NapCat.Shell.zip"
+```
+
 ### 1. 安装依赖
 
 ```powershell
@@ -346,6 +373,7 @@ powershell -ExecutionPolicy Bypass -File .\control.ps1
 
 | 脚本 | 作用 |
 |---|---|
+| [一键安装.cmd](一键安装.cmd) | 首次安装：检查环境、安装 QQNT/uv、配置 NapCat、写入 Key 并引导扫码 |
 | [启动机器人.cmd](启动机器人.cmd) | 启动便携 NapCat、等待登录、同步依赖并启动机器人 |
 | [停止机器人.cmd](停止机器人.cmd) | 关闭项目机器人和项目内便携 NapCat，不影响主 QQ |
 | [启动控制台.cmd](启动控制台.cmd) | 启动 `8090` 登录控制台并打开网页 |
@@ -1032,6 +1060,8 @@ qq-smart-bot/
 ├─ data/                  本地数据库与生成文件，不提交
 ├─ .runtime/              NapCat、日志、密钥和恢复快照，不提交
 ├─ start.ps1              启动 NapCat 和机器人
+├─ install.ps1            首次一键安装与配置引导
+├─ 一键安装.cmd           双击运行首次安装
 ├─ stop.ps1               停止机器人和项目内 NapCat
 ├─ control.ps1            启动登录控制台
 ├─ disable_group_mention.ps1  全局和所有已有群切换为免 @
