@@ -52,15 +52,25 @@ function Get-TunnelProcess {
 }
 
 function Get-TunnelUrl {
-    $text = ""
-    if (Test-Path -LiteralPath $log) {
-        $text += Get-Content -LiteralPath $log -Raw -ErrorAction SilentlyContinue
+    $candidates = @()
+    foreach ($path in @($log, $stderrLog)) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+        if (-not $text) { continue }
+        $matches = [regex]::Matches(
+            $text,
+            "https://[A-Za-z0-9.-]+\.trycloudflare\.com",
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        if ($matches.Count -eq 0) { continue }
+        $candidates += [pscustomobject]@{
+            Modified = (Get-Item -LiteralPath $path).LastWriteTimeUtc
+            Url = $matches[$matches.Count - 1].Value
+        }
     }
-    if (Test-Path -LiteralPath $stderrLog) {
-        $text += "`n" + (Get-Content -LiteralPath $stderrLog -Raw -ErrorAction SilentlyContinue)
+    if ($candidates.Count -gt 0) {
+        return ($candidates | Sort-Object Modified -Descending | Select-Object -First 1).Url
     }
-    $match = [regex]::Match($text, "https://[A-Za-z0-9.-]+\.trycloudflare\.com")
-    if ($match.Success) { return $match.Value }
     if ($PublicUrl) { return $PublicUrl.Trim() }
     if (Test-Path -LiteralPath $urlFile) {
         return (Get-Content -LiteralPath $urlFile -Raw).Trim()
@@ -76,7 +86,12 @@ function Show-Status {
     } else {
         Write-Host "Cloudflare tunnel is stopped."
     }
-    if ($url) { Write-Host "Mobile URL: $url" }
+    if ($url) {
+        if ($process) {
+            $url | Set-Content -LiteralPath $urlFile -Encoding ASCII
+        }
+        Write-Host "Mobile URL: $url"
+    }
     Write-Host "Log: $log"
 }
 

@@ -1038,16 +1038,36 @@ def _redact_log_line(line: str) -> str:
 
 
 def _cloudflare_url_from_log() -> str:
-    text = "\n".join(
-        _tail_file(CLOUDFLARE_LOG, limit=500, max_bytes=524288)
-        + _tail_file(CLOUDFLARE_STDERR_LOG, limit=500, max_bytes=524288)
-    )
-    match = re.search(
-        r"https://[A-Za-z0-9.-]+\.trycloudflare\.com",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return match.group(0) if match else ""
+    candidates: list[tuple[float, str]] = []
+    for path in (CLOUDFLARE_LOG, CLOUDFLARE_STDERR_LOG):
+        lines = _tail_file(path, limit=500, max_bytes=524288)
+        if not lines:
+            continue
+        text = "\n".join(lines)
+        markers = list(
+            re.finditer(
+                r"starting cloudflared mode=",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        if markers:
+            text = text[markers[-1].start() :]
+        matches = re.findall(
+            r"https://[A-Za-z0-9.-]+\.trycloudflare\.com",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not matches:
+            continue
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            modified = 0.0
+        candidates.append((modified, matches[-1]))
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def _find_cloudflared() -> Path | None:
@@ -1097,9 +1117,8 @@ def _cloudflare_status() -> dict[str, Any]:
         ).strip().lstrip("\ufeff")
     except OSError:
         saved_url = ""
-    url = configured_url or saved_url
-    if not url:
-        url = _cloudflare_url_from_log()
+    logged_url = _cloudflare_url_from_log()
+    url = configured_url or logged_url or saved_url
     if process is None:
         running = False
     elif isinstance(process, subprocess.Popen):
@@ -1108,6 +1127,11 @@ def _cloudflare_status() -> dict[str, Any]:
         running = process.is_running()
     if not running and not configured_url:
         url = ""
+    elif running and logged_url and logged_url != saved_url:
+        try:
+            CLOUDFLARE_URL_FILE.write_text(logged_url, encoding="utf-8")
+        except OSError:
+            pass
     log_lines = [
         _redact_log_line(line)
         for line in _tail_file(CLOUDFLARE_LOG, 25)

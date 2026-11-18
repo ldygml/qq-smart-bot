@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -233,6 +234,49 @@ async def test_dashboard_logs_secure_cookie_and_scoped_admin_page(
         )
         assert redirect.status_code == 307
         assert redirect.headers["location"].startswith(f"/instances/{instance_id}/admin")
+
+
+def test_cloudflare_status_prefers_latest_quick_tunnel_url(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    log_path = tmp_path / "cloudflared.log"
+    stderr_path = tmp_path / "cloudflared.stderr.log"
+    url_path = tmp_path / "cloudflared.url"
+    log_path.write_text(
+        "\n".join(
+            (
+                "[old] starting cloudflared mode=quick",
+                "https://old-example.trycloudflare.com",
+                "[new] starting cloudflared mode=quick",
+                "https://new-example.trycloudflare.com",
+            )
+        ),
+        encoding="utf-8",
+    )
+    stderr_path.write_text(
+        "https://stale-example.trycloudflare.com\n",
+        encoding="utf-8",
+    )
+    url_path.write_text(
+        "https://old-example.trycloudflare.com",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(control_plane, "CLOUDFLARE_LOG", log_path)
+    monkeypatch.setattr(control_plane, "CLOUDFLARE_STDERR_LOG", stderr_path)
+    monkeypatch.setattr(control_plane, "CLOUDFLARE_URL_FILE", url_path)
+    monkeypatch.setattr(control_plane, "cloudflare_process", None)
+    monkeypatch.setattr(control_plane, "cloudflare_public_url", "")
+    monkeypatch.setattr(
+        control_plane,
+        "_stored_cloudflare_process",
+        lambda: SimpleNamespace(pid=123, is_running=lambda: True),
+    )
+
+    status = control_plane._cloudflare_status()
+
+    assert status["public_url"] == "https://new-example.trycloudflare.com"
+    assert url_path.read_text(encoding="utf-8") == status["public_url"]
 
 
 def test_import_current_config_encrypts_local_secrets(tmp_path, monkeypatch) -> None:
