@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     generated_media_dir: Path = Path("data/generated")
     auto_sticker_enabled: bool = True
     sticker_model: str = "qwen3.8-flash"
-    sticker_min_confidence: float = 0.7
+    sticker_min_confidence: float = 0.45
     sticker_download_enabled: bool = True
     sticker_asset_dir: Path = Path("data/sticker_assets")
     sticker_download_timeout_seconds: float = 45.0
@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     natural_reply_delay_min_ms: int = 200
     natural_reply_delay_max_ms: int = 900
     natural_split_replies: bool = True
-    auto_sticker_cooldown_seconds: float = 180.0
+    auto_sticker_cooldown_seconds: float = 90.0
     quote_replies: bool = True
     group_quote_counts_as_mention: bool = True
 

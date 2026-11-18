@@ -13,6 +13,7 @@ from pydantic import SecretStr
 from qq_ai_bot.app import (
     _admin_access_signature,
     _clean_model_reply,
+    _detect_natural_sticker_request,
     _history_for_current_turn,
     _is_simple_fact_lookup,
     _is_unsolicited_presence_ping,
@@ -22,6 +23,7 @@ from qq_ai_bot.app import (
     _needs_claim_review,
     _needs_web_search,
     _reply_variety_hint,
+    _rank_sticker_candidates,
     _social_only_reply,
     _social_tone_hint,
     create_app,
@@ -349,6 +351,37 @@ def test_social_short_turns_and_task_detection() -> None:
     assert _needs_web_search("连名带姓这首歌是谁唱的")
     assert _needs_web_search("帮我上网查一下最近的人工智能新闻")
     assert _needs_web_search("现查一下这个政策")
+
+
+def test_natural_sticker_request_recognizes_conversational_variants() -> None:
+    for text in (
+        "来个表情包",
+        "给我发个无语的表情包",
+        "整点搞笑的",
+        "能不能发张表情看看",
+        "用表情包回我",
+        "有没有表情包",
+        "表情包呢",
+    ):
+        assert _detect_natural_sticker_request(text), text
+
+    for text in (
+        "不要发表情包",
+        "你发过什么表情包",
+        "表情包怎么收藏",
+        "为什么发表情包",
+        "你发表情包了吗",
+    ):
+        assert not _detect_natural_sticker_request(text), text
+
+
+def test_sticker_candidate_ranking_prefers_matching_mood() -> None:
+    candidates = [
+        {"id": 1, "summary": "奶龙", "category": "开心", "tags": []},
+        {"id": 2, "summary": "汗", "category": "无语", "tags": []},
+    ]
+    ranked = _rank_sticker_candidates(candidates, "给我发个无语的表情包")
+    assert ranked[0]["id"] == 2
     for question in (
         "王宝强是谁",
         "上海明天热不热",
@@ -2521,6 +2554,64 @@ async def test_media_commands_send_voice_image_file_and_sticker(tmp_path) -> Non
     assert sender.images[0][1].endswith("a.png")
     assert sender.files[0][2] == "sample.txt"
     assert sender.stickers[0][1].summary == "开心"
+
+
+@pytest.mark.asyncio
+async def test_natural_sticker_request_falls_back_when_model_abstains(
+    tmp_path,
+) -> None:
+    sender = FakeOneBotClient()
+    chat_memory = ChatMemory(tmp_path / "memory.db")
+    sticker_store = StickerStore(tmp_path / "stickers.db")
+    sticker_store.record(
+        StickerSource(
+            summary="无语",
+            emoji_id="sticker-1",
+            emoji_package_id="pack-1",
+            key="sticker-key",
+        )
+    )
+    decider = FakeStickerDecider(None)
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=chat_memory,
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        sticker_store=sticker_store,
+        sticker_choice_decider=decider,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2400,
+                "message": "给我发个无语的表情包",
+            },
+        )
+        await _wait_for_condition(
+            lambda: bool(
+                sender.stickers
+                and chat_memory.history("private:123", 5)
+            ),
+            timeout=5.0,
+        )
+
+    assert decider.last_kwargs["explicit_request"] is True
+    assert sender.stickers[0][1].summary == "无语"
+    assert chat_memory.history("private:123", 5)[-1]["content"] == (
+        "[我刚刚发了一个表情包：无语]"
+    )
 
 
 @pytest.mark.asyncio

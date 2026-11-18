@@ -240,6 +240,7 @@ async def test_group_settings_api_is_persistent_and_reloadable(tmp_path) -> None
                 "quote_replies": False,
                 "natural_message_debounce_ms": 1200,
                 "auto_sticker_cooldown_seconds": 240,
+                "sticker_min_confidence": 0.33,
             },
         )
         assert updated.status_code == 200
@@ -295,6 +296,7 @@ async def test_group_settings_api_is_persistent_and_reloadable(tmp_path) -> None
     assert loaded.trigger_prefixes == ()
     assert loaded.natural_message_debounce_ms == 1200
     assert loaded.auto_sticker_cooldown_seconds == 240
+    assert loaded.sticker_min_confidence == 0.33
     transport = httpx.ASGITransport(app=reloaded)
     async with httpx.AsyncClient(
         transport=transport,

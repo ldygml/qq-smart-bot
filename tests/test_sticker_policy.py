@@ -13,6 +13,14 @@ class ChoiceChat:
         return None
 
 
+class LowConfidenceChoiceChat:
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        return '{"sticker_id": 1, "confidence": 0.2}'
+
+    async def close(self) -> None:
+        return None
+
+
 @pytest.mark.asyncio
 async def test_sticker_decider_chooses_matching_catalog_item() -> None:
     decider = LLMStickerChoiceDecider(
@@ -31,3 +39,29 @@ async def test_sticker_decider_chooses_matching_catalog_item() -> None:
         explicit_request=True,
     )
     assert choice == 2
+
+
+@pytest.mark.asyncio
+async def test_explicit_sticker_request_accepts_valid_choice_below_threshold() -> None:
+    decider = LLMStickerChoiceDecider(
+        LowConfidenceChoiceChat(),
+        model="test-model",
+        min_confidence=0.7,
+    )
+    candidates = [{"id": 1, "summary": "无语", "use_count": 0}]
+    explicit = await decider.choose(
+        history=[],
+        user_text="来个表情包",
+        assistant_text="",
+        candidates=candidates,
+        explicit_request=True,
+    )
+    automatic = await decider.choose(
+        history=[],
+        user_text="今天有点累",
+        assistant_text="先歇会儿",
+        candidates=candidates,
+        explicit_request=False,
+    )
+    assert explicit == 1
+    assert automatic is None

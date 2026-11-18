@@ -97,6 +97,7 @@ class StickerChoiceDecider(Protocol):
         candidates: list[dict[str, object]],
         explicit_request: bool,
         contact_context: str = "",
+        min_confidence: float | None = None,
     ) -> int | None: ...
 
 
@@ -121,6 +122,7 @@ class LLMStickerChoiceDecider:
         candidates: list[dict[str, object]],
         explicit_request: bool,
         contact_context: str = "",
+        min_confidence: float | None = None,
     ) -> int | None:
         if not candidates:
             return None
@@ -130,7 +132,7 @@ class LLMStickerChoiceDecider:
             f"适用场景={item.get('usage_hint') or '未设置'}；"
             f"标签={','.join(str(tag) for tag in item.get('tags', [])[:8]) or '无'}；"
             f"已使用={item.get('use_count', 0)}次"
-            for item in candidates[:30]
+            for item in candidates[:40]
         )
         recent = "\n".join(
             f"{item.get('role')}: {str(item.get('content', ''))[:180]}"
@@ -139,10 +141,12 @@ class LLMStickerChoiceDecider:
         prompt = (
             "判断是否发送一个 QQ 商城表情包。只能从给定表情库选择，不能编造 ID。"
             '返回 JSON：{"sticker_id":数字或null,"confidence":0到1}。\n'
-            "只有在表情名称和当前语境明显匹配时才发送；没有合适表情就返回 null。"
-            "还必须适应当前联系人的关系、称呼和禁忌；对方不想开玩笑或语境严肃时宁可不发。"
-            "用户明确要表情包时可以更积极，但不能选择语义冲突的表情。"
-            "普通聊天不要为了活跃气氛强行发表情。\n\n"
+            "先看情绪、话题和最近对话，再从分类、标签、名称和适用场景中选择最贴近的表情。"
+            "关系、称呼或禁忌明显冲突，或者语境严肃、需要认真处理时返回 null。"
+            "用户明确要表情包时，只要没有明显冲突就必须选一个；没有完全相同的关键词时，"
+            "选择情绪相近的表情，不要因为不是原词就拒绝。"
+            "普通聊天中，遇到轻松、吐槽、开心、安慰、无语、惊讶等明显情绪时可以自然发表情；"
+            "不必等到关键词完全一致。但不要连续用同一种表情，也不要在任务、争论和严肃话题中硬插。\n\n"
             f"是否明确请求表情包：{'是' if explicit_request else '否'}\n"
             f"联系人上下文：{contact_context or '无额外资料'}\n"
             f"最近对话：\n{recent or '无'}\n"
@@ -174,7 +178,12 @@ class LLMStickerChoiceDecider:
             confidence = float(data.get("confidence", 0))
         except (TypeError, ValueError):
             return None
-        if confidence < self.min_confidence:
+        threshold = (
+            self.min_confidence
+            if min_confidence is None
+            else float(min_confidence)
+        )
+        if not explicit_request and confidence < threshold:
             return None
         valid_ids = {int(item["id"]) for item in candidates}
         return sticker_id if sticker_id in valid_ids else None

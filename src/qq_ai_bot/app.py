@@ -256,6 +256,10 @@ GROUP_SETTING_SPECS = {
         "auto_sticker_cooldown_seconds",
         "cooldown",
     ),
+    "sticker_min_confidence": (
+        "sticker_min_confidence",
+        "confidence",
+    ),
     "natural_reply_delay_min_ms": (
         "natural_reply_delay_min_ms",
         "delay",
@@ -1978,6 +1982,13 @@ def create_app(
         ):
             group_decider.min_confidence = updates[
                 "group_min_reply_confidence"
+            ]
+        if "sticker_min_confidence" in updates and hasattr(
+            sticker_decider,
+            "min_confidence",
+        ):
+            sticker_decider.min_confidence = updates[
+                "sticker_min_confidence"
             ]
         return JSONResponse(
             {
@@ -5307,8 +5318,9 @@ def create_app(
                         "：:，, 。"
                     )
                     break
-        if not command and value in {"发个表情包", "来个表情包"}:
+        if not command and _detect_natural_sticker_request(value):
             command = "/发表情"
+            argument = value
 
         if not command:
             return False
@@ -5350,6 +5362,7 @@ def create_app(
             return True
         if (
             command.startswith("/发")
+            and command != "/发表情"
             and event.user_id != config.owner_qq
         ):
             await _safe_send(target, "媒体发送命令仅限管理员使用。")
@@ -5557,13 +5570,14 @@ def create_app(
             return True
 
         if command == "/发表情":
-            candidates = stickers.list_recent(limit=50)
-            if argument:
-                candidates = [
-                    item
-                    for item in candidates
-                    if argument.lower() in str(item["summary"]).lower()
-                ]
+            if not limiter.allow(str(event.user_id)):
+                await _safe_send(target, "表情发得太频了，等会儿再说。")
+                return True
+            candidates = _rank_sticker_candidates(
+                stickers.list_recent(limit=200),
+                value,
+                limit=60,
+            )
             if not candidates:
                 await _safe_send(
                     target,
@@ -5582,10 +5596,21 @@ def create_app(
                 candidates=candidates,
                 explicit_request=True,
                 contact_context=contact_context,
+                min_confidence=float(config.sticker_min_confidence),
             )
             sticker = stickers.get_by_id(sticker_id) if sticker_id else None
             if sticker is None:
-                await _safe_send(target, "没有找到和当前语气匹配的表情包。")
+                fallback = _choose_explicit_sticker_fallback(
+                    candidates,
+                    value,
+                )
+                sticker = (
+                    stickers.get_by_id(int(fallback["id"]))
+                    if fallback is not None
+                    else None
+                )
+            if sticker is None:
+                await _safe_send(target, "表情包暂时发不出去，等会儿再试。")
                 return True
             try:
                 await sender.send_sticker(target, sticker)
@@ -5627,9 +5652,13 @@ def create_app(
         cooldown = max(0.0, float(config.auto_sticker_cooldown_seconds))
         last_sent = last_auto_sticker_at.get(target.conversation_id, 0.0)
         now = time.monotonic()
-        if cooldown and now - last_sent < cooldown:
+        if not explicit_request and cooldown and now - last_sent < cooldown:
             return None
-        candidates = stickers.list_recent(limit=50)
+        candidates = _rank_sticker_candidates(
+            stickers.list_recent(limit=200),
+            f"{user_text}\n{assistant_text}",
+            limit=60,
+        )
         if not candidates:
             return None
         sticker_context = user_text
@@ -5644,6 +5673,7 @@ def create_app(
             candidates=candidates,
             explicit_request=explicit_request,
             contact_context=contact_context,
+            min_confidence=float(config.sticker_min_confidence),
         )
         sticker = stickers.get_by_id(choice_id) if choice_id else None
         if sticker is None:
@@ -7220,28 +7250,139 @@ def _needs_doc_lookup(text: str) -> bool:
     )
 
 
-def _has_sticker_context(user_text: str, assistant_text: str) -> bool:
-    text = f"{user_text} {assistant_text}".lower()
-    return any(
-        marker in text
+def _detect_natural_sticker_request(text: str) -> bool:
+    value = re.sub(r"\s+", "", text.strip().lower())
+    compact = re.sub(r"[，。！？!?,.~～]+", "", value)
+    if not compact or compact.startswith("/"):
+        return False
+    if any(
+        marker in compact
         for marker in (
-            "哈哈",
-            "笑死",
-            "无语",
-            "离谱",
-            "尴尬",
-            "开心",
-            "难过",
-            "生气",
-            "服了",
-            "绝了",
-            "好家伙",
-            "绷不住",
-            "破防",
-            "表情包",
-            "牛",
+            "不要发",
+            "别发",
+            "不准发",
+            "不许发",
+            "别用表情",
+            "不要表情",
+        )
+    ):
+        return False
+    if not any(marker in compact for marker in ("表情包", "表情", "meme")):
+        implicit_mood = re.search(
+            r"(发|来|整|甩|上|给).{0,5}"
+            r"(搞笑|好笑|无语|开心|可爱|生气|难过|震惊|嘲讽|安慰|加油|梗图)",
+            compact,
+        )
+        if implicit_mood is None:
+            return False
+    if any(
+        marker in compact
+        for marker in (
+            "发过",
+            "用过",
+            "收藏过",
+            "收藏了",
+            "有哪些",
+            "什么表情",
+            "几个表情",
+            "多少表情",
+            "为什么",
+            "为啥",
+            "怎么发",
+            "如何发",
+            "哪里发",
+            "谁发",
+            "干嘛",
+            "了吗",
+        )
+    ):
+        return False
+    exact_requests = {
+        "表情包呢",
+        "表情呢",
+        "表情包",
+        "来个表情",
+        "来点表情",
+        "整点表情",
+        "有没有表情包",
+        "有无表情包",
+        "有表情包吗",
+    }
+    if compact in exact_requests:
+        return True
+    if any(
+        marker in compact
+        for marker in ("发", "来", "整", "甩", "给", "上", "用", "回")
+    ):
+        return True
+    return bool(re.search(r"(有没有|有无|还有).{0,4}表情", compact))
+
+
+_STICKER_CATEGORY_ALIASES = {
+    "开心": ("开心", "笑", "哈哈", "好笑", "搞笑", "庆祝", "赞", "棒", "妙"),
+    "无语": ("无语", "尴尬", "离谱", "服了", "汗", "沉默", "省略号"),
+    "震惊": ("震惊", "惊讶", "卧槽", "什么", "居然"),
+    "生气": ("生气", "恼火", "火大", "不满", "气死"),
+    "委屈": ("委屈", "难过", "哭", "心疼", "可怜"),
+    "嘲讽": ("嘲讽", "阴阳", "呵呵", "白眼", "讥讽"),
+    "赞同": ("赞同", "同意", "确实", "可以", "对"),
+    "疑惑": ("疑惑", "问号", "懵", "不懂", "不理解"),
+    "安慰": ("安慰", "抱抱", "别难过", "辛苦", "累", "心疼"),
+    "加油": ("加油", "鼓励", "努力", "冲", "顶住"),
+    "日常": ("日常", "随意", "应景", "合适", "看看"),
+}
+
+
+def _rank_sticker_candidates(
+    candidates: list[dict[str, object]],
+    context: str,
+    *,
+    limit: int | None = None,
+) -> list[dict[str, object]]:
+    compact = re.sub(r"\s+", "", context.lower())
+    if not compact:
+        return candidates[:limit] if limit else candidates
+
+    def score(item: dict[str, object]) -> int:
+        summary = str(item.get("summary") or "").lower()
+        category = str(item.get("category") or "").lower()
+        usage_hint = str(item.get("usage_hint") or "").lower()
+        tags = ",".join(str(tag) for tag in item.get("tags", []) or []).lower()
+        catalog = " ".join((summary, category, usage_hint, tags))
+        result = 0
+        if summary and summary in compact:
+            result += 40
+        if category and category in compact:
+            result += 16
+        for canonical, aliases in _STICKER_CATEGORY_ALIASES.items():
+            request_matches = any(alias in compact for alias in aliases)
+            if not request_matches:
+                continue
+            if canonical in catalog:
+                result += 10
+            result += 3 * sum(alias in catalog for alias in aliases)
+        return result
+
+    indexed = list(enumerate(candidates))
+    indexed.sort(
+        key=lambda pair: (
+            -score(pair[1]),
+            int(pair[1].get("use_count") or 0),
+            pair[0],
         )
     )
+    ranked = [item for _, item in indexed]
+    return ranked[:limit] if limit else ranked
+
+
+def _choose_explicit_sticker_fallback(
+    candidates: list[dict[str, object]],
+    request_text: str,
+) -> dict[str, object] | None:
+    if not candidates:
+        return None
+    ranked = _rank_sticker_candidates(candidates, request_text)
+    return ranked[0] if ranked else None
 
 
 def _sent_sticker_history_label(sticker: StickerSource) -> str:

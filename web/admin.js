@@ -1044,7 +1044,8 @@ function renderGroupSettings(settings) {
   $("#natural-delay-min").value = settings.natural_reply_delay_min_ms ?? 200;
   $("#natural-delay-max").value = settings.natural_reply_delay_max_ms ?? 900;
   $("#natural-debounce").value = settings.natural_message_debounce_ms ?? 0;
-  $("#sticker-cooldown").value = settings.auto_sticker_cooldown_seconds ?? 180;
+  $("#sticker-cooldown").value = settings.auto_sticker_cooldown_seconds ?? 90;
+  $("#sticker-confidence").value = settings.sticker_min_confidence ?? 0.45;
 }
 
 $("#save-group-settings").addEventListener("click", async () => {
@@ -1067,6 +1068,7 @@ $("#save-group-settings").addEventListener("click", async () => {
       natural_reply_delay_max_ms: Number($("#natural-delay-max").value),
       natural_message_debounce_ms: Number($("#natural-debounce").value),
       auto_sticker_cooldown_seconds: Number($("#sticker-cooldown").value),
+      sticker_min_confidence: Number($("#sticker-confidence").value),
       group_min_reply_confidence: Number($("#group-confidence").value),
       group_reply_cooldown_seconds: Number($("#group-cooldown").value),
       group_participation_model: $("#group-model").value.trim(),
