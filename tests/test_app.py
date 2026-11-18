@@ -15,6 +15,7 @@ from qq_ai_bot.app import (
     _clean_model_reply,
     _history_for_current_turn,
     _is_simple_fact_lookup,
+    _is_unsolicited_presence_ping,
     _looks_like_task_request,
     _metric_inference_is_unsupported,
     _needs_casual_rewrite,
@@ -111,7 +112,12 @@ class FakeOneBotClient:
     async def poke(self, target: ReplyTarget) -> None:
         self.poked.append(target)
 
-    async def get_msg_sender_id(self, message_id: int | str) -> int | None:
+    async def get_msg_sender_id(
+        self,
+        message_id: int | str,
+        *,
+        group_id: int | None = None,
+    ) -> int | None:
         return self.quoted_sender_id
 
     async def get_group_list(self) -> list[dict[str, object]]:
@@ -313,6 +319,12 @@ def test_social_tone_hint_softens_requested_edge() -> None:
     fake = _social_tone_hint("回答得好假")
     assert "关心模板" in fake
     assert "不要长篇道歉" in fake
+
+
+def test_unsolicited_presence_ping_is_rejected() -> None:
+    assert _is_unsolicited_presence_ping("发完了", "在吗")
+    assert _is_unsolicited_presence_ping("嗯", "在吗？")
+    assert not _is_unsolicited_presence_ping("你在吗", "在")
 
 
 def test_reply_variety_hint_detects_repeated_openings() -> None:
@@ -944,6 +956,55 @@ async def test_quoting_bot_message_triggers_group_reply_without_mention(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_quoting_another_member_does_not_trigger_group_reply(
+    tmp_path,
+) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    sender.quoted_sender_id = 777
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=False,
+            group_quote_counts_as_mention=True,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        group_reply_decider=FakeGroupDecider(True),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "self_id": 999,
+                "user_id": 123,
+                "group_id": 456,
+                "message_id": 2001,
+                "message": [
+                    {"type": "reply", "data": {"id": "43"}},
+                    {"type": "text", "data": {"text": "我同意他说的"}},
+                ],
+            },
+        )
+        await asyncio.sleep(0.1)
+
+    assert sender.sent == []
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
 async def test_group_can_reply_without_mention(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()
@@ -1464,7 +1525,7 @@ async def test_incoming_poke_notice_makes_bot_respond(tmp_path) -> None:
                 "sender": {"nickname": "小明"},
             },
         )
-        await _wait_for_condition(lambda: bool(sender.sent))
+        await _wait_for_condition(lambda: bool(sender.sent), timeout=8.0)
 
     assert sender.poked[0].user_id == 123
     assert sender.poked[0].group_id == 500

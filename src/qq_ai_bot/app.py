@@ -2751,7 +2751,11 @@ def create_app(
             return
         last_poke_reply[poke_key] = now
 
+        # A poke is a low-urgency notification, not a command. Leave enough
+        # time for a person to notice the phone before reacting.
+        await asyncio.sleep(random.triangular(2.0, 5.5, 3.2))
         await _safe_poke(target)
+        await asyncio.sleep(random.uniform(0.35, 0.9))
         replies = (
             "在呢。",
             "嗯？",
@@ -3685,7 +3689,8 @@ def create_app(
             if content.reply_id:
                 try:
                     replied_user_id = await sender.get_msg_sender_id(
-                        content.reply_id
+                        content.reply_id,
+                        group_id=event.group_id,
                     )
                 except Exception:
                     replied_user_id = None
@@ -3830,6 +3835,7 @@ def create_app(
                 quoted_bot = await _is_reply_to_bot(
                     content.reply_id,
                     event.self_id,
+                    group_id=event.group_id,
                 )
             addressed_by_name = config.bot_name in text
             natural_generation = _detect_natural_generation(text) is not None
@@ -3870,6 +3876,14 @@ def create_app(
                 and not directly_addressed
             ):
                 trace.skip("当前群要求 @、引用或触发前缀")
+                return
+            if (
+                content.reply_id
+                and not quoted_bot
+                and not directly_addressed
+            ):
+                group_behavior.record_ordinary_ignored(group_id)
+                trace.skip("引用了其他成员的消息，但没有明确叫机器人")
                 return
             if (
                 not group_profile.require_mention
@@ -4242,6 +4256,12 @@ def create_app(
                 if is_task_request or loaded_images or use_web_search
                 else config.casual_system_prompt
             )
+            system_prompt += (
+                "\n\n# 对话边界\n"
+                "只回应对方这次实际发来的内容。不要主动发起闲聊，"
+                "不要用“在吗”“在不在”“你在吗”“干嘛呢”这类空开场续聊，"
+                "也不要把回复写成等待对方回应的试探。"
+            )
             if _is_simple_fact_lookup(text):
                 system_prompt += (
                     "\n这是简单事实查询：第一句直接给出答案，通常只保留歌手、"
@@ -4530,6 +4550,9 @@ def create_app(
                         reply = rewritten.strip()
                 except LLMError:
                     logger.warning("Casual reply rewrite failed; using original reply.")
+            if _is_unsolicited_presence_ping(text, reply):
+                trace.skip("模型生成了没有上下文的“在吗”式开场")
+                return
             claim_evidence = "\n".join(
                 part
                 for part in (
@@ -4894,11 +4917,16 @@ def create_app(
     async def _is_reply_to_bot(
         message_id: str,
         self_id: int | None,
+        *,
+        group_id: int | None = None,
     ) -> bool:
         if self_id is None:
             return False
         try:
-            sender_id = await sender.get_msg_sender_id(message_id)
+            sender_id = await sender.get_msg_sender_id(
+                message_id,
+                group_id=group_id,
+            )
         except Exception:
             logger.warning("Could not inspect quoted message", exc_info=True)
             return False
@@ -7206,6 +7234,19 @@ def _clean_model_reply(reply: str) -> str:
     value = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
+
+
+def _is_unsolicited_presence_ping(user_text: str, reply: str) -> bool:
+    openers = {"在吗", "在么", "在不在", "你在吗", "你还在吗", "人呢"}
+
+    def compact(value: str) -> str:
+        return re.sub(r"[\W_]+", "", value.lower(), flags=re.UNICODE)
+
+    reply_value = compact(reply)
+    if reply_value not in openers:
+        return False
+    user_value = compact(user_text)
+    return not any(opener in user_value for opener in openers)
 
 
 async def _rewrite_casual_reply(

@@ -377,7 +377,12 @@ class OneBotClient:
             raise OneBotError("OneBot get_record returned no voice data")
         return record_data
 
-    async def get_msg_sender_id(self, message_id: int | str) -> int | None:
+    async def get_msg_sender_id(
+        self,
+        message_id: int | str,
+        *,
+        group_id: int | None = None,
+    ) -> int | None:
         response = await self._client.post(
             "get_msg",
             json={"message_id": str(message_id)},
@@ -392,14 +397,29 @@ class OneBotClient:
         message_data = data.get("data")
         if not isinstance(message_data, dict):
             return None
+        if group_id is not None:
+            try:
+                returned_group_id = int(message_data.get("group_id"))
+            except (TypeError, ValueError):
+                return None
+            if returned_group_id != int(group_id):
+                return None
         sender = message_data.get("sender")
         if not isinstance(sender, dict):
             return None
         user_id = sender.get("user_id")
         try:
-            return int(user_id)
+            sender_user_id = int(user_id)
         except (TypeError, ValueError):
             return None
+        top_level_user_id = message_data.get("user_id")
+        if top_level_user_id is not None:
+            try:
+                if int(top_level_user_id) != sender_user_id:
+                    return None
+            except (TypeError, ValueError):
+                return None
+        return sender_user_id
 
     async def get_group_list(self) -> list[dict[str, Any]]:
         response = await self._client.post(
