@@ -11,6 +11,7 @@ from qq_ai_bot.grounded_qa import (
     _clean_search_query,
     _decode_html_response,
     _is_low_quality_search_domain,
+    _search_queries,
     _answer_supported_by_sources,
     grounded_lookup,
     is_explicit_search_request,
@@ -143,6 +144,13 @@ def test_search_wrappers_are_removed_from_query() -> None:
     assert _clean_search_query("你联网帮我查一下今天的足球赛程，给我来源") == (
         "今天的足球赛程"
     )
+
+
+def test_natural_weather_question_expands_to_current_forecast_query() -> None:
+    queries = _search_queries("上海明天冷不冷")
+    assert queries
+    assert "上海明天冷不冷 天气 预报 气温" == queries[0]
+    assert "天气预报" in queries[1]
 
 
 def test_generated_sports_seo_domains_are_filtered() -> None:

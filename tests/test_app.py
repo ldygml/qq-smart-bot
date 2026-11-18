@@ -349,6 +349,29 @@ def test_social_short_turns_and_task_detection() -> None:
     assert _needs_web_search("连名带姓这首歌是谁唱的")
     assert _needs_web_search("帮我上网查一下最近的人工智能新闻")
     assert _needs_web_search("现查一下这个政策")
+    for question in (
+        "王宝强是谁",
+        "上海明天热不热",
+        "现在金价多少钱一克",
+        "最近有什么好看的电影",
+        "网上说苹果出了折叠屏，真的假的",
+        "从北京到上海高铁几点",
+        "台风现在到哪了",
+        "世界杯什么时候开始",
+        "王宝强演过什么",
+        "他最近有什么新电影",
+    ):
+        assert _needs_web_search(question), question
+    for question in (
+        "我好累",
+        "你是谁",
+        "他是谁",
+        "晚上吃什么",
+        "帮我编个故事",
+        "你觉得我该不该换工作",
+        "最近工作有点烦",
+    ):
+        assert not _needs_web_search(question), question
     assert not _needs_web_search("比赛")
     assert not _looks_like_task_request("换个话题")
     assert not _looks_like_task_request("比赛")
@@ -2207,6 +2230,64 @@ async def test_current_news_request_enables_web_search(
     assert "足球比赛" in sender.sent[0][1]
     assert "xinhuanet.com" in sender.sent[0][1]
     assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_natural_fact_question_enables_web_search(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_grounded_lookup(*args, **kwargs):
+        calls.append(str(kwargs.get("question") or ""))
+        return GroundedAnswer(
+            answer="王宝强是中国演员、导演。",
+            sources=(
+                GroundedSource(
+                    "百度百科",
+                    "https://baike.baidu.com/item/test",
+                    "王宝强是中国演员",
+                ),
+            ),
+            verified=True,
+        )
+
+    monkeypatch.setattr(
+        "qq_ai_bot.app.grounded_lookup",
+        fake_grounded_lookup,
+    )
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(tmp_path, web_search_enabled=True),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2402,
+                "message": "王宝强是谁",
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert calls == ["王宝强是谁"]
+    assert "baike.baidu.com" in sender.sent[0][1]
 
 
 @pytest.mark.asyncio

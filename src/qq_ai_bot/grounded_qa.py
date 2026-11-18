@@ -1013,7 +1013,31 @@ def _clean_search_query(question: str) -> str:
 
 def _search_queries(question: str) -> list[str]:
     clean = _clean_search_query(question)
-    queries = [clean]
+    weather_markers = (
+        "天气",
+        "气温",
+        "温度",
+        "冷不冷",
+        "热不热",
+        "下雨",
+        "下雪",
+        "空气质量",
+    )
+    if any(marker in clean for marker in weather_markers):
+        weather_query = clean
+        if "天气" not in weather_query:
+            weather_query += " 天气"
+        if not any(
+            marker in weather_query
+            for marker in ("预报", "气温", "温度")
+        ):
+            weather_query += " 预报 气温"
+        queries = [
+            weather_query,
+            f"{clean} 天气预报 中国天气网",
+        ]
+    else:
+        queries = [clean]
     if _requires_authority_sources(clean) and "site:gov.cn" not in clean:
         queries.append(f"{clean} site:gov.cn")
     return queries

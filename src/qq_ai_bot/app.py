@@ -6975,11 +6975,180 @@ def _is_simple_fact_lookup(text: str) -> bool:
     )
 
 
+def _looks_like_verifiable_lookup(text: str) -> bool:
+    value = re.sub(r"\s+", "", text.strip().lower())
+    if len(value) < 3:
+        return False
+
+    if re.search(
+        r"^(?:请问)?(?:介绍|说说|讲讲|聊聊)(?:一下)?"
+        r"(?:你自己|你|我|我们|你自己吧)$",
+        value,
+    ):
+        return False
+
+    if re.search(
+        r"^(?:请问|问一下)?(?:听说|据说|网传|网上说|有人说)",
+        value,
+    ) or any(
+        marker in value
+        for marker in (
+            "真的假的",
+            "是真的吗",
+            "是不是真的",
+            "有这回事吗",
+            "属实吗",
+            "可信吗",
+            "靠谱吗",
+            "帮我核实",
+            "帮我确认",
+        )
+    ):
+        return True
+
+    if re.search(
+        r"^(?:请问|问一下|帮我|给我)?"
+        r"(?:介绍一下|说说|讲讲|了解一下).{2,30}$",
+        value,
+    ):
+        return True
+
+    entity_question = re.search(
+        r".{2,30}(?:是谁|是什么人|干什么的|做什么的|代表作|有什么作品|"
+        r"哪个国家|哪家公司|在哪里|在哪|什么时候|哪一年|哪张专辑|"
+        r"多少钱|多少岁|多高|多重)$",
+        value,
+    )
+    if entity_question:
+        subject = re.sub(
+            r"^(?:请问|问一下|帮我|给我)",
+            "",
+            entity_question.group(0),
+        )
+        subject = re.sub(
+            r"(?:是谁|是什么人|干什么的|做什么的|代表作|有什么作品|"
+            r"哪个国家|哪家公司|在哪里|在哪|什么时候|哪一年|哪张专辑|"
+            r"多少钱|多少岁|多高|多重)$",
+            "",
+            subject,
+        )
+        if subject not in {
+            "我",
+            "我们",
+            "你",
+            "你们",
+            "他",
+            "她",
+            "它",
+            "他们",
+            "她们",
+        }:
+            return True
+    if re.search(
+        r"(?:演过|唱过|写过|拍过|做过)什么|"
+        r"(?:什么时候|哪一年|几点|多久).{0,10}"
+        r"(?:发布|生效|实施|开始|结束|举行|发行|上映|开售|公布|出台)",
+        value,
+    ):
+        return True
+
+    current_scope = re.search(
+        r"(?:今天|今日|明天|明日|现在|当前|最近|本周|这周|本月|今年|"
+        r"刚刚|最新|实时)",
+        value,
+    )
+    dynamic_topic = any(
+        marker in value
+        for marker in (
+            "天气",
+            "气温",
+            "温度",
+            "下雨",
+            "下雪",
+            "冷不冷",
+            "热不热",
+            "空气质量",
+            "新闻",
+            "消息",
+            "动态",
+            "热搜",
+            "比赛",
+            "比分",
+            "赛程",
+            "转会",
+            "伤病",
+            "积分榜",
+            "排名",
+            "榜单",
+            "股价",
+            "金价",
+            "油价",
+            "房价",
+            "汇率",
+            "价格",
+            "多少钱",
+            "航班",
+            "高铁",
+            "火车",
+            "班次",
+            "票价",
+            "路况",
+            "限行",
+            "台风",
+            "地震",
+            "疫情",
+            "政策",
+            "法规",
+            "版本",
+            "发布",
+            "上映",
+            "开售",
+            "预约",
+            "演唱会",
+            "展览",
+            "电影",
+            "电视剧",
+            "综艺",
+            "赛事",
+            "考试时间",
+            "报名时间",
+            "录取结果",
+            "分数线",
+            "结果",
+            "大事",
+            "进展",
+            "突破",
+            "发布会",
+            "游戏",
+            "手机",
+            "销量",
+            "优惠",
+            "折扣",
+            "值得买",
+            "黄金",
+        )
+    )
+    if current_scope and dynamic_topic:
+        return True
+
+    if re.search(
+        r"(?:哪里|哪儿|去哪).{0,10}(?:好玩|好吃|景点|餐厅)|"
+        r"(?:有什么|推荐).{0,10}"
+        r"(?:好玩|好吃|景点|餐厅|电影|电视剧|综艺|动漫|游戏)|"
+        r"从.{1,18}到.{1,18}(?:怎么去|几点|多久|怎么走)",
+        value,
+    ):
+        return True
+    return False
+
+
 def _needs_web_search(text: str) -> bool:
     value = text.lower()
     if _wants_forced_research(value):
         return True
     if _is_simple_fact_lookup(value):
+        return True
+    if _looks_like_verifiable_lookup(value):
         return True
     direct_markers = (
         "联网搜索",
