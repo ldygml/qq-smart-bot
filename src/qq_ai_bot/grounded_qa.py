@@ -5,7 +5,7 @@ import html
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import httpx
@@ -86,6 +86,14 @@ async def grounded_lookup(
     current_date: str | None = None,
 ) -> GroundedAnswer:
     local_date = current_date or datetime.now().astimezone().date().isoformat()
+    sports_result = await sports_schedule_lookup(
+        question,
+        current_date=local_date,
+        trust_env=trust_env,
+        transport=transport,
+    )
+    if sports_result is not None:
+        return sports_result
     music_result = await music_catalog_lookup(
         question,
         trust_env=trust_env,
@@ -117,8 +125,6 @@ async def grounded_lookup(
         if searched is not None:
             return searched
     reason = "没有获得可核验的事实答案。"
-    unverified_answer = ""
-    unverified_sources: list[GroundedSource] = []
     for attempt in range(2):
         prompt = _grounding_prompt(question, strict=attempt > 0)
         reply = await chat_client.chat(
@@ -152,9 +158,6 @@ async def grounded_lookup(
             question=question,
             answer=answer,
         )
-        if answer and candidates:
-            unverified_answer = answer
-            unverified_sources = candidates[:4]
         if len({urlparse(item.url).netloc.lower() for item in candidates}) < 2:
             reason = "检索结果缺少两个不同域名的可信来源，暂不下结论。"
             continue
@@ -223,15 +226,207 @@ async def grounded_lookup(
             reason="联网检索已执行，但没有完成交叉核验。",
             verification_level="live_search_pages_unverified",
         )
-    if unverified_answer:
-        return GroundedAnswer(
-            answer=unverified_answer,
-            sources=tuple(unverified_sources),
-            verified=False,
-            reason=reason,
-            verification_level="source_links_unverified",
-        )
     return GroundedAnswer("", reason=reason)
+
+
+async def sports_schedule_lookup(
+    question: str,
+    *,
+    current_date: str,
+    trust_env: bool = False,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> GroundedAnswer | None:
+    if "篮球" in question or "nba" in question.lower():
+        return None
+    normalized_question = question.lower()
+    football_terms = (
+        "足球",
+        "球赛",
+        "赛程",
+        "比分",
+        "对阵",
+        "中超",
+        "英超",
+        "西甲",
+        "德甲",
+        "意甲",
+        "法甲",
+        "欧冠",
+        "欧联",
+        "世界杯",
+        "亚洲杯",
+    )
+    if not any(term in normalized_question for term in football_terms):
+        return None
+    has_schedule_word = any(
+        marker in normalized_question for marker in ("赛程", "对阵")
+    )
+    has_date_scope = any(
+        marker in normalized_question
+        for marker in (
+            "今天",
+            "今日",
+            "今晚",
+            "现在",
+            "明天",
+            "明日",
+            "昨天",
+            "昨日",
+        )
+    ) or bool(
+        re.search(r"20\d{2}\s*[年./-]\s*\d{1,2}\s*[月./-]\s*\d{1,2}", question)
+    )
+    has_event_word = any(
+        marker in normalized_question
+        for marker in ("比赛", "球赛", "比分", "对阵")
+    )
+    if not has_schedule_word and not (has_event_word and has_date_scope):
+        return None
+    schedule_date = _sports_schedule_date(question, current_date)
+    if schedule_date is None:
+        return None
+    endpoint = "https://www.thesportsdb.com/api/v1/json/123/eventsday.php"
+    params = {"d": schedule_date, "s": "Soccer"}
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            trust_env=trust_env,
+            timeout=httpx.Timeout(20.0),
+            transport=transport,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                )
+            },
+        ) as client:
+            response = await client.get(endpoint, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    raw_events = data.get("events") if isinstance(data, dict) else None
+    events = (
+        [item for item in raw_events if isinstance(item, dict)]
+        if isinstance(raw_events, list)
+        else []
+    )
+    league_aliases = (
+        ("英超", ("english premier league",)),
+        ("西甲", ("spanish la liga", "la liga")),
+        ("德甲", ("german bundesliga", "bundesliga")),
+        ("意甲", ("italian serie a",)),
+        ("法甲", ("french ligue 1", "ligue 1")),
+        ("欧冠", ("uefa champions league",)),
+        ("欧联", ("uefa europa league",)),
+        ("中超", ("chinese super league",)),
+        ("世界杯", ("fifa world cup",)),
+        ("亚洲杯", ("afc asian cup",)),
+    )
+    requested_league = next(
+        (
+            (label, aliases)
+            for label, aliases in league_aliases
+            if label in question
+        ),
+        None,
+    )
+    if requested_league is not None:
+        _, aliases = requested_league
+        events = [
+            event
+            for event in events
+            if any(
+                alias in str(event.get("strLeague") or "").lower()
+                for alias in aliases
+            )
+        ]
+    source_url = str(httpx.URL(endpoint, params=params))
+    source = GroundedSource(
+        title=f"TheSportsDB {schedule_date} 足球赛程",
+        url=source_url,
+        quote=f"{schedule_date} Soccer events",
+    )
+    if not events:
+        if requested_league is not None:
+            no_match = (
+                f"TheSportsDB 的 {schedule_date} 数据中没有符合"
+                f"“{requested_league[0]}”条件的比赛。这不等于现实中绝对没有比赛，"
+                "只是这个数据源这次没有给出匹配记录。"
+            )
+        else:
+            no_match = (
+                f"TheSportsDB 的 {schedule_date} 足球赛程数据中没有列出比赛。"
+                "这不代表全世界当天绝对没有比赛，只是这个数据源没有记录。"
+            )
+        return GroundedAnswer(
+            answer=no_match,
+            sources=(source,),
+            verified=True,
+            verification_level="sports_data_api",
+        )
+    lines = [f"TheSportsDB 的 {schedule_date} 足球赛程："]
+    for event in events[:20]:
+        home = str(event.get("strHomeTeam") or "").strip()
+        away = str(event.get("strAwayTeam") or "").strip()
+        if not home or not away:
+            continue
+        league = str(event.get("strLeague") or "").strip()
+        event_time = str(event.get("strTime") or "").strip()
+        status = str(event.get("strStatus") or "").strip()
+        status_label = {
+            "NS": "未开始",
+            "FT": "已结束",
+            "AET": "加时结束",
+            "PEN": "点球结束",
+            "POSTP": "延期",
+            "CANC": "取消",
+        }.get(status, status)
+        details = " vs ".join((home, away))
+        if league:
+            details += f"（{league}）"
+        if event_time:
+            details += f" 时间 {event_time[:5]}"
+        home_score = str(event.get("intHomeScore") or "").strip()
+        away_score = str(event.get("intAwayScore") or "").strip()
+        if home_score and away_score:
+            details += f" 比分 {home_score}-{away_score}"
+        if status_label:
+            details += f" 状态 {status_label}"
+        lines.append(f"{len(lines)}. {details}")
+    if len(lines) == 1:
+        return None
+    if len(events) > 20:
+        lines.append(f"数据源共有 {len(events)} 场，上面只列出前 20 场。")
+    lines.append("时间字段按数据源原样展示，未擅自换算时区。")
+    return GroundedAnswer(
+        answer="\n".join(lines),
+        sources=(source,),
+        verified=True,
+        verification_level="sports_data_api",
+    )
+
+
+def _sports_schedule_date(question: str, current_date: str) -> str | None:
+    explicit = re.search(
+        r"(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})",
+        question,
+    )
+    if explicit:
+        year, month, day = (int(value) for value in explicit.groups())
+        try:
+            return datetime(year, month, day).date().isoformat()
+        except ValueError:
+            return None
+    try:
+        base_date = datetime.fromisoformat(current_date).date()
+    except ValueError:
+        return None
+    if any(marker in question for marker in ("明天", "明日")):
+        return (base_date + timedelta(days=1)).isoformat()
+    if any(marker in question for marker in ("昨天", "昨日")):
+        return (base_date - timedelta(days=1)).isoformat()
+    return base_date.isoformat()
 
 
 async def music_catalog_lookup(
@@ -953,6 +1148,8 @@ async def _answer_from_search_pages(
             reason="联网页面日期与今天不一致。",
             verification_level="stale_live_source",
         )
+    if not _answer_supported_by_sources(answer, selected):
+        return None
     if summary and not re.search(r"(?m)^\s*1[.、]", answer):
         organized = await _organize_grounded_answer(
             chat_client,
@@ -1004,6 +1201,47 @@ def _stale_today_date(
     if any(value.replace("-", "") == normalized_current for value in dates):
         return ""
     return dates[0]
+
+
+def _answer_supported_by_sources(
+    answer: str,
+    sources: list[GroundedSource],
+) -> bool:
+    if not answer or not sources:
+        return False
+    corpus = " ".join(
+        f"{source.title} {source.quote} {source.page_text}"
+        for source in sources
+    )
+    compact_corpus = re.sub(r"\s+", "", corpus)
+    dates = re.findall(
+        r"(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})",
+        answer,
+    )
+    for year, month, day in dates:
+        if f"{int(year):04d}{int(month):02d}{int(day):02d}" not in re.sub(
+            r"\D",
+            "",
+            corpus,
+        ):
+            return False
+    for value in re.findall(r"(?<!\d)\d{1,2}:\d{2}(?!\d)", answer):
+        if value not in corpus:
+            return False
+    if "官方" in answer and "官方" not in corpus:
+        return False
+    for quote in re.findall(r"[“\"]([^”\"]{2,80})[”\"]", answer):
+        if re.sub(r"\s+", "", quote) not in compact_corpus:
+            return False
+    matchup_pattern = (
+        r"(?:^|[\s，,；;、])"
+        r"([\u4e00-\u9fff]{2,10})\s*(?:vs\.?|VS|对阵)\s*"
+        r"([\u4e00-\u9fff]{2,10})"
+    )
+    for home, away in re.findall(matchup_pattern, answer, re.IGNORECASE):
+        if home not in compact_corpus or away not in compact_corpus:
+            return False
+    return True
 
 
 def _wants_organized_answer(question: str) -> bool:

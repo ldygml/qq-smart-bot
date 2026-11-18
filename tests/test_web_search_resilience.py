@@ -11,8 +11,10 @@ from qq_ai_bot.grounded_qa import (
     _clean_search_query,
     _decode_html_response,
     _is_low_quality_search_domain,
+    _answer_supported_by_sources,
     grounded_lookup,
     is_explicit_search_request,
+    sports_schedule_lookup,
 )
 from qq_ai_bot.app import _format_grounded_reply
 
@@ -67,6 +69,20 @@ class StaleSourceChat:
             {
                 "answer": "今日（2026年11月17日）有一场足球比赛。[来源1]",
                 "source_ids": [1],
+            },
+            ensure_ascii=False,
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+class HallucinatingChat:
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        return json.dumps(
+            {
+                "answer": "今晚 23:45 曼城vs利物浦。[来源1]",
+                "source_ids": [1, 2],
             },
             ensure_ascii=False,
         )
@@ -148,6 +164,25 @@ def test_html_pages_without_charset_fall_back_to_gb18030() -> None:
     assert "今日足球赛程" in _decode_html_response(response)
 
 
+def test_unsupported_entities_and_times_are_rejected() -> None:
+    sources = [
+        GroundedSource(
+            title="赛程",
+            url="https://example.com/schedule",
+            quote="",
+            page_text="今天只有阿森纳对切尔西，开赛时间 20:00",
+        )
+    ]
+    assert not _answer_supported_by_sources(
+        "今晚 23:45 曼城vs利物浦。[来源1]",
+        sources,
+    )
+    assert _answer_supported_by_sources(
+        "阿森纳对切尔西在 20:00 开赛。[来源1]",
+        sources,
+    )
+
+
 def test_unverified_search_text_is_not_discarded() -> None:
     reply = _format_grounded_reply(
         GroundedAnswer(
@@ -224,7 +259,11 @@ async def test_real_time_football_can_use_one_known_data_source() -> None:
             )
         return httpx.Response(
             200,
-            text="<html><body>2026-11-18 今日足球赛程 " + "比赛数据 " * 80 + "</body></html>",
+            text=(
+                "<html><body>2026-11-18 今日足球赛程 23:00 "
+                + "比赛数据 " * 80
+                + "</body></html>"
+            ),
         )
 
     result = await grounded_lookup(
@@ -265,3 +304,112 @@ async def test_stale_schedule_is_not_presented_as_today() -> None:
     assert result.verification_level == "stale_live_source"
     assert "2026-11-17" in result.answer
     assert "2026-11-18" in result.answer
+
+
+@pytest.mark.asyncio
+async def test_football_schedule_uses_structured_data_not_search_snippets() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "www.thesportsdb.com"
+        return httpx.Response(
+            200,
+            json={
+                "events": [
+                    {
+                        "strHomeTeam": "Coritiba",
+                        "strAwayTeam": "Santos",
+                        "strLeague": "Brazilian Serie A",
+                        "strTime": "22:30:00",
+                        "strStatus": "NS",
+                    }
+                ]
+            },
+        )
+
+    result = await sports_schedule_lookup(
+        "搜索今天的足球赛程",
+        current_date="2026-11-18",
+        transport=httpx.MockTransport(handler),
+    )
+    assert result is not None
+    assert result.verified is True
+    assert result.verification_level == "sports_data_api"
+    assert "Coritiba vs Santos" in result.answer
+    assert "未开始" in result.answer
+
+
+@pytest.mark.asyncio
+async def test_generic_football_question_does_not_fetch_schedule() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    result = await sports_schedule_lookup(
+        "足球是什么",
+        current_date="2026-11-18",
+        transport=httpx.MockTransport(handler),
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_football_schedule_filters_requested_league_and_date() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "www.thesportsdb.com"
+        assert request.url.params["d"] == "2026-11-19"
+        return httpx.Response(
+            200,
+            json={
+                "events": [
+                    {
+                        "strHomeTeam": "Arsenal",
+                        "strAwayTeam": "Chelsea",
+                        "strLeague": "English Premier League",
+                        "strTime": "20:00:00",
+                        "strStatus": "NS",
+                    },
+                    {
+                        "strHomeTeam": "Coritiba",
+                        "strAwayTeam": "Santos",
+                        "strLeague": "Brazilian Serie A",
+                        "strTime": "22:30:00",
+                        "strStatus": "NS",
+                    },
+                ]
+            },
+        )
+
+    result = await sports_schedule_lookup(
+        "明天英超赛程",
+        current_date="2026-11-18",
+        transport=httpx.MockTransport(handler),
+    )
+    assert result is not None
+    assert "Arsenal vs Chelsea" in result.answer
+    assert "Coritiba" not in result.answer
+    assert "2026-11-19" in result.answer
+
+
+@pytest.mark.asyncio
+async def test_hallucinated_matchup_is_not_returned() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "www.so.com":
+            return httpx.Response(
+                200,
+                text=(
+                    '<a data-mdurl="https://www.example.com/a" href="#">A</a>'
+                    '<a data-mdurl="https://www.example.org/b" href="#">B</a>'
+                ),
+            )
+        return httpx.Response(
+            200,
+            text="<html><body>阿森纳对切尔西，开赛时间 20:00。" + "正文 " * 120 + "</body></html>",
+        )
+
+    result = await grounded_lookup(
+        HallucinatingChat(),
+        model="test",
+        question="搜索今晚的足球比赛",
+        transport=httpx.MockTransport(handler),
+    )
+    assert result.verified is False
+    assert "23:45" not in result.answer
+    assert "曼城vs利物浦" not in result.answer
