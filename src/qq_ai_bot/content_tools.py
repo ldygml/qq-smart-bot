@@ -199,6 +199,7 @@ async def generate_chart(
     model: str,
     prompt: str,
     output_dir: Path,
+    requested_name: str = "",
 ) -> GeneratedArtifact:
     reply = await chat_client.chat(
         [
@@ -242,7 +243,11 @@ async def generate_chart(
     image.save(path, format="PNG")
     return GeneratedArtifact(
         path=path,
-        name=_canonical_file_name(title, "png", "数据图表"),
+        name=_canonical_file_name(
+            requested_name or title,
+            "png",
+            "数据图表",
+        ),
         kind="image",
         summary=f"已生成图表：{title}",
     )
@@ -255,6 +260,7 @@ async def generate_document(
     prompt: str,
     output_dir: Path,
     force_research: bool = False,
+    requested_name: str = "",
 ) -> GeneratedArtifact:
     research = await _research_context(
         chat_client,
@@ -358,7 +364,11 @@ async def generate_document(
         for source in sources[:8]:
             document.add_paragraph(source)
     output_dir.mkdir(parents=True, exist_ok=True)
-    clean_name = _canonical_file_name(title, "docx", "文档")
+    clean_name = _canonical_file_name(
+        requested_name or title,
+        "docx",
+        "文档",
+    )
     stem = Path(clean_name).stem
     path = output_dir / (
         f"{stem}_{datetime.now():%Y%m%d_%H%M%S_%f}.docx"
@@ -379,6 +389,7 @@ async def generate_file(
     prompt: str,
     output_dir: Path,
     force_research: bool = False,
+    requested_name: str = "",
 ) -> GeneratedArtifact:
     research = await _research_context(
         chat_client,
@@ -432,7 +443,11 @@ async def generate_file(
         content = content.rstrip() + "\n\n## 参考资料\n\n" + "\n".join(
             f"- {source}" for source in sources[:8]
         )
-    clean_name = _canonical_file_name(title, extension, "生成文件")
+    clean_name = _canonical_file_name(
+        requested_name or title,
+        extension,
+        "生成文件",
+    )
     stem = Path(clean_name).stem
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / (
@@ -497,6 +512,7 @@ async def generate_code(
     fallback_model: str | None = None,
     prompt: str,
     output_dir: Path,
+    requested_name: str = "",
 ) -> GeneratedArtifact:
     request_messages = [
             {
@@ -610,7 +626,15 @@ async def generate_code(
         path.write_text(content, encoding="utf-8")
         return GeneratedArtifact(
             path=path,
-            name=original_name,
+            name=(
+                _canonical_file_name(
+                    requested_name,
+                    suffix,
+                    Path(original_name).stem,
+                )
+                if requested_name
+                else original_name
+            ),
             kind="code",
             summary=str(
                 spec.get("summary") or "代码文件已生成"
@@ -637,7 +661,15 @@ async def generate_code(
             archive.write(source, f"{project_stem}/{relative_path}")
     return GeneratedArtifact(
         path=archive_path,
-        name=f"{project_stem}.zip",
+        name=(
+            _canonical_file_name(
+                requested_name,
+                "zip",
+                project_stem,
+            )
+            if requested_name
+            else f"{project_stem}.zip"
+        ),
         kind="archive",
         summary=f"{summary}（{len(files)} 个文件，已打包 ZIP）",
     )
@@ -806,6 +838,24 @@ _OUTPUT_EXTENSIONS = {
     "toml",
 }
 
+_STRIPPABLE_EXTENSIONS = _OUTPUT_EXTENSIONS | {
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+    "gif",
+    "bmp",
+    "pdf",
+    "svg",
+    "zip",
+    "wav",
+    "mp3",
+    "ogg",
+    "m4a",
+    "xml",
+    "doc",
+}
+
 
 def _strip_known_suffix(value: str) -> str:
     stem = value.strip()
@@ -813,7 +863,7 @@ def _strip_known_suffix(value: str) -> str:
     while changed:
         changed = False
         suffix = Path(stem).suffix.lower().lstrip(".")
-        if suffix in _OUTPUT_EXTENSIONS:
+        if suffix in _STRIPPABLE_EXTENSIONS:
             stem = stem[: -(len(suffix) + 1)].rstrip(" ._-")
             changed = True
     return stem

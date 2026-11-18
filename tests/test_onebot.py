@@ -400,6 +400,44 @@ async def test_get_group_root_files_normalizes_napcat_response() -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_get_group_file_url_supports_napcat_field_variants() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/get_group_file_url")
+        assert json.loads(request.content) == {
+            "group_id": 100,
+            "file_id": "file-1",
+            "busid": 102,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "retcode": 0,
+                "data": {
+                    "download_url": "https://cdn.example.com/file-1.pdf",
+                    "file_name": "讲义.pdf",
+                },
+            },
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.get_group_file_url(
+            100,
+            "file-1",
+            busid=102,
+        )
+    finally:
+        await client.close()
+    assert result["url"] == "https://cdn.example.com/file-1.pdf"
+    assert result["file_name"] == "讲义.pdf"
+
+
 def test_at_another_user_is_not_bot_mention() -> None:
     content = extract_message_content(
         [{"type": "at", "data": {"qq": "20002"}}],

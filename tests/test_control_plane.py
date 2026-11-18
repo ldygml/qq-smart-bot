@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from starlette.requests import Request
 
 from qq_ai_bot import control_plane
 from qq_ai_bot.control_plane import ControlStore, SecretBox
@@ -580,3 +581,117 @@ async def test_instance_admin_proxy_sends_owner_token(
     assert captured["headers"] == {
         "X-Bot-Admin-Token": "owner-token"
     }
+
+
+@pytest.mark.asyncio
+async def test_control_file_proxy_streams_range_and_headers(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = ControlStore(tmp_path / "control.db")
+    box = SecretBox()
+    user_id = store.create_user("owner", "secure-password")
+    provider_id = store.save_provider(
+        user_id=user_id,
+        provider_id=None,
+        name="provider",
+        provider_type="custom",
+        base_url="https://api.example.com/v1",
+        model="chat",
+        api_key_encrypted=box.encrypt("key"),
+    )
+    instance_id = store.save_instance(
+        user_id=user_id,
+        instance_id=None,
+        name="instance",
+        port=18081,
+        onebot_api_base="http://127.0.0.1:13000",
+        onebot_token_encrypted=box.encrypt("owner-token"),
+        provider_id=provider_id,
+        database_path="data/test.db",
+    )
+    session_token, _ = store.create_session(user_id)
+    captured: dict[str, object] = {}
+    released = {"response": False, "client": False}
+
+    class FakeResponse:
+        is_error = False
+        status_code = 206
+        headers = httpx.Headers(
+            {
+                "content-type": "application/zip",
+                "content-disposition": (
+                    "attachment; filename*=UTF-8''test.zip"
+                ),
+                "content-length": "4",
+                "content-range": "bytes 0-3/12",
+                "accept-ranges": "bytes",
+                "x-content-type-options": "nosniff",
+            }
+        )
+
+        async def aiter_bytes(self, size: int):
+            assert size == 64 * 1024
+            yield b"test"
+
+        async def aclose(self) -> None:
+            released["response"] = True
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def build_request(self, method, url, *, headers):
+            captured.update(method=method, url=url, headers=headers)
+            return object()
+
+        async def send(self, request, *, stream):
+            assert stream is True
+            return FakeResponse()
+
+        async def aclose(self) -> None:
+            released["client"] = True
+
+    monkeypatch.setattr(control_plane, "store", store)
+    monkeypatch.setattr(control_plane, "secrets_box", box)
+    monkeypatch.setattr(control_plane.httpx, "AsyncClient", FakeClient)
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": (
+                f"/api/instances/{instance_id}/group-profiles/456/"
+                "file-content"
+            ),
+            "query_string": b"file_id=abc&name=test.zip&busid=102",
+            "headers": [
+                (
+                    b"cookie",
+                    f"qq_control_session={session_token}".encode(),
+                ),
+                (b"range", b"bytes=0-3"),
+            ],
+        }
+    )
+
+    response = await control_plane.instance_group_file_content(
+        instance_id,
+        456,
+        request,
+    )
+    chunks = [chunk async for chunk in response.body_iterator]
+
+    assert response.status_code == 206
+    assert b"".join(chunks) == b"test"
+    assert response.headers["content-range"] == "bytes 0-3/12"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-type"] == "application/zip"
+    assert captured["method"] == "GET"
+    assert captured["url"].endswith(
+        "/api/admin/group-profiles/456/file-content"
+        "?file_id=abc&name=test.zip&busid=102"
+    )
+    assert "owner-token" not in str(captured["url"])
+    assert captured["headers"]["Range"] == "bytes=0-3"
+    assert captured["headers"]["X-Bot-Admin-Token"] == "owner-token"
+    assert released == {"response": True, "client": True}

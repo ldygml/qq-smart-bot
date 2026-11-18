@@ -7,6 +7,10 @@ const state = {
   groupMembers: [],
   groupRelationships: [],
   groupFiles: [],
+  groupFolderId: "",
+  groupFolderTrail: [{id: "", name: "根目录"}],
+  generatedArtifacts: [],
+  selectedGenerated: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -77,6 +81,7 @@ document.querySelectorAll("nav button").forEach((button) => {
       knowledge: loadKnowledge,
       operations: loadOperations,
       evolution: loadEvolution,
+      generate: loadGeneratedHistory,
     };
     loaders[button.dataset.tab]?.().catch((error) => alert(error.message));
   });
@@ -836,6 +841,8 @@ async function loadGroupDetails(groupId) {
   state.groupMembers = data.members;
   state.groupRelationships = data.relationships || [];
   state.groupFiles = [];
+  state.groupFolderId = "";
+  state.groupFolderTrail = [{id: "", name: "根目录"}];
   renderGroupKnowledge();
   renderGroupMembers();
   renderGroupRelationships();
@@ -889,7 +896,24 @@ function renderGroupFiles(data = null) {
       ...(data.folders || []).map((item) => ({...item, kind: "folder"})),
       ...(data.files || []).map((item) => ({...item, kind: "file"})),
     ];
+    state.groupFolderId = data.folder_id || "";
   }
+  const breadcrumb = $("#group-file-breadcrumb");
+  breadcrumb.innerHTML = state.groupFolderTrail.map((item, index) => `
+    <button type="button" data-group-folder-index="${index}">${esc(item.name || "文件夹")}</button>
+    ${index < state.groupFolderTrail.length - 1 ? "<span>/</span>" : ""}
+  `).join("");
+  breadcrumb.querySelectorAll("[data-group-folder-index]").forEach((button) => {
+    button.onclick = () => {
+      const index = Number(button.dataset.groupFolderIndex);
+      const target = state.groupFolderTrail[index];
+      if (!target) return;
+      state.groupFolderTrail = state.groupFolderTrail.slice(0, index + 1);
+      loadGroupFiles(target.id, target.name, false).catch((error) => {
+        $("#group-profile-status").textContent = error.message;
+      });
+    };
+  });
   $("#group-file-list").innerHTML = state.groupFiles.length
     ? state.groupFiles.map((item) => `
       <article class="source-row">
@@ -898,8 +922,51 @@ function renderGroupFiles(data = null) {
         <div class="row-meta">${item.kind === "folder"
           ? `ID: ${esc(item.folder_id)} · ${esc(item.file_count || 0)} 项`
           : `${number(item.size)} 字节 · 上传者 ${esc(item.uploader || "未知")}`}</div>
+        ${item.kind === "folder"
+          ? `<button type="button" data-open-group-folder="${esc(item.folder_id)}" data-folder-name="${esc(item.name)}">打开</button>`
+          : `<div class="file-actions"><a class="button-link" target="_blank" rel="noopener" href="${esc(groupFileContentUrl(item, false))}">查看</a><a class="button-link" href="${esc(groupFileContentUrl(item, true))}">下载</a></div>`}
       </article>`).join("")
     : `<div class="muted">尚未读取群文件。</div>`;
+  document.querySelectorAll("[data-open-group-folder]").forEach((button) => {
+    button.onclick = () => {
+      const folderId = button.dataset.openGroupFolder || "";
+      const folderName = button.dataset.folderName || "文件夹";
+      state.groupFolderTrail.push({id: folderId, name: folderName});
+      loadGroupFiles(folderId, folderName, false).catch((error) => {
+        $("#group-profile-status").textContent = error.message;
+      });
+    };
+  });
+}
+
+function groupFileContentUrl(item, download) {
+  const params = new URLSearchParams({
+    file_id: String(item.file_id || ""),
+    busid: String(item.busid ?? ""),
+    name: String(item.name || ""),
+  });
+  if (download) params.set("download", "true");
+  const groupId = Number($("#group-profile-select").value);
+  return `${scopedAdminPath(`/api/admin/group-profiles/${groupId}/file-content`)}?${params}`;
+}
+
+async function loadGroupFiles(folderId = "", folderName = "", pushTrail = true) {
+  const groupId = Number($("#group-profile-select").value);
+  if (!groupId) return;
+  const button = $("#load-group-files");
+  button.disabled = true;
+  button.textContent = "读取中…";
+  try {
+    const query = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : "";
+    const data = await api(`/api/admin/group-profiles/${groupId}/files${query}`);
+    if (pushTrail && folderId) {
+      state.groupFolderTrail.push({id: folderId, name: folderName || "文件夹"});
+    }
+    renderGroupFiles(data);
+  } finally {
+    button.disabled = false;
+    button.textContent = "读取群文件";
+  }
 }
 
 $("#group-profile-select").addEventListener("change", async (event) => {
@@ -1028,21 +1095,27 @@ $("#save-group-member").addEventListener("click", async () => {
 });
 
 $("#load-group-files").addEventListener("click", async () => {
-  const groupId = Number($("#group-profile-select").value);
-  if (!groupId) return;
-  const button = $("#load-group-files");
-  button.disabled = true;
-  button.textContent = "读取中…";
+  const folderId = $("#group-folder-id").value.trim();
+  if (!folderId) state.groupFolderTrail = [{id: "", name: "根目录"}];
   try {
-    const folderId = $("#group-folder-id").value.trim();
-    const query = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : "";
-    const data = await api(`/api/admin/group-profiles/${groupId}/files${query}`);
-    renderGroupFiles(data);
+    await loadGroupFiles(
+      folderId,
+      folderId ? `文件夹 ${folderId}` : "根目录",
+      Boolean(folderId),
+    );
   } catch (error) {
     $("#group-profile-status").textContent = error.message;
-  } finally {
-    button.disabled = false;
-    button.textContent = "读取群文件";
+  }
+});
+
+$("#group-files-up").addEventListener("click", async () => {
+  if (state.groupFolderTrail.length <= 1) return;
+  state.groupFolderTrail.pop();
+  const parent = state.groupFolderTrail[state.groupFolderTrail.length - 1];
+  try {
+    await loadGroupFiles(parent.id, parent.name, false);
+  } catch (error) {
+    $("#group-profile-status").textContent = error.message;
   }
 });
 
@@ -1193,6 +1266,144 @@ $("#load-topics").addEventListener("click", async () => {
   }
 });
 
+function generatedKindLabel(kind) {
+  return ({
+    image: "图表",
+    file: "文档/文件",
+    code: "代码",
+    archive: "ZIP 项目",
+    audio: "语音",
+  })[kind] || kind || "文件";
+}
+
+function generatedStatusLabel(item) {
+  if (item.status === "ready") return "可下载";
+  if (item.status === "running") return "生成中";
+  return "失败";
+}
+
+async function loadGeneratedHistory() {
+  const data = await api("/api/admin/generated?limit=40");
+  state.generatedArtifacts = data.artifacts || [];
+  renderGeneratedHistory();
+}
+
+function renderGeneratedHistory() {
+  const list = $("#generated-history");
+  list.innerHTML = state.generatedArtifacts.length
+    ? state.generatedArtifacts.map((item) => `
+      <article class="source-row generated-history-row">
+        <div><span class="tag">${esc(generatedKindLabel(item.kind))}</span>
+          <strong>${esc(item.display_name || "未命名生成任务")}</strong>
+          <span class="tag">${esc(generatedStatusLabel(item))}</span></div>
+        <div class="row-meta">${dateText(item.created_at)} · ${number(item.size)} 字节 · 来源 ${esc(item.source || "website")}</div>
+        <div class="row-meta">${esc((item.prompt || "").slice(0, 180))}</div>
+        ${item.status === "failed" ? `<div class="error">${esc(item.error || "生成失败")}</div>` : ""}
+        <div class="file-actions">
+          ${item.status === "ready" && item.available ? `<button type="button" data-view-generated="${item.id}">预览</button><a class="button-link" href="${esc(scopedAdminPath(item.download_url))}">下载</a>` : ""}
+          <button type="button" data-reuse-generated="${item.id}">再来一次</button>
+          <button type="button" class="danger" data-delete-generated="${item.id}">删除</button>
+        </div>
+      </article>`).join("")
+    : `<div class="muted">还没有生成记录。生成过的文件在刷新或关机后仍会保留在这里。</div>`;
+  list.querySelectorAll("[data-view-generated]").forEach((button) => {
+    button.onclick = () => showGeneratedRecord(Number(button.dataset.viewGenerated));
+  });
+  list.querySelectorAll("[data-reuse-generated]").forEach((button) => {
+    button.onclick = () => {
+      const item = state.generatedArtifacts.find((entry) => entry.id === Number(button.dataset.reuseGenerated));
+      if (!item) return;
+      $("#generate-kind").value = item.kind === "image" ? "chart" : item.kind === "archive" || item.kind === "code" ? "code" : item.kind === "audio" ? "voice" : "file";
+      $("#generate-prompt").value = item.prompt || "";
+      $("#generate-file-name").value = item.display_name || "";
+      $("#generate-error").textContent = "";
+      $("#generate-result").innerHTML = "";
+      $("#generate-send-box").hidden = true;
+      $("#generate-prompt").focus();
+    };
+  });
+  list.querySelectorAll("[data-delete-generated]").forEach((button) => {
+    button.onclick = async () => {
+      const id = Number(button.dataset.deleteGenerated);
+      if (!confirm("删除这条生成记录和对应文件？")) return;
+      await api(`/api/admin/generated/records/${id}`, {method: "DELETE"});
+      if (state.selectedGenerated === id) {
+        state.selectedGenerated = null;
+        $("#generate-result").innerHTML = "";
+        $("#generate-send-box").hidden = true;
+      }
+      await loadGeneratedHistory();
+    };
+  });
+}
+
+async function showGeneratedRecord(recordId) {
+  const preview = await api(`/api/admin/generated/records/${recordId}/preview`);
+  state.selectedGenerated = recordId;
+  const item = preview.artifact;
+  const downloadUrl = scopedAdminPath(preview.download_url);
+  const inlineUrl = scopedAdminPath(preview.inline_url);
+  let body = "";
+  if (preview.preview_kind === "image") {
+    body = `<img src="${esc(inlineUrl)}" alt="${esc(item.display_name)}">`;
+  } else if (preview.preview_kind === "audio") {
+    body = `<audio controls src="${esc(inlineUrl)}"></audio>`;
+  } else if (preview.preview_kind === "pdf") {
+    body = `<iframe class="document-preview" src="${esc(inlineUrl)}" title="${esc(item.display_name)}"></iframe>`;
+  } else if (preview.preview_kind === "archive") {
+    body = `<p><strong>文件清单</strong></p><div class="archive-list">${(preview.entries || []).map((entry) => `<code>${esc(entry)}</code>`).join("")}</div>`;
+  } else if (preview.excerpt) {
+    body = `<pre class="content-preview">${esc(preview.excerpt)}</pre>`;
+  } else {
+    body = `<p class="muted">这类文件没有网页内预览，请下载后打开。</p>`;
+  }
+  $("#generate-result").innerHTML = `
+    <div class="generated-result">
+      <span class="tag">${esc(generatedKindLabel(item.kind))}</span>
+      <strong>${esc(item.display_name)}</strong>
+      <p class="row-meta">${esc(item.summary || "")}</p>
+      <div class="item-actions">
+        <a class="button-link" href="${esc(downloadUrl)}">下载文件</a>
+        <a class="button-link" target="_blank" rel="noopener" href="${esc(inlineUrl)}">浏览器打开</a>
+      </div>
+      ${body}
+    </div>`;
+  $("#generate-send-box").hidden = false;
+  $("#generate-send-status").textContent = "";
+}
+
+$("#refresh-generated").addEventListener("click", () => {
+  loadGeneratedHistory().catch((error) => {
+    $("#generate-error").textContent = error.message;
+  });
+});
+
+$("#generate-send").addEventListener("click", async () => {
+  const errorBox = $("#generate-error");
+  const status = $("#generate-send-status");
+  errorBox.textContent = "";
+  status.textContent = "";
+  if (!state.selectedGenerated) {
+    errorBox.textContent = "请先生成或选择一个文件。";
+    return;
+  }
+  const button = $("#generate-send");
+  button.disabled = true;
+  button.textContent = "发送中…";
+  try {
+    const data = await jsonRequest(`/api/admin/generated/records/${state.selectedGenerated}/send`, "POST", {
+      target_type: $("#generate-send-type").value,
+      target_id: Number($("#generate-send-target").value),
+    });
+    status.textContent = data.message;
+  } catch (error) {
+    errorBox.textContent = error.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = "发送当前文件";
+  }
+});
+
 $("#generate-submit").addEventListener("click", async () => {
   const button = $("#generate-submit");
   const errorBox = $("#generate-error");
@@ -1205,12 +1416,15 @@ $("#generate-submit").addEventListener("click", async () => {
     const result = await jsonRequest("/api/admin/generate", "POST", {
       kind: $("#generate-kind").value,
       prompt: $("#generate-prompt").value,
+      file_name: $("#generate-file-name").value.trim(),
       research: $("#generate-research").checked,
     });
-    const artifactUrl = scopedAdminPath(result.download_url);
-    resultBox.innerHTML = `<div class="generated-result"><strong>${esc(result.summary)}</strong><br><a href="${esc(artifactUrl)}">下载 ${esc(result.name)}</a>${result.kind === "image" ? `<br><img src="${esc(artifactUrl)}" alt="${esc(result.name)}">` : ""}</div>`;
+    resultBox.innerHTML = `<div class="muted">文件已生成，正在加载预览…</div>`;
+    await showGeneratedRecord(result.record_id);
+    await loadGeneratedHistory();
   } catch (error) {
     errorBox.textContent = error.message;
+    await loadGeneratedHistory().catch(() => {});
   } finally {
     button.disabled = false;
     button.textContent = "开始生成";

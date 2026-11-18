@@ -28,7 +28,12 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from dotenv import dotenv_values
 from fastapi import Body, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field
 
 
@@ -2073,30 +2078,50 @@ async def _proxy_instance_admin_request(
     if query:
         target += f"?{query}"
     headers = _instance_admin_headers(instance)
+    headers["Accept-Encoding"] = "identity"
     content_type = request.headers.get("content-type")
     if content_type:
         headers["Content-Type"] = content_type
     body = await request.body()
+    client = httpx.AsyncClient(timeout=300, trust_env=False)
     try:
-        async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
-            response = await client.request(
-                method,
-                target,
-                content=body,
-                headers=headers,
-            )
+        outbound = client.build_request(
+            method,
+            target,
+            content=body,
+            headers=headers,
+        )
+        response = await client.send(outbound, stream=True)
     except httpx.HTTPError as exc:
+        await client.aclose()
         raise HTTPException(
             status_code=503,
             detail="Instance service is not reachable",
         ) from exc
     response_headers = {
         key: response.headers[key]
-        for key in ("content-type", "content-disposition", "cache-control")
+        for key in (
+            "content-type",
+            "content-disposition",
+            "cache-control",
+            "content-length",
+            "content-range",
+            "accept-ranges",
+        )
         if key in response.headers
     }
-    return Response(
-        content=response.content,
+
+    async def stream_response():
+        try:
+            async for chunk in response.aiter_bytes(64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_response(),
         status_code=response.status_code,
         headers=response_headers,
     )
@@ -2580,6 +2605,73 @@ async def instance_group_files(
         instance_id,
         int(user["id"]),
         f"/api/admin/group-profiles/{group_id}/files{suffix}",
+    )
+
+
+@app.get(
+    "/api/instances/{instance_id}/group-profiles/{group_id}/file-content"
+)
+async def instance_group_file_content(
+    instance_id: int,
+    group_id: int,
+    request: Request,
+) -> Response:
+    user = _request_user(request)
+    instance = store.instance(instance_id, int(user["id"]))
+    if instance is None:
+        raise HTTPException(status_code=404, detail="instance not found")
+    query = request.url.query
+    target = (
+        f"http://127.0.0.1:{instance['port']}"
+        f"/api/admin/group-profiles/{group_id}/file-content"
+    )
+    if query:
+        target += f"?{query}"
+    headers = _instance_admin_headers(instance)
+    headers["Accept-Encoding"] = "identity"
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(180.0, connect=20.0),
+        trust_env=False,
+    )
+    try:
+        outbound = client.build_request("GET", target, headers=headers)
+        response = await client.send(outbound, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(
+            status_code=503,
+            detail="Instance service is not reachable",
+        ) from exc
+    response_headers = {
+        key: response.headers[key]
+        for key in (
+            "content-type",
+            "content-disposition",
+            "cache-control",
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "x-content-type-options",
+        )
+        if key in response.headers
+    }
+
+    async def stream_file():
+        try:
+            async for chunk in response.aiter_bytes(64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_file(),
+        status_code=response.status_code,
+        headers=response_headers,
     )
 
 

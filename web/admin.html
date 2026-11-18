@@ -234,10 +234,12 @@
         </div>
         <div class="section-box">
           <h3>QQ 群文件</h3>
-          <p class="muted">从 NapCat 读取当前群的文件列表。填写文件夹 ID 可以进入子目录；文件内容仍通过发送给机器人来建立知识库。</p>
+          <p class="muted">可直接浏览文件夹、在线查看图片/PDF/文本，或下载任意群文件。QQ 临时下载地址由机器人代为读取，不会暴露到浏览器。</p>
+          <div id="group-file-breadcrumb" class="file-breadcrumb"></div>
           <div class="field-row">
             <input id="group-folder-id" placeholder="文件夹 ID（留空为根目录）">
             <button id="load-group-files">读取群文件</button>
+            <button id="group-files-up" type="button">返回上级</button>
           </div>
           <div id="group-file-list" class="source-list"></div>
         </div>
@@ -326,7 +328,11 @@
 
     <section id="generate" class="tab">
       <article class="panel">
-        <h2>生成图表、文档或文件</h2>
+        <div class="detail-head">
+          <div><p class="eyebrow">CONTENT WORKBENCH</p><h2>内容生成工作台</h2></div>
+          <button id="refresh-generated" type="button">刷新历史</button>
+        </div>
+        <p class="muted">生成结果会持久保存，可预览正文、查看 ZIP 文件清单、重新下载，并直接发送到指定私聊或群文件。</p>
         <label>生成类型
           <select id="generate-kind">
             <option value="chart">数据图表</option>
@@ -336,6 +342,9 @@
             <option value="voice">语音文件（千问 TTS）</option>
           </select>
         </label>
+        <label>文件名（可选）
+          <input id="generate-file-name" placeholder="例如：本周学习计划；扩展名会按生成类型自动校正">
+        </label>
         <label>内容要求
           <textarea id="generate-prompt" rows="8" placeholder="例如：把本周学习时长做成柱状图，周一 2 小时、周二 1.5 小时……"></textarea>
         </label>
@@ -343,6 +352,19 @@
         <button id="generate-submit" class="primary">开始生成</button>
         <p id="generate-error" class="error"></p>
         <div id="generate-result"></div>
+        <div class="section-box" id="generate-send-box" hidden>
+          <h3>发送到 QQ</h3>
+          <div class="field-row">
+            <select id="generate-send-type"><option value="private">私聊</option><option value="group">群文件</option></select>
+            <input id="generate-send-target" inputmode="numeric" placeholder="QQ 号或群号">
+            <button id="generate-send" type="button">发送当前文件</button>
+          </div>
+          <p id="generate-send-status" class="muted"></p>
+        </div>
+        <div class="section-box">
+          <h3>最近生成</h3>
+          <div id="generated-history" class="source-list"></div>
+        </div>
       </article>
     </section>
   </main>

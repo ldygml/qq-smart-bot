@@ -110,6 +110,8 @@ class FakeOneBotClient:
             "folders": [],
             "files": [],
         }
+        self.group_file_url = ""
+        self.group_file_name = ""
 
     async def send_text(self, target: ReplyTarget, text: str) -> None:
         self.sent.append((target, text))
@@ -135,6 +137,20 @@ class FakeOneBotClient:
         folder_id: str = "",
     ) -> dict[str, list[dict[str, object]]]:
         return self.group_files
+
+    async def get_group_file_url(
+        self,
+        group_id: int,
+        file_id: str,
+        *,
+        busid: str | int | None = None,
+    ) -> dict[str, str]:
+        if not self.group_file_url:
+            raise OneBotError("test file URL is not configured")
+        return {
+            "url": self.group_file_url,
+            "file_name": self.group_file_name or file_id,
+        }
 
     async def send_image(self, target: ReplyTarget, image: str) -> None:
         self.images.append((target, image))
@@ -1744,6 +1760,7 @@ async def test_voice_message_uses_audio_model(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_admin_generates_downloadable_voice_file(tmp_path) -> None:
+    sender = FakeOneBotClient()
     app = create_app(
         settings=make_settings(
             tmp_path,
@@ -1751,7 +1768,7 @@ async def test_admin_generates_downloadable_voice_file(tmp_path) -> None:
             generated_media_dir=tmp_path / "generated",
         ),
         chat_client=FakeChatClient(),
-        onebot_client=FakeOneBotClient(),
+        onebot_client=sender,
         memory=ChatMemory(tmp_path / "memory.db"),
         image_loader=FakeImageLoader(),
         document_loader=FakeDocumentLoader(),
@@ -1773,6 +1790,34 @@ async def test_admin_generates_downloadable_voice_file(tmp_path) -> None:
         download = await client.get(result["download_url"])
         assert download.status_code == 200
         assert download.content == b"\x00\x00\x00"
+
+        history = await client.get("/api/admin/generated")
+        assert history.status_code == 200
+        record = history.json()["artifacts"][0]
+        assert record["status"] == "ready"
+        assert record["source"] == "web"
+        assert record["prompt"] == "今天状态不错"
+
+        preview = await client.get(
+            f"/api/admin/generated/records/{result['record_id']}/preview"
+        )
+        assert preview.status_code == 200
+        assert preview.json()["preview_kind"] == "audio"
+
+        sent = await client.post(
+            f"/api/admin/generated/records/{result['record_id']}/send",
+            json={"target_type": "private", "target_id": 123456},
+        )
+        assert sent.status_code == 200
+        assert sender.files[-1][0].user_id == 123456
+        assert sender.files[-1][2] == result["name"]
+
+        deleted = await client.delete(
+            f"/api/admin/generated/records/{result['record_id']}"
+        )
+        assert deleted.status_code == 200
+        missing = await client.get(result["download_url"])
+        assert missing.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -3251,6 +3296,77 @@ async def test_group_files_are_available_in_admin_and_chat(tmp_path) -> None:
     reply = sender.sent[-1][1]
     assert "课程资料" in reply
     assert "讲义.pdf" in reply
+
+
+@pytest.mark.asyncio
+async def test_group_file_can_be_previewed_and_downloaded_safely(
+    tmp_path,
+) -> None:
+    sender = FakeOneBotClient()
+    sender.group_file_url = "https://cdn.example.com/temporary/file-1"
+    sender.group_file_name = "讲义.pdf"
+
+    async def file_handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == sender.group_file_url
+        assert request.headers["range"] == "bytes=0-9"
+        return httpx.Response(
+            206,
+            content=b"%PDF-1.7\n",
+            headers={
+                "content-type": "application/pdf",
+                "content-range": "bytes 0-9/100",
+                "accept-ranges": "bytes",
+            },
+        )
+
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            generated_media_dir=tmp_path / "generated",
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        group_file_transport=httpx.MockTransport(file_handler),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        preview = await client.get(
+            "/api/admin/group-profiles/456/file-content",
+            params={
+                "file_id": "file-1",
+                "busid": "102",
+                "name": "讲义.pdf",
+            },
+            headers={"Range": "bytes=0-9"},
+        )
+        download = await client.get(
+            "/api/admin/group-profiles/456/file-content",
+            params={
+                "file_id": "file-1",
+                "busid": "102",
+                "name": "../../危险.pdf",
+                "download": "true",
+            },
+            headers={"Range": "bytes=0-9"},
+        )
+
+    assert preview.status_code == 206
+    assert preview.content == b"%PDF-1.7\n"
+    assert preview.headers["content-type"].startswith("application/pdf")
+    assert preview.headers["content-disposition"].startswith("inline;")
+    assert "temporary%2Ffile-1" not in preview.text
+    assert download.status_code == 206
+    assert download.headers["content-disposition"].startswith("attachment;")
+    assert "%E5%8D%B1%E9%99%A9.pdf" in download.headers[
+        "content-disposition"
+    ]
 
 
 @pytest.mark.asyncio

@@ -7,10 +7,12 @@ import hmac
 from io import BytesIO
 import json
 import logging
+import mimetypes
 import random
 import re
 import time
 import unicodedata
+import zipfile
 from collections import OrderedDict, deque
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
@@ -19,15 +21,18 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
+from docx import Document as WordDocument
 from fastapi import Body, FastAPI, Request, Response
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
+    StreamingResponse,
 )
 from pydantic import ValidationError
 from PIL import Image, UnidentifiedImageError
@@ -64,6 +69,7 @@ from .grounded_qa import (
     grounded_lookup,
     is_explicit_search_request,
 )
+from .generation_store import GenerationStore
 from .history_sync import (
     HISTORY_RESULT_STATE,
     history_cursor_key,
@@ -304,6 +310,8 @@ def create_app(
     topic_store: TopicStore | None = None,
     presence_store: PresenceStore | None = None,
     trace_store: MessageTraceStore | None = None,
+    generation_store: GenerationStore | None = None,
+    group_file_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     config = settings or Settings()
     logging.basicConfig(
@@ -324,6 +332,9 @@ def create_app(
         token=config.onebot_token.get_secret_value(),
     )
     store = memory or ChatMemory(config.database_path)
+    generation_journal = generation_store or GenerationStore(
+        config.database_path
+    )
     usage = UsageStore(config.database_path)
     quality = quality_store or QualityStore(config.database_path)
     topics = topic_store or TopicStore(config.database_path)
@@ -480,6 +491,35 @@ def create_app(
             path = Path.cwd() / path
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _generated_file_path(file_name: str) -> Path | None:
+        safe_name = Path(file_name).name
+        root = _generated_media_dir().resolve()
+        path = (root / safe_name).resolve()
+        if path.parent != root or not path.is_file():
+            return None
+        return path
+
+    def _remember_generated_artifact(
+        artifact: GeneratedArtifact,
+        *,
+        prompt: str,
+        source: str = "qq",
+        research: bool = False,
+    ) -> None:
+        try:
+            generation_journal.record_artifact(
+                file_name=artifact.path.name,
+                display_name=artifact.name,
+                kind=artifact.kind,
+                prompt=prompt,
+                summary=artifact.summary,
+                source=source,
+                research=research,
+                size=artifact.path.stat().st_size,
+            )
+        except Exception:
+            logger.warning("Could not index generated artifact", exc_info=True)
 
     limiter = SlidingWindowRateLimiter(config.rate_limit_per_minute, 60.0)
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
@@ -2246,6 +2286,130 @@ def create_app(
             **listing,
         }
 
+    @app.get("/api/admin/group-profiles/{group_id}/file-content")
+    async def admin_group_file_content(
+        group_id: int,
+        request: Request,
+        file_id: str,
+        busid: str = "",
+        name: str = "",
+        download: bool = False,
+    ) -> Response:
+        if not file_id.strip():
+            return JSONResponse(
+                {"detail": "群文件 ID 不能为空"},
+                status_code=400,
+            )
+        resolver = getattr(sender, "get_group_file_url", None)
+        if not callable(resolver):
+            return JSONResponse(
+                {
+                    "detail": (
+                        "当前 NapCat 客户端不支持获取群文件下载地址，"
+                        "请升级 NapCat 后重试。"
+                    )
+                },
+                status_code=501,
+            )
+        try:
+            resolved = await resolver(
+                group_id,
+                file_id,
+                busid=busid or None,
+            )
+        except OneBotError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=502)
+        remote_url = str((resolved or {}).get("url") or "").strip()
+        if not remote_url.startswith(("https://", "http://")):
+            return JSONResponse(
+                {"detail": "NapCat 没有返回有效的群文件下载地址。"},
+                status_code=502,
+            )
+        file_name = _safe_download_name(
+            name or str((resolved or {}).get("file_name") or "") or file_id,
+            "qq-file",
+        )
+        forwarded_headers: dict[str, str] = {
+            "Accept-Encoding": "identity",
+        }
+        range_header = request.headers.get("range")
+        if range_header:
+            forwarded_headers["Range"] = range_header
+        client = httpx.AsyncClient(
+            follow_redirects=True,
+            trust_env=config.llm_trust_env,
+            timeout=httpx.Timeout(120.0, connect=20.0),
+            transport=group_file_transport,
+        )
+        try:
+            upstream_request = client.build_request(
+                "GET",
+                remote_url,
+                headers=forwarded_headers,
+            )
+            upstream = await client.send(upstream_request, stream=True)
+        except (httpx.HTTPError, ValueError) as exc:
+            await client.aclose()
+            logger.warning("Group file download failed: %s", exc)
+            return JSONResponse(
+                {"detail": "连接 QQ 文件服务器失败，请稍后重试。"},
+                status_code=502,
+            )
+        if upstream.is_error:
+            status_code = upstream.status_code
+            await upstream.aclose()
+            await client.aclose()
+            return JSONResponse(
+                {
+                    "detail": (
+                        "QQ 文件服务器拒绝了下载请求 "
+                        f"(HTTP {status_code})，文件链接可能已过期。"
+                    )
+                },
+                status_code=502,
+            )
+        content_type = _download_content_type(
+            file_name,
+            upstream.headers.get("content-type", ""),
+        )
+        inline = not download and _can_preview_inline(
+            content_type,
+            file_name,
+        )
+        response_headers = {
+            "Content-Disposition": _content_disposition(
+                file_name,
+                inline=inline,
+            ),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        }
+        for header_name in (
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "last-modified",
+        ):
+            value = upstream.headers.get(header_name)
+            if value:
+                response_headers[header_name.title()] = value
+
+        async def stream_file():
+            try:
+                async for chunk in upstream.aiter_bytes(64 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            stream_file(),
+            status_code=upstream.status_code,
+            media_type=content_type,
+            headers=response_headers,
+        )
+
     @app.post("/api/admin/group-profiles/{group_id}/knowledge")
     async def admin_add_group_knowledge(
         group_id: int,
@@ -2332,14 +2496,37 @@ def create_app(
     async def admin_generate(
         payload: dict[str, Any] = Body(...),
     ) -> JSONResponse:
-        kind = str(payload.get("kind") or "").strip()
+        kind = str(payload.get("kind") or "").strip().lower()
         prompt = str(payload.get("prompt") or "").strip()
+        requested_name = str(payload.get("file_name") or "").strip()
         force_research = bool(payload.get("research", False))
         if not prompt:
             return JSONResponse(
-                {"detail": "prompt is required"},
+                {"detail": "请先写清楚要生成什么内容。"},
                 status_code=400,
             )
+        if kind not in {"chart", "document", "file", "code", "voice"}:
+            return JSONResponse(
+                {
+                    "detail": (
+                        "生成类型必须是 chart、document、file、code 或 voice。"
+                    )
+                },
+                status_code=400,
+            )
+        stage_names = {
+            "chart": "图表数据整理与绘制",
+            "document": "资料整理与 Word 文档生成",
+            "file": "资料整理与文件生成",
+            "code": "代码生成与语法检查",
+            "voice": "语音合成与音频下载",
+        }
+        record_id = generation_journal.start(
+            kind=kind,
+            prompt=prompt,
+            research=force_research,
+            source="web",
+        )
         try:
             if kind == "chart":
                 artifact = await generate_chart(
@@ -2347,6 +2534,7 @@ def create_app(
                     model=config.llm_model,
                     prompt=prompt,
                     output_dir=_generated_media_dir(),
+                    requested_name=requested_name,
                 )
             elif kind == "document":
                 artifact = await generate_document(
@@ -2355,6 +2543,7 @@ def create_app(
                     prompt=prompt,
                     output_dir=_generated_media_dir(),
                     force_research=force_research,
+                    requested_name=requested_name,
                 )
             elif kind == "file":
                 artifact = await generate_file(
@@ -2363,6 +2552,7 @@ def create_app(
                     prompt=prompt,
                     output_dir=_generated_media_dir(),
                     force_research=force_research,
+                    requested_name=requested_name,
                 )
             elif kind == "code":
                 artifact = await generate_code(
@@ -2371,31 +2561,239 @@ def create_app(
                     fallback_model=config.code_fallback_model,
                     prompt=prompt,
                     output_dir=_generated_media_dir(),
+                    requested_name=requested_name,
                 )
             elif kind == "voice":
                 artifact = await _render_voice_artifact(prompt)
-            else:
-                return JSONResponse(
-                    {
-                        "detail": (
-                            "kind must be chart, document, file, code, or voice"
-                        )
-                    },
-                    status_code=400,
+            size = artifact.path.stat().st_size
+            if size <= 0:
+                raise ContentGenerationError(
+                    "生成流程结束了，但输出文件为空，已停止交付。"
                 )
         except (ContentGenerationError, LLMError, TTSError) as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=502)
+            detail = str(exc).strip() or "生成失败，模型没有返回可用结果。"
+            generation_journal.fail(record_id, detail)
+            is_timeout = any(
+                marker in detail.lower()
+                for marker in ("timeout", "timed out", "超时")
+            )
+            if is_timeout:
+                detail = (
+                    f"{stage_names[kind]}超时，文件没有生成。"
+                    "可以在控制台切换更快的模型后重试。"
+                )
+            return JSONResponse(
+                {"detail": detail, "record_id": record_id},
+                status_code=504 if is_timeout else 502,
+            )
+        except asyncio.TimeoutError:
+            detail = (
+                f"{stage_names[kind]}超时，文件没有生成。"
+                "可以在控制台切换更快的模型后重试。"
+            )
+            generation_journal.fail(record_id, detail)
+            return JSONResponse(
+                {"detail": detail, "record_id": record_id},
+                status_code=504,
+            )
+        except Exception:
+            logger.exception("Unexpected content generation failure")
+            detail = (
+                f"{stage_names[kind]}时发生内部错误，没有交付不完整的文件。"
+            )
+            generation_journal.fail(record_id, detail)
+            return JSONResponse(
+                {"detail": detail, "record_id": record_id},
+                status_code=500,
+            )
+        generation_journal.complete(
+            record_id,
+            file_name=artifact.path.name,
+            display_name=artifact.name,
+            kind=artifact.kind,
+            summary=artifact.summary,
+            size=size,
+        )
         return JSONResponse(
             {
                 "ok": True,
+                "record_id": record_id,
                 "name": artifact.name,
                 "kind": artifact.kind,
                 "summary": artifact.summary,
-                "download_url": (
-                    f"/api/admin/generated/{artifact.path.name}"
+                "size": size,
+                "download_url": f"/api/admin/generated/{artifact.path.name}",
+                "preview_url": (
+                    f"/api/admin/generated/records/{record_id}/preview"
                 ),
             }
         )
+
+    @app.get("/api/admin/generated")
+    async def admin_generated_history(
+        limit: int = 40,
+    ) -> dict[str, Any]:
+        records = []
+        for record in generation_journal.list(limit=limit):
+            item = record.to_dict()
+            path = _generated_file_path(record.file_name)
+            item["available"] = path is not None
+            if path is not None:
+                item["size"] = path.stat().st_size
+                item["download_url"] = (
+                    f"/api/admin/generated/{record.file_name}"
+                )
+            items = item
+            records.append(items)
+        return {"ok": True, "artifacts": records}
+
+    @app.get("/api/admin/generated/records/{record_id}/preview")
+    async def admin_generated_preview(record_id: int) -> dict[str, Any]:
+        record = generation_journal.get(record_id)
+        if record is None:
+            return JSONResponse(
+                {"detail": "生成记录不存在"},
+                status_code=404,
+            )
+        path = _generated_file_path(record.file_name)
+        if path is None:
+            return JSONResponse(
+                {"detail": "生成文件已被移动或删除，请重新生成。"},
+                status_code=404,
+            )
+        suffix = path.suffix.lower()
+        content_type = mimetypes.guess_type(record.display_name)[0] or (
+            mimetypes.guess_type(path.name)[0]
+            or "application/octet-stream"
+        )
+        preview_kind = "download"
+        excerpt = ""
+        entries: list[str] = []
+        if suffix in {
+            ".txt",
+            ".md",
+            ".csv",
+            ".json",
+            ".py",
+            ".js",
+            ".ts",
+            ".tsx",
+            ".jsx",
+            ".html",
+            ".css",
+            ".java",
+            ".c",
+            ".cpp",
+            ".h",
+            ".go",
+            ".rs",
+            ".sql",
+            ".yaml",
+            ".yml",
+            ".xml",
+        }:
+            preview_kind = "text"
+            excerpt = path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )[:24_000]
+        elif suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            preview_kind = "image"
+        elif suffix in {".mp3", ".wav", ".ogg", ".m4a"}:
+            preview_kind = "audio"
+        elif suffix == ".pdf":
+            preview_kind = "pdf"
+        elif suffix == ".docx":
+            preview_kind = "document"
+            document = WordDocument(path)
+            excerpt = "\n".join(
+                paragraph.text
+                for paragraph in document.paragraphs[:40]
+                if paragraph.text.strip()
+            )[:24_000]
+        elif suffix == ".zip":
+            preview_kind = "archive"
+            with zipfile.ZipFile(path) as archive:
+                entries = [
+                    info.filename
+                    for info in archive.infolist()[:120]
+                    if not info.is_dir()
+                ]
+        return {
+            "ok": True,
+            "artifact": record.to_dict(),
+            "content_type": content_type,
+            "preview_kind": preview_kind,
+            "excerpt": excerpt,
+            "entries": entries,
+            "download_url": f"/api/admin/generated/{record.file_name}",
+            "inline_url": (
+                f"/api/admin/generated/{record.file_name}?inline=true"
+            ),
+        }
+
+    @app.delete("/api/admin/generated/records/{record_id}")
+    async def admin_delete_generated(record_id: int) -> dict[str, Any]:
+        record = generation_journal.get(record_id)
+        if record is None:
+            return JSONResponse(
+                {"detail": "生成记录不存在"},
+                status_code=404,
+            )
+        if record.status == "ready":
+            path = _generated_file_path(record.file_name)
+            if path is not None:
+                path.unlink(missing_ok=True)
+        generation_journal.delete(record_id)
+        return {"ok": True, "id": record_id}
+
+    @app.post("/api/admin/generated/records/{record_id}/send")
+    async def admin_send_generated(
+        record_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        record = generation_journal.get(record_id)
+        if record is None or record.status != "ready":
+            return JSONResponse(
+                {"detail": "生成文件不存在或尚未完成"},
+                status_code=404,
+            )
+        path = _generated_file_path(record.file_name)
+        if path is None:
+            return JSONResponse(
+                {"detail": "生成文件已被移动或删除"},
+                status_code=404,
+            )
+        target_type = str(payload.get("target_type") or "").strip()
+        target_id = _optional_int(payload.get("target_id"))
+        if target_type not in {"group", "private"} or not target_id:
+            return JSONResponse(
+                {"detail": "请选择发送到私聊或群聊，并填写有效 QQ/群号"},
+                status_code=400,
+            )
+        target = ReplyTarget(
+            message_type=target_type,
+            user_id=target_id,
+            group_id=target_id if target_type == "group" else None,
+        )
+        try:
+            await sender.upload_file(
+                target,
+                path=str(path),
+                name=record.display_name,
+            )
+        except OneBotError as exc:
+            return JSONResponse(
+                {"detail": f"文件已生成，但发送到 QQ 失败：{exc}"},
+                status_code=502,
+            )
+        return {
+            "ok": True,
+            "message": (
+                f"已发送到{'群聊' if target_type == 'group' else '私聊'} "
+                f"{target_id}"
+            ),
+        }
 
     async def _render_voice_artifact(prompt: str) -> GeneratedArtifact:
         if not config.tts_enabled:
@@ -2450,17 +2848,34 @@ def create_app(
         )
 
     @app.get("/api/admin/generated/{file_name}")
-    async def admin_generated_file(file_name: str) -> Response:
-        safe_name = Path(file_name).name
-        path = (_generated_media_dir() / safe_name).resolve()
-        if path.parent != _generated_media_dir().resolve() or not path.is_file():
+    async def admin_generated_file(
+        file_name: str,
+        inline: bool = False,
+    ) -> Response:
+        path = _generated_file_path(file_name)
+        if path is None:
             return JSONResponse({"detail": "file not found"}, status_code=404)
+        record = generation_journal.for_file(path.name)
+        display_name = (
+            record.display_name if record is not None else path.name
+        )
+        content_type = mimetypes.guess_type(display_name)[0] or (
+            mimetypes.guess_type(path.name)[0]
+            or "application/octet-stream"
+        )
+        inline_allowed = inline and _can_preview_inline(
+            content_type,
+            display_name,
+        )
         return FileResponse(
             path,
-            filename=safe_name,
-            content_disposition_type=(
-                "inline" if path.suffix.lower() in {".png", ".jpg", ".jpeg"} else "attachment"
-            ),
+            filename=display_name,
+            media_type=content_type,
+            content_disposition_type="inline" if inline_allowed else "attachment",
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.post("/onebot")
@@ -5458,6 +5873,11 @@ def create_app(
                     prompt=argument,
                     output_dir=_generated_media_dir(),
                 )
+                _remember_generated_artifact(
+                    artifact,
+                    prompt=argument,
+                    source=target.conversation_id,
+                )
                 await sender.send_image(target, str(artifact.path))
             except (ContentGenerationError, LLMError, OneBotError) as exc:
                 await _safe_send(target, f"图表生成失败：{exc}")
@@ -5516,6 +5936,12 @@ def create_app(
                         force_research=force_research,
                     )
                 )
+                _remember_generated_artifact(
+                    artifact,
+                    prompt=argument,
+                    source=target.conversation_id,
+                    research=force_research,
+                )
                 await sender.upload_file(
                     target,
                     path=str(artifact.path),
@@ -5554,6 +5980,11 @@ def create_app(
                     fallback_model=config.code_fallback_model,
                     prompt=argument,
                     output_dir=_generated_media_dir(),
+                )
+                _remember_generated_artifact(
+                    artifact,
+                    prompt=argument,
+                    source=target.conversation_id,
                 )
                 await sender.upload_file(
                     target,
@@ -6506,6 +6937,47 @@ def _social_only_reply(text: str) -> str | None:
             )
         )
     return None
+
+
+def _safe_download_name(value: str, fallback: str = "qq-file") -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = text.replace("\\", "/").rsplit("/", 1)[-1]
+    text = re.sub(r"[\x00-\x1f\x7f<>:\"|?*]", "_", text)
+    text = text.strip(" .")[:180]
+    return text or fallback
+
+
+def _content_disposition(file_name: str, *, inline: bool) -> str:
+    safe_name = _safe_download_name(file_name)
+    suffix = "".join(Path(safe_name).suffixes)[-20:]
+    ascii_name = "qq-file" + suffix
+    disposition = "inline" if inline else "attachment"
+    return (
+        f'{disposition}; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(safe_name, safe='')}"
+    )
+
+
+def _download_content_type(file_name: str, remote_type: str = "") -> str:
+    guessed = mimetypes.guess_type(file_name)[0] or ""
+    remote = remote_type.split(";", 1)[0].strip().lower()
+    if remote and remote != "application/octet-stream":
+        return remote_type
+    return guessed or "application/octet-stream"
+
+
+def _can_preview_inline(content_type: str, file_name: str) -> bool:
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    suffix = Path(file_name).suffix.lower()
+    if media_type == "image/svg+xml" or suffix in {".svg", ".html", ".htm"}:
+        return False
+    return (
+        media_type.startswith("image/")
+        or media_type.startswith("audio/")
+        or media_type.startswith("video/")
+        or media_type == "application/pdf"
+        or media_type.startswith("text/plain")
+    )
 
 
 def _reply_variety_hint(history: list[dict[str, Any]]) -> str:

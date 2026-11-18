@@ -383,6 +383,7 @@ async def test_content_generation_creates_real_artifacts(tmp_path) -> None:
         model="test",
         prompt="周一 2 小时，周二 1.5 小时",
         output_dir=tmp_path,
+        requested_name="学习时长.png.png",
     )
     document = await generate_document(
         client,
@@ -403,6 +404,7 @@ async def test_content_generation_creates_real_artifacts(tmp_path) -> None:
         output_dir=tmp_path,
     )
     assert chart.path.read_bytes().startswith(b"\x89PNG")
+    assert chart.name == "学习时长.png"
     assert document.path.suffix == ".docx"
     assert document.path.stat().st_size > 1000
     assert data_file.path.read_text(encoding="utf-8") == "日期,时长"
@@ -437,6 +439,16 @@ async def test_file_generation_does_not_duplicate_suffix(tmp_path) -> None:
     )
     assert artifact.name == "打卡记录.csv"
     assert artifact.path.suffix == ".csv"
+
+    renamed = await generate_file(
+        NamedFileChat(),
+        model="test",
+        prompt="生成打卡记录",
+        output_dir=tmp_path,
+        requested_name="本周打卡.csv.csv",
+    )
+    assert renamed.name == "本周打卡.csv"
+    assert renamed.path.suffix == ".csv"
 
 
 @pytest.mark.asyncio

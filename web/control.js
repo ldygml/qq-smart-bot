@@ -4,6 +4,7 @@ let instances = [];
 let latestDashboard = null;
 let groupDetails = {knowledge: [], members: [], relationships: []};
 let groupFiles = [];
+let groupFolderTrail = [{id: "", name: "根目录"}];
 
 async function api(path, options = {}) {
   const headers = {...(options.headers || {})};
@@ -656,6 +657,7 @@ async function loadGroupDetails(instanceId, groupId) {
   const data = await api(`/api/instances/${instanceId}/group-profiles/${groupId}/details`);
   groupDetails = data;
   groupFiles = [];
+  groupFolderTrail = [{id: "", name: "根目录"}];
   renderGroupKnowledge();
   renderGroupMembers();
   renderGroupRelationships();
@@ -706,6 +708,24 @@ function renderGroupRelationships() {
 
 function renderGroupFiles() {
   const list = document.querySelector("#group-file-list");
+  const breadcrumb = document.querySelector("#group-file-breadcrumb");
+  breadcrumb.innerHTML = groupFolderTrail.map((item, index) => `
+    <button type="button" data-group-folder-index="${index}">${esc(item.name || "文件夹")}</button>
+    ${index < groupFolderTrail.length - 1 ? "<span>/</span>" : ""}
+  `).join("");
+  breadcrumb.querySelectorAll("[data-group-folder-index]").forEach((button) => {
+    button.onclick = async () => {
+      const index = Number(button.dataset.groupFolderIndex);
+      const target = groupFolderTrail[index];
+      if (!target) return;
+      groupFolderTrail = groupFolderTrail.slice(0, index + 1);
+      try {
+        await loadGroupFiles(target.id, target.name, false);
+      } catch (err) {
+        document.querySelector("#profile-error").textContent = err.message;
+      }
+    };
+  });
   list.innerHTML = groupFiles.length
     ? groupFiles.map((item) => `
       <article class="source-row">
@@ -714,8 +734,57 @@ function renderGroupFiles() {
         <div class="row-meta">${item.kind === "folder"
           ? `ID: ${esc(item.folder_id)} · ${esc(item.file_count || 0)} 项`
           : `${esc(item.size || 0)} 字节 · 上传者 ${esc(item.uploader || "未知")}`}</div>
+        ${item.kind === "folder"
+          ? `<button type="button" data-open-group-folder="${esc(item.folder_id)}" data-folder-name="${esc(item.name)}">打开</button>`
+          : `<div class="file-actions"><a class="button-link" target="_blank" rel="noopener" href="${esc(groupFileContentUrl(item, false))}">查看</a><a class="button-link" href="${esc(groupFileContentUrl(item, true))}">下载</a></div>`}
       </article>`).join("")
     : `<div class="empty">尚未读取群文件</div>`;
+  list.querySelectorAll("[data-open-group-folder]").forEach((button) => {
+    button.onclick = async () => {
+      const folderId = button.dataset.openGroupFolder || "";
+      const folderName = button.dataset.folderName || "文件夹";
+      groupFolderTrail.push({id: folderId, name: folderName});
+      try {
+        await loadGroupFiles(folderId, folderName, false);
+      } catch (err) {
+        document.querySelector("#profile-error").textContent = err.message;
+      }
+    };
+  });
+}
+
+function groupFileContentUrl(item, download) {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const groupId = Number(document.querySelector("#settings-profile-select").value);
+  const params = new URLSearchParams({
+    file_id: String(item.file_id || ""),
+    busid: String(item.busid ?? ""),
+    name: String(item.name || ""),
+  });
+  if (download) params.set("download", "true");
+  return `/api/instances/${instanceId}/group-profiles/${groupId}/file-content?${params}`;
+}
+
+async function loadGroupFiles(folderId = "", folderName = "", pushTrail = true) {
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const groupId = Number(document.querySelector("#settings-profile-select").value);
+  if (!instanceId || !groupId) return;
+  const button = document.querySelector("#load-group-files");
+  button.disabled = true;
+  button.textContent = "读取中…";
+  try {
+    const suffix = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : "";
+    const data = await api(`/api/instances/${instanceId}/group-profiles/${groupId}/files${suffix}`);
+    if (pushTrail && folderId) groupFolderTrail.push({id: folderId, name: folderName || "文件夹"});
+    groupFiles = [
+      ...(data.folders || []).map((item) => ({...item, kind:"folder"})),
+      ...(data.files || []).map((item) => ({...item, kind:"file"})),
+    ];
+    renderGroupFiles();
+  } finally {
+    button.disabled = false;
+    button.textContent = "读取群文件";
+  }
 }
 
 document.querySelector("#profile-add-group").addEventListener("click", async () => {
@@ -837,26 +906,27 @@ document.querySelector("#save-group-member").addEventListener("click", async () 
 });
 
 document.querySelector("#load-group-files").addEventListener("click", async () => {
-  const instanceId = Number(document.querySelector("#settings-instance").value);
-  const groupId = Number(document.querySelector("#settings-profile-select").value);
-  if (!instanceId || !groupId) return;
-  const button = document.querySelector("#load-group-files");
-  button.disabled = true;
-  button.textContent = "读取中…";
+  const folderId = document.querySelector("#group-folder-id").value.trim();
+  if (!folderId) groupFolderTrail = [{id: "", name: "根目录"}];
   try {
-    const folderId = document.querySelector("#group-folder-id").value.trim();
-    const suffix = folderId ? `?folder_id=${encodeURIComponent(folderId)}` : "";
-    const data = await api(`/api/instances/${instanceId}/group-profiles/${groupId}/files${suffix}`);
-    groupFiles = [
-      ...(data.folders || []).map((item) => ({...item, kind:"folder"})),
-      ...(data.files || []).map((item) => ({...item, kind:"file"})),
-    ];
-    renderGroupFiles();
+    await loadGroupFiles(
+      folderId,
+      folderId ? `文件夹 ${folderId}` : "根目录",
+      Boolean(folderId),
+    );
   } catch (err) {
     document.querySelector("#profile-error").textContent = err.message;
-  } finally {
-    button.disabled = false;
-    button.textContent = "读取群文件";
+  }
+});
+
+document.querySelector("#group-files-up").addEventListener("click", async () => {
+  if (groupFolderTrail.length <= 1) return;
+  groupFolderTrail.pop();
+  const parent = groupFolderTrail[groupFolderTrail.length - 1];
+  try {
+    await loadGroupFiles(parent.id, parent.name, false);
+  } catch (err) {
+    document.querySelector("#profile-error").textContent = err.message;
   }
 });
 

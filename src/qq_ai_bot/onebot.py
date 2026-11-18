@@ -620,6 +620,69 @@ class OneBotClient:
         ]
         return {"folders": folders, "files": files}
 
+    async def get_group_file_url(
+        self,
+        group_id: int,
+        file_id: str,
+        *,
+        busid: str | int | None = None,
+    ) -> dict[str, str]:
+        """Resolve a temporary QQ group-file URL through NapCat."""
+        actions = (
+            "get_group_file_url",
+            "get_group_file_download_url",
+        )
+        last_error = "OneBot 客户端不支持获取群文件下载地址。"
+        for action in actions:
+            payload: dict[str, Any] = {
+                "group_id": group_id,
+                "file_id": file_id,
+            }
+            if busid not in (None, ""):
+                payload["busid"] = busid
+            response = await self._client.post(
+                action,
+                json=payload,
+                timeout=30.0,
+            )
+            try:
+                data = response.json()
+            except ValueError:
+                last_error = f"OneBot {action} 返回了非 JSON 数据"
+                continue
+            if response.is_error or data.get("status") != "ok":
+                retcode = data.get("retcode")
+                last_error = (
+                    f"OneBot {action} 失败 "
+                    f"(HTTP {response.status_code}, retcode={retcode})"
+                )
+                continue
+            result = data.get("data")
+            if isinstance(result, str):
+                url = result.strip()
+            elif isinstance(result, dict):
+                url = str(
+                    result.get("url")
+                    or result.get("download_url")
+                    or result.get("file_url")
+                    or ""
+                ).strip()
+            else:
+                url = ""
+            if url.startswith(("https://", "http://")):
+                return {
+                    "url": url,
+                    "file_name": str(
+                        result.get("file_name")
+                        or result.get("name")
+                        or file_id
+                        if isinstance(result, dict)
+                        else file_id
+                    ),
+                }
+            last_error = f"OneBot {action} 没有返回有效下载地址"
+        raise OneBotError(last_error)
+
     async def get_group_member_name(
         self,
         group_id: int,
