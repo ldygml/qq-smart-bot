@@ -33,6 +33,22 @@ def test_memory_prunes_old_rows(tmp_path) -> None:
     assert history[-1]["content"] == "assistant-5"
 
 
+def test_single_message_is_persisted_and_pruned(tmp_path) -> None:
+    memory = ChatMemory(tmp_path / "chat.db")
+    memory.append_exchange("private:1", "你好", "在", max_rows=3)
+    memory.append_message(
+        "private:1",
+        "assistant",
+        "[我刚刚发了一个表情包：无语]",
+        max_rows=2,
+    )
+
+    history = memory.history("private:1", 10)
+    assert len(history) == 2
+    assert history[0]["content"] == "在"
+    assert history[-1]["content"].startswith("[我刚刚发了一个表情包")
+
+
 def test_memory_can_delete_one_user_or_everything(tmp_path) -> None:
     memory = ChatMemory(tmp_path / "chat.db")
     memory.append_exchange("private:1", "a", "b", max_rows=10)

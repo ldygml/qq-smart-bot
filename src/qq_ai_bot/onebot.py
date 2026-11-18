@@ -437,6 +437,122 @@ class OneBotClient:
                 )
         return result
 
+    async def get_recent_contact(
+        self,
+        *,
+        count: int = 50,
+    ) -> list[dict[str, Any]]:
+        response = await self._client.post(
+            "get_recent_contact",
+            json={"count": max(1, min(200, int(count)))},
+            timeout=30.0,
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                "OneBot get_recent_contact returned non-JSON data"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            raise OneBotError("OneBot get_recent_contact failed")
+        result = data.get("data")
+        if isinstance(result, dict):
+            result = result.get("contacts") or result.get("list") or []
+        if not isinstance(result, list):
+            raise OneBotError("OneBot get_recent_contact returned no list")
+        contacts: list[dict[str, Any]] = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            try:
+                peer_uin = int(item.get("peerUin") or item.get("peer_uin"))
+                chat_type = int(item.get("chatType") or item.get("chat_type"))
+                msg_time = int(item.get("msgTime") or item.get("msg_time") or 0)
+            except (TypeError, ValueError):
+                continue
+            if peer_uin <= 0 or chat_type not in {1, 2}:
+                continue
+            contacts.append(
+                {
+                    "peer_uin": peer_uin,
+                    "chat_type": "private" if chat_type == 1 else "group",
+                    "name": str(
+                        item.get("peerName")
+                        or item.get("remark")
+                        or ""
+                    ).strip()[:120],
+                    "msg_time": msg_time,
+                    "msg_id": str(item.get("msgId") or ""),
+                }
+            )
+        return contacts
+
+    async def get_friend_msg_history(
+        self,
+        user_id: int,
+        *,
+        message_seq: int | str = 0,
+        count: int = 50,
+        reverse_order: bool = True,
+    ) -> list[dict[str, Any]]:
+        data = await self._history_action(
+            "get_friend_msg_history",
+            {
+                "user_id": user_id,
+                "message_seq": message_seq,
+                "count": max(1, min(100, int(count))),
+                "reverse_order": reverse_order,
+            },
+        )
+        return self._history_messages(data, "get_friend_msg_history")
+
+    async def get_group_msg_history(
+        self,
+        group_id: int,
+        *,
+        message_seq: int | str = 0,
+        count: int = 50,
+        reverse_order: bool = True,
+    ) -> list[dict[str, Any]]:
+        data = await self._history_action(
+            "get_group_msg_history",
+            {
+                "group_id": group_id,
+                "message_seq": message_seq,
+                "count": max(1, min(100, int(count))),
+                "reverse_order": reverse_order,
+            },
+        )
+        return self._history_messages(data, "get_group_msg_history")
+
+    async def _history_action(
+        self,
+        action: str,
+        payload: dict[str, Any],
+    ) -> Any:
+        response = await self._client.post(action, json=payload, timeout=30.0)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                f"OneBot {action} returned non-JSON data"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            retcode = data.get("retcode")
+            raise OneBotError(
+                f"OneBot {action} failed "
+                f"(HTTP {response.status_code}, retcode={retcode})"
+            )
+        return data.get("data")
+
+    @staticmethod
+    def _history_messages(data: Any, action: str) -> list[dict[str, Any]]:
+        if isinstance(data, dict):
+            data = data.get("messages") or data.get("message") or []
+        if not isinstance(data, list):
+            raise OneBotError(f"OneBot {action} returned no message list")
+        return [item for item in data if isinstance(item, dict)]
+
     async def get_group_files(
         self,
         group_id: int,

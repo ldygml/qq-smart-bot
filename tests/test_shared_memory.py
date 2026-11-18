@@ -92,6 +92,44 @@ def test_shared_context_respects_visibility(tmp_path) -> None:
     assert "睡眠不好" in unrestricted_context
 
 
+def test_contact_aliases_and_shareable_facts_bridge_conversations(
+    tmp_path,
+) -> None:
+    store = SharedMemoryStore(tmp_path / "memory.db")
+    store.record_person(222, "小明")
+    store.record_person(222, "阿明")
+    store.add_memory(
+        subject_user_id=222,
+        subject_name="阿明",
+        content="下周三要去杭州出差",
+        visibility="shareable",
+        source_conversation="private:222",
+    )
+    store.add_memory(
+        subject_user_id=222,
+        subject_name="阿明",
+        content="最近睡眠不好",
+        visibility="private",
+        source_conversation="private:222",
+    )
+
+    alias_context = store.context_for(
+        current_user_id=333,
+        current_user_name="小李",
+        query="小明之前说过什么",
+    )
+    assert "杭州出差" in alias_context
+    assert "睡眠不好" not in alias_context
+
+    broad_context = store.context_for(
+        current_user_id=333,
+        current_user_name="小李",
+        query="你最近跟别人聊了什么",
+    )
+    assert "杭州出差" in broad_context
+    assert "睡眠不好" not in broad_context
+
+
 def test_unrelated_short_chat_does_not_pull_old_topics(tmp_path) -> None:
     store = SharedMemoryStore(tmp_path / "memory.db")
     store.record_person(222, "小明")

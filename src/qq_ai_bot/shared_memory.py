@@ -63,6 +63,15 @@ class SharedMemoryStore:
                     relationship_note TEXT NOT NULL DEFAULT '',
                     profile_updated_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS shared_person_aliases (
+                    user_id INTEGER NOT NULL,
+                    alias TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    PRIMARY KEY (user_id, alias)
+                );
+                CREATE INDEX IF NOT EXISTS idx_shared_person_alias
+                ON shared_person_aliases (alias, user_id);
                 CREATE TABLE IF NOT EXISTS shared_profile_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -292,6 +301,31 @@ class SharedMemoryStore:
                     "ADD COLUMN processed INTEGER NOT NULL DEFAULT 0"
                 )
 
+            # QQ nicknames and group cards change often. Keep every observed
+            # alias so a later contact can still recognize the same person.
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO shared_person_aliases
+                    (user_id, alias, first_seen, last_seen)
+                SELECT speaker_user_id, MIN(TRIM(speaker_name)),
+                       MIN(created_at), MAX(created_at)
+                FROM shared_episodes
+                WHERE LENGTH(TRIM(speaker_name)) >= 2
+                GROUP BY speaker_user_id, LOWER(TRIM(speaker_name))
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO shared_person_aliases
+                    (user_id, alias, first_seen, last_seen)
+                SELECT subject_user_id, MIN(TRIM(subject_name)),
+                       MIN(created_at), MAX(updated_at)
+                FROM shared_memories
+                WHERE LENGTH(TRIM(subject_name)) >= 2
+                GROUP BY subject_user_id, LOWER(TRIM(subject_name))
+                """
+            )
+
     def record_person(self, user_id: int, display_name: str) -> None:
         name = display_name.strip() or str(user_id)
         now = _utc_now()
@@ -307,6 +341,17 @@ class SharedMemoryStore:
                 """,
                 (user_id, name, now, now),
             )
+            if len(name) >= 2 and not name.isdigit():
+                connection.execute(
+                    """
+                    INSERT INTO shared_person_aliases
+                        (user_id, alias, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id, alias) DO UPDATE SET
+                        last_seen = excluded.last_seen
+                    """,
+                    (user_id, name, now, now),
+                )
 
     def add_memory(
         self,
@@ -467,17 +512,30 @@ class SharedMemoryStore:
     def mentioned_people(self, text: str) -> list[tuple[int, str]]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                "SELECT user_id, display_name FROM shared_people"
+                """
+                SELECT p.user_id, p.display_name, a.alias
+                FROM shared_people p
+                LEFT JOIN shared_person_aliases a
+                  ON a.user_id = p.user_id
+                """
             ).fetchall()
         normalized = text.lower()
         matches: list[tuple[int, str]] = []
+        matched_ids: set[int] = set()
         for row in rows:
             user_id = int(row["user_id"])
             name = str(row["display_name"])
-            if str(user_id) in normalized or (
-                len(name.strip()) >= 2 and name.lower() in normalized
+            alias = str(row["alias"] or "").strip()
+            if user_id in matched_ids:
+                continue
+            candidates = (name, alias)
+            if str(user_id) in normalized or any(
+                len(candidate.strip()) >= 2
+                and candidate.lower() in normalized
+                for candidate in candidates
             ):
                 matches.append((user_id, name))
+                matched_ids.add(user_id)
         return matches
 
     def get_person(self, user_id: int) -> dict[str, Any] | None:
@@ -697,6 +755,8 @@ class SharedMemoryStore:
             (
                 "只自然使用与话题相关的信息。private 记忆只属于当事人，"
                 "不能告诉其他联系人，也不要复述私密原话。"
+                "shareable 信息可以用于串起不同联系人之间的相关话题；"
+                "必须分清是谁说的，不能把不同人的经历混成一个人。"
             ),
         ]
         current_person = self.get_person(current_user_id)
@@ -851,6 +911,20 @@ class SharedMemoryStore:
                 (user_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def memory_is_shareable(self, memory_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM shared_memories
+                WHERE id = ? AND status = 'active'
+                  AND visibility = 'shareable'
+                LIMIT 1
+                """,
+                (memory_id,),
+            ).fetchone()
+        return row is not None
 
     def memories_since(self, memory_id: int, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
@@ -1846,6 +1920,10 @@ class SharedMemoryStore:
                     "DELETE FROM shared_people WHERE user_id = ?",
                     (user_id,),
                 ).rowcount,
+                "aliases": connection.execute(
+                    "DELETE FROM shared_person_aliases WHERE user_id = ?",
+                    (user_id,),
+                ).rowcount,
             }
             connection.execute(
                 "DELETE FROM shared_memories WHERE subject_user_id = ?",
@@ -1893,6 +1971,9 @@ class SharedMemoryStore:
                 "people": connection.execute(
                     "DELETE FROM shared_people"
                 ).rowcount,
+                "aliases": connection.execute(
+                    "DELETE FROM shared_person_aliases"
+                ).rowcount,
                 "memories": connection.execute(
                     "DELETE FROM shared_memories"
                 ).rowcount,
@@ -1927,6 +2008,7 @@ class SharedMemoryStore:
     def export_data(self) -> dict[str, Any]:
         tables = (
             "shared_people",
+            "shared_person_aliases",
             "shared_memories",
             "shared_episodes",
             "shared_observations",
@@ -1951,6 +2033,7 @@ class SharedMemoryStore:
         imported: dict[str, int] = {}
         allowed_tables = {
             "shared_people",
+            "shared_person_aliases",
             "shared_memories",
             "shared_episodes",
             "shared_observations",
@@ -2642,6 +2725,28 @@ def _is_broad_memory_query(query: str) -> bool:
             "群里有人",
             "有人说了什么",
             "最近聊了什么",
+            "聊过什么",
+            "都聊了什么",
+            "跟谁聊",
+            "和谁聊",
+            "跟别人聊",
+            "和别人聊",
+            "跟其他人聊",
+            "和其他人聊",
+            "谁跟你",
+            "你跟谁",
+            "别人说了什么",
+            "其他人说了什么",
+            "其他联系人",
+            "你上次说",
+            "你之前说",
+            "你说过",
+            "你提过",
+            "你刚说",
+            "刚才你说",
+            "记得我说过",
+            "还记不记得",
+            "还记得我说",
             "住哪",
             "住在哪",
             "哪里住",

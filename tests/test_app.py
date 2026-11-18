@@ -37,7 +37,7 @@ from qq_ai_bot.shared_memory import SharedMemoryStore
 from qq_ai_bot.stickers import StickerAssetStore, StickerStore
 from qq_ai_bot.topics import TopicCandidate, TopicStore
 from qq_ai_bot.tracing import MessageTraceStore
-from qq_ai_bot.vector_memory import VectorMemoryStore
+from qq_ai_bot.vector_memory import VectorChunk, VectorMemoryStore
 from qq_ai_bot.web_reader import WebArticle
 
 
@@ -1679,6 +1679,104 @@ async def test_other_contact_can_use_shareable_memory(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_vector_recall_shares_facts_but_not_other_chats(
+    tmp_path,
+) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    shared = SharedMemoryStore(tmp_path / "shared.db")
+    shared.record_person(222, "小明")
+    public_id = shared.add_memory(
+        subject_user_id=222,
+        subject_name="小明",
+        content="下周三要去杭州出差",
+        visibility="shareable",
+        source_conversation="private:222",
+    )
+    private_id = shared.add_memory(
+        subject_user_id=222,
+        subject_name="小明",
+        content="最近睡眠不好",
+        visibility="private",
+        source_conversation="private:222",
+    )
+    assert public_id and private_id
+    vectors = VectorMemoryStore(tmp_path / "vectors.db")
+    vectors.upsert_chunks(
+        [
+            VectorChunk(
+                "memory",
+                f"memory:{public_id}",
+                "小明",
+                "长期记忆",
+                "下周三要去杭州出差",
+            ),
+            VectorChunk(
+                "memory",
+                f"memory:{private_id}",
+                "小明",
+                "长期记忆",
+                "最近睡眠不好",
+            ),
+            VectorChunk(
+                "episode",
+                "episode:9",
+                "小明 的对话",
+                "private:222",
+                "小明说周五一个人哭到很晚",
+            ),
+        ],
+        [[1.0, 0.0, 0.0] for _ in range(3)],
+        metadata={"user_id": 222, "conversation_id": "private:222"},
+    )
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            shared_memory_enabled=True,
+            vector_memory_enabled=True,
+            memory_privacy_protection=True,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        shared_memory_store=shared,
+        embedding_client=FakeEmbeddingClient(),
+        vector_store=vectors,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 333,
+                "message_id": 2150,
+                "message": "小明最近有什么安排",
+                "sender": {"nickname": "小李"},
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    prompt_text = "\n".join(
+        str(message.get("content") or "")
+        for call in llm.calls
+        for message in call
+    )
+    assert "杭州出差" in prompt_text
+    assert "睡眠不好" not in prompt_text
+    assert "一个人哭" not in prompt_text
+
+
+@pytest.mark.asyncio
 async def test_privacy_protection_can_be_disabled(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()
@@ -1733,13 +1831,14 @@ async def test_privacy_protection_can_be_disabled(tmp_path) -> None:
 async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()
+    chat_memory = ChatMemory(tmp_path / "memory.db")
     sticker_store = StickerStore(tmp_path / "stickers.db")
     sticker_decider = FakeStickerDecider(1)
     app = create_app(
         settings=make_settings(tmp_path),
         chat_client=llm,
         onebot_client=sender,
-        memory=ChatMemory(tmp_path / "memory.db"),
+        memory=chat_memory,
         image_loader=FakeImageLoader(),
         document_loader=FakeDocumentLoader(),
         productivity_store=ProductivityStore(tmp_path / "tools.db"),
@@ -1771,7 +1870,9 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
                 ],
             },
         )
-        await _wait_for_condition(lambda: bool(sender.stickers))
+        await _wait_for_condition(
+            lambda: chat_memory.count("private:123") >= 2
+        )
 
     assert all(model == "qwen3.8-flash" for model in llm.models)
     assert all(model != "qwen3-vl-plus" for model in llm.models)
@@ -1779,6 +1880,9 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     assert sticker_store.count() == 1
     assert sender.stickers[0][1].summary == "奶龙"
     assert "QQ：123" in str(sticker_decider.last_kwargs["contact_context"])
+    history = chat_memory.history("private:123", 10)
+    assert history[0]["content"] == "[对方发来表情包：奶龙]"
+    assert history[1]["content"] == "[我刚刚发了一个表情包：奶龙]"
 
 
 @pytest.mark.asyncio
@@ -1919,6 +2023,7 @@ async def test_casual_reply_can_trigger_contextual_sticker_without_keywords(
     tmp_path,
 ) -> None:
     sender = FakeOneBotClient()
+    chat_memory = ChatMemory(tmp_path / "memory.db")
     sticker_store = StickerStore(tmp_path / "stickers.db")
     sticker_store.record(
         StickerSource(
@@ -1937,7 +2042,7 @@ async def test_casual_reply_can_trigger_contextual_sticker_without_keywords(
         ),
         chat_client=FakeChatClient(),
         onebot_client=sender,
-        memory=ChatMemory(tmp_path / "memory.db"),
+        memory=chat_memory,
         image_loader=FakeImageLoader(),
         document_loader=FakeDocumentLoader(),
         sticker_store=sticker_store,
@@ -1961,13 +2066,23 @@ async def test_casual_reply_can_trigger_contextual_sticker_without_keywords(
             },
         )
         await _wait_for_condition(
-            lambda: bool(sender.sent and sender.stickers),
+            lambda: bool(
+                sender.sent
+                and sender.stickers
+                and any(
+                    "我刚刚发了一个表情包：安慰" in item["content"]
+                    for item in chat_memory.history("private:123", 10)
+                )
+            ),
             timeout=5.0,
         )
 
     assert decider.calls == 1
     assert decider.last_kwargs["explicit_request"] is False
     assert sender.stickers[0][1].summary == "安慰"
+    assert chat_memory.history("private:123", 10)[-1]["content"] == (
+        "[我刚刚发了一个表情包：安慰]"
+    )
 
 
 @pytest.mark.asyncio

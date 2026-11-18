@@ -120,6 +120,13 @@ class Settings(BaseSettings):
 
     history_messages: int = 40
     max_history_rows_per_chat: int = 160
+    history_sync_enabled: bool = True
+    history_sync_on_startup: bool = True
+    history_sync_max_days: int = 30
+    history_sync_max_pages: int = 10
+    history_sync_page_size: int = 50
+    history_sync_max_conversations: int = 40
+    history_sync_observe_memory: bool = True
     rate_limit_per_minute: int = 8
     max_concurrent_requests: int = 4
     quality_review_enabled: bool = True

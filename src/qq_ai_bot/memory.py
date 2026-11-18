@@ -38,6 +38,28 @@ class ChatMemory:
                 ON messages (conversation_id, id)
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS external_messages (
+                    external_key TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    group_id INTEGER,
+                    sender_user_id INTEGER NOT NULL,
+                    sender_name TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                    content TEXT NOT NULL,
+                    event_time INTEGER NOT NULL DEFAULT 0,
+                    archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_external_messages_conversation
+                ON external_messages (conversation_id, event_time)
+                """
+            )
 
     def history(self, conversation_id: str, limit: int) -> list[dict[str, str]]:
         limit = max(0, limit)
@@ -93,6 +115,162 @@ class ChatMemory:
                 (conversation_id, conversation_id, max(2, max_rows)),
             )
 
+    def append_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        *,
+        max_rows: int,
+    ) -> None:
+        if role not in {"user", "assistant"}:
+            raise ValueError("role must be 'user' or 'assistant'")
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO messages (conversation_id, role, content)
+                VALUES (?, ?, ?)
+                """,
+                (conversation_id, role, content),
+            )
+            connection.execute(
+                """
+                DELETE FROM messages
+                WHERE conversation_id = ?
+                  AND id NOT IN (
+                    SELECT id
+                    FROM messages
+                    WHERE conversation_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                  )
+                """,
+                (conversation_id, conversation_id, max(1, max_rows)),
+            )
+
+    def archive_message(
+        self,
+        *,
+        external_key: str,
+        conversation_id: str,
+        message_type: str,
+        group_id: int | None,
+        sender_user_id: int,
+        sender_name: str,
+        role: str,
+        content: str,
+        event_time: int = 0,
+        add_to_chat: bool = False,
+        max_rows: int = 160,
+    ) -> bool:
+        """Archive one QQ message exactly once.
+
+        History imports can also materialize the message in the short-term
+        chat table. Real-time webhook events only archive their external id so
+        the normal event pipeline remains responsible for reply handling.
+        """
+        if role not in {"user", "assistant"}:
+            raise ValueError("role must be 'user' or 'assistant'")
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO external_messages
+                    (
+                        external_key, conversation_id, message_type, group_id,
+                        sender_user_id, sender_name, role, content, event_time
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    external_key,
+                    conversation_id,
+                    message_type,
+                    group_id,
+                    sender_user_id,
+                    sender_name[:120],
+                    role,
+                    content,
+                    int(event_time or 0),
+                ),
+            )
+            if cursor.rowcount <= 0:
+                return False
+            if add_to_chat:
+                connection.execute(
+                    """
+                    INSERT INTO messages (conversation_id, role, content)
+                    VALUES (?, ?, ?)
+                    """,
+                    (conversation_id, role, content),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM messages
+                    WHERE conversation_id = ?
+                      AND id NOT IN (
+                        SELECT id
+                        FROM messages
+                        WHERE conversation_id = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                      )
+                    """,
+                    (
+                        conversation_id,
+                        conversation_id,
+                        max(1, max_rows),
+                    ),
+                )
+            return True
+
+    def external_message_exists(self, external_key: str) -> bool:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM external_messages
+                WHERE external_key = ?
+                LIMIT 1
+                """,
+                (external_key,),
+            ).fetchone()
+        return row is not None
+
+    def archived_messages(
+        self,
+        *,
+        conversation_id: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        safe_limit = min(1000, max(1, limit))
+        with self._lock, self._connect() as connection:
+            if conversation_id:
+                rows = connection.execute(
+                    """
+                    SELECT external_key, conversation_id, message_type,
+                           group_id, sender_user_id, sender_name, role,
+                           content, event_time, archived_at
+                    FROM external_messages
+                    WHERE conversation_id = ?
+                    ORDER BY event_time DESC, archived_at DESC
+                    LIMIT ?
+                    """,
+                    (conversation_id, safe_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT external_key, conversation_id, message_type,
+                           group_id, sender_user_id, sender_name, role,
+                           content, event_time, archived_at
+                    FROM external_messages
+                    ORDER BY event_time DESC, archived_at DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
     def reset(self, conversation_id: str) -> int:
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
@@ -114,11 +292,23 @@ class ChatMemory:
                     f"group:%:user:{user_id}",
                 ),
             )
+            connection.execute(
+                """
+                DELETE FROM external_messages
+                WHERE conversation_id = ?
+                   OR conversation_id LIKE ?
+                """,
+                (
+                    f"private:{user_id}",
+                    f"group:%:user:{user_id}",
+                ),
+            )
             return cursor.rowcount
 
     def delete_all(self) -> int:
         with self._lock, self._connect() as connection:
             cursor = connection.execute("DELETE FROM messages")
+            connection.execute("DELETE FROM external_messages")
             return cursor.rowcount
 
     def count(self, conversation_id: str) -> int:
@@ -148,5 +338,13 @@ class ChatMemory:
             row = connection.execute(
                 "SELECT COUNT(*) AS total FROM messages"
             ).fetchone()
-        return {"stored_messages": int(row["total"]) if row is not None else 0}
+            archive_row = connection.execute(
+                "SELECT COUNT(*) AS total FROM external_messages"
+            ).fetchone()
+        return {
+            "stored_messages": int(row["total"]) if row is not None else 0,
+            "archived_messages": (
+                int(archive_row["total"]) if archive_row is not None else 0
+            ),
+        }
 
