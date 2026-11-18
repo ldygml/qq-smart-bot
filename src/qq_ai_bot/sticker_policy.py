@@ -13,6 +13,7 @@ class StickerClassification:
     category: str
     usage_hint: str
     tags: tuple[str, ...] = ()
+    source: str = "text"
 
 
 class LLMStickerOrganizer:
@@ -35,13 +36,18 @@ class LLMStickerOrganizer:
         image_url: str = "",
     ) -> StickerClassification:
         prompt = (
-            "整理一个 QQ 表情包。根据名称和最近语境判断它的情绪与适用场景。"
+            "整理一个 QQ 表情包。先直接观察画面、人物动作、表情、画面文字和梗，"
+            "再结合聊天语境与名称判断。名称可能不准确，以画面证据为准。"
             '只返回 JSON：{"category":"分类","usage_hint":"何时适合使用",'
-            '"tags":["识别到的文字、梗或情绪标签"]}。'
+            '"tags":["画面文字、情绪、动作、梗、语气标签"]}。'
             "分类优先从：开心、无语、震惊、生气、委屈、嘲讽、赞同、"
             "疑惑、安慰、加油、日常 中选择，也可以使用更准确的中文短分类。"
-            "usage_hint 要具体，例如“对方说了离谱的事情时使用”。"
-            "同时说明适合哪些熟悉程度、关系阶段或联系人，以及哪些严肃场景不应使用。"
+            "usage_hint 必须写成可执行规则，并包含三部分："
+            "1）适合回复的情绪或话题；2）适合的关系阶段或聊天氛围；"
+            "3）明确不适合的场景。不要只写“日常聊天使用”这种空泛描述。"
+            "例如“朋友吐槽工作离谱、气氛轻松时用，适合熟人和半熟人；"
+            "对方在求助、严肃争论或表达真实难过时不要用”。"
+            "画面里能确认的文字要写进 tags；看不清就写“画面文字不清”，不要猜梗。"
             "不要在语境冲突时强行使用表情。\n\n"
             f"表情名称：{summary or '动画表情'}\n"
             f"表情图片：{'已提供，请直接识别画面和文字' if image_url else '无'}\n"
@@ -81,10 +87,25 @@ class LLMStickerOrganizer:
                 if str(item).strip()
             ) if isinstance(raw_tags, list) else ()
             if category and usage_hint:
-                return StickerClassification(category, usage_hint, tags)
+                return StickerClassification(
+                    category,
+                    usage_hint,
+                    tags,
+                    source=(
+                        "vision"
+                        if image_url.startswith(("http://", "https://", "data:image/"))
+                        else "text"
+                    ),
+                )
         except Exception:
             pass
-        return infer_sticker_classification(summary)
+        fallback = infer_sticker_classification(summary)
+        return StickerClassification(
+            fallback.category,
+            fallback.usage_hint,
+            fallback.tags,
+            source="fallback",
+        )
 
 
 class StickerChoiceDecider(Protocol):

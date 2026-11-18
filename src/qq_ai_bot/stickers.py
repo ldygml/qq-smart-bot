@@ -235,6 +235,7 @@ class StickerStore:
                     category TEXT NOT NULL DEFAULT '未分类',
                     usage_hint TEXT NOT NULL DEFAULT '',
                     tags TEXT NOT NULL DEFAULT '[]',
+                    classification_source TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     seen_at TEXT NOT NULL,
                     use_count INTEGER NOT NULL DEFAULT 0,
@@ -253,6 +254,7 @@ class StickerStore:
                 ("category", "TEXT NOT NULL DEFAULT '未分类'"),
                 ("usage_hint", "TEXT NOT NULL DEFAULT ''"),
                 ("tags", "TEXT NOT NULL DEFAULT '[]'"),
+                ("classification_source", "TEXT NOT NULL DEFAULT ''"),
                 ("enabled", "INTEGER NOT NULL DEFAULT 1"),
                 ("local_path", "TEXT NOT NULL DEFAULT ''"),
                 ("asset_sha256", "TEXT NOT NULL DEFAULT ''"),
@@ -455,7 +457,8 @@ class StickerStore:
                 SELECT id, summary, emoji_id, emoji_package_id,
                        sticker_key, image_source, local_path,
                        asset_sha256, mime_type, asset_verified_at,
-                       asset_error, category, usage_hint, tags, enabled,
+                       asset_error, category, usage_hint, tags,
+                       classification_source, enabled,
                        seen_at, use_count
                 FROM sticker_catalog
                 {where}
@@ -514,7 +517,8 @@ class StickerStore:
                 SELECT id, summary, emoji_id, emoji_package_id,
                        sticker_key, image_source, local_path,
                        asset_sha256, mime_type, asset_verified_at,
-                       asset_error, category, usage_hint, tags, enabled,
+                       asset_error, category, usage_hint, tags,
+                       classification_source, enabled,
                        seen_at, use_count
                 FROM sticker_catalog
                 WHERE id = ?
@@ -647,7 +651,8 @@ class StickerStore:
             cursor = connection.execute(
                 """
                 UPDATE sticker_catalog
-                SET category = ?, usage_hint = ?, enabled = ?
+                SET category = ?, usage_hint = ?, enabled = ?,
+                    classification_source = 'manual'
                 WHERE id = ?
                 """,
                 (
@@ -701,18 +706,21 @@ class StickerStore:
         category: str,
         usage_hint: str,
         tags: tuple[str, ...] = (),
+        source: str = "auto",
     ) -> bool:
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE sticker_catalog
-                SET category = ?, usage_hint = ?, tags = ?
+                SET category = ?, usage_hint = ?, tags = ?,
+                    classification_source = ?
                 WHERE id = ?
                 """,
                 (
                     category.strip()[:80] or "未分类",
                     usage_hint.strip()[:300],
                     json.dumps(list(tags[:12]), ensure_ascii=False),
+                    source.strip()[:40] or "auto",
                     sticker_id,
                 ),
             )

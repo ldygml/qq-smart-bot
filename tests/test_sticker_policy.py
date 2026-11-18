@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from qq_ai_bot.sticker_policy import LLMStickerChoiceDecider
+from qq_ai_bot.sticker_policy import LLMStickerChoiceDecider, LLMStickerOrganizer
 
 
 class ChoiceChat:
@@ -16,6 +16,20 @@ class ChoiceChat:
 class LowConfidenceChoiceChat:
     async def chat(self, messages, *, model=None, extra_payload=None) -> str:
         return '{"sticker_id": 1, "confidence": 0.2}'
+
+    async def close(self) -> None:
+        return None
+
+
+class OrganizerChat:
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        prompt = messages[-1]["content"][0]["text"]
+        assert "三部分" in prompt
+        return (
+            '{"category":"无语","usage_hint":"朋友吐槽离谱事情时用；'
+            '适合熟人轻松聊天，严肃求助时不用",'
+            '"tags":["汗","无语","尴尬"]}'
+        )
 
     async def close(self) -> None:
         return None
@@ -65,3 +79,20 @@ async def test_explicit_sticker_request_accepts_valid_choice_below_threshold() -
     )
     assert explicit == 1
     assert automatic is None
+
+
+@pytest.mark.asyncio
+async def test_sticker_organizer_uses_vision_when_image_is_available() -> None:
+    organizer = LLMStickerOrganizer(
+        OrganizerChat(),
+        model="text-model",
+        vision_model="vision-model",
+    )
+    classification = await organizer.classify(
+        summary="汗",
+        recent_context="朋友：这也太离谱了",
+        image_url="data:image/jpeg;base64,AAAA",
+    )
+    assert classification.category == "无语"
+    assert "严肃求助时不用" in classification.usage_hint
+    assert classification.source == "vision"

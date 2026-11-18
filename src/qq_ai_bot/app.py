@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+from io import BytesIO
 import json
 import logging
 import random
@@ -29,6 +30,7 @@ from fastapi.responses import (
     RedirectResponse,
 )
 from pydantic import ValidationError
+from PIL import Image, UnidentifiedImageError
 
 from .audio import AudioLoader, AudioLoaderProtocol, AudioLoadError
 from .config import Settings
@@ -1325,21 +1327,36 @@ def create_app(
         )
 
     @app.post("/api/admin/stickers/organize")
-    async def admin_organize_stickers() -> dict[str, Any]:
-        candidates = stickers.list_unclassified(limit=100)
+    async def admin_organize_stickers(
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        refresh_all = bool((payload or {}).get("refresh_all"))
+        candidates = (
+            stickers.list_recent(limit=100, include_disabled=True)
+            if refresh_all
+            else stickers.list_unclassified(limit=100)
+        )
         gate = asyncio.Semaphore(4)
 
         async def organize(item: dict[str, object]) -> bool:
             async with gate:
+                sticker_id = int(item["id"])
+                metadata = stickers.get_metadata(sticker_id) or item
+                image_url = await asyncio.to_thread(
+                    _sticker_classification_image,
+                    metadata,
+                )
                 classification = await sticker_organizer_client.classify(
                     summary=str(item.get("summary") or "表情包"),
-                    image_url=str(item.get("image_source") or ""),
+                    recent_context="后台重新校准表情的画面与适用场景。",
+                    image_url=image_url,
                 )
                 return stickers.update_classification(
-                    int(item["id"]),
+                    sticker_id,
                     category=classification.category,
                     usage_hint=classification.usage_hint,
                     tags=classification.tags,
+                    source=classification.source,
                 )
 
         results = await asyncio.gather(
@@ -3289,14 +3306,12 @@ def create_app(
         *,
         summary: str,
         context: str,
+        sticker_source: str = "",
     ) -> None:
         metadata = stickers.get_metadata(sticker_id)
         if metadata is None:
             return
-        if (
-            str(metadata.get("category") or "") != "未分类"
-            or str(metadata.get("usage_hint") or "")
-        ):
+        if str(metadata.get("classification_source") or "") == "manual":
             return
         if sticker_id in sticker_organize_inflight:
             return
@@ -3304,17 +3319,16 @@ def create_app(
 
         async def organize() -> None:
             try:
-                classification = await sticker_organizer_client.classify(
-                    summary=summary,
-                    recent_context=context,
-                    image_url=str(metadata.get("image_source") or ""),
-                )
-                stickers.update_classification(
+                if config.sticker_download_enabled and sticker_source:
+                    logger.debug("Saving sticker %s before vision classification", sticker_id)
+                    await _persist_sticker_asset(sticker_id, sticker_source)
+                    logger.debug("Sticker %s asset is ready for classification", sticker_id)
+                await _classify_and_store_sticker(
                     sticker_id,
-                    category=classification.category,
-                    usage_hint=classification.usage_hint,
-                    tags=classification.tags,
+                    summary=summary,
+                    context=context,
                 )
+                logger.debug("Sticker %s classification stored", sticker_id)
             except Exception:
                 logger.warning(
                     "Automatic sticker classification failed",
@@ -3326,6 +3340,37 @@ def create_app(
         task = asyncio.create_task(organize())
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
+
+    async def _classify_and_store_sticker(
+        sticker_id: int,
+        *,
+        summary: str,
+        context: str = "",
+    ) -> bool:
+        metadata = stickers.get_metadata(sticker_id)
+        if metadata is None:
+            return False
+        image_url = await asyncio.to_thread(
+            _sticker_classification_image,
+            metadata,
+        )
+        logger.debug(
+            "Classifying sticker %s with %s image source",
+            sticker_id,
+            "locally rendered" if image_url.startswith("data:image/") else "context only",
+        )
+        classification = await sticker_organizer_client.classify(
+            summary=summary,
+            recent_context=context,
+            image_url=image_url,
+        )
+        return stickers.update_classification(
+            sticker_id,
+            category=classification.category,
+            usage_hint=classification.usage_hint,
+            tags=classification.tags,
+            source=classification.source,
+        )
 
     async def _handle_presence_command(
         target: ReplyTarget,
@@ -3637,7 +3682,12 @@ def create_app(
             raw_message=event.raw_message,
         )
         text = re.sub(r"\[文件:[^\]]+\]", "", content.text)
-        text = text.replace("[图片]", "").replace("[语音]", "").strip()
+        text = (
+            text.replace("[图片]", "")
+            .replace("[语音]", "")
+            .replace("[表情包]", "")
+            .strip()
+        )
         raw_user_text = re.sub(
             r"\[(?:图片|语音|表情包)\]",
             "",
@@ -3715,11 +3765,11 @@ def create_app(
         for sticker in sticker_sources:
             sticker_id = stickers.record(sticker)
             if sticker_id is not None:
-                _queue_sticker_asset(sticker_id, sticker.image_source)
                 _queue_sticker_organization(
                     sticker_id,
                     summary=sticker.summary,
-                    context=f"{display_name}：{text}",
+                    context=f"{display_name}：{text or '只发送了一个表情包'}",
+                    sticker_source=sticker.image_source,
                 )
         if sticker_summaries:
             sticker_text = "、".join(dict.fromkeys(sticker_summaries))
@@ -7264,17 +7314,11 @@ def _detect_natural_sticker_request(text: str) -> bool:
             "不许发",
             "别用表情",
             "不要表情",
+            "别斗图",
+            "不想看表情",
         )
     ):
         return False
-    if not any(marker in compact for marker in ("表情包", "表情", "meme")):
-        implicit_mood = re.search(
-            r"(发|来|整|甩|上|给).{0,5}"
-            r"(搞笑|好笑|无语|开心|可爱|生气|难过|震惊|嘲讽|安慰|加油|梗图)",
-            compact,
-        )
-        if implicit_mood is None:
-            return False
     if any(
         marker in compact
         for marker in (
@@ -7282,8 +7326,12 @@ def _detect_natural_sticker_request(text: str) -> bool:
             "用过",
             "收藏过",
             "收藏了",
+            "怎么收藏",
+            "怎么添加",
+            "怎么弄",
             "有哪些",
             "什么表情",
+            "表情是什么",
             "几个表情",
             "多少表情",
             "为什么",
@@ -7297,38 +7345,98 @@ def _detect_natural_sticker_request(text: str) -> bool:
         )
     ):
         return False
-    exact_requests = {
-        "表情包呢",
-        "表情呢",
-        "表情包",
-        "来个表情",
-        "来点表情",
-        "整点表情",
-        "有没有表情包",
-        "有无表情包",
-        "有表情包吗",
-    }
-    if compact in exact_requests:
-        return True
-    if any(
+    explicit_sticker = any(
         marker in compact
-        for marker in ("发", "来", "整", "甩", "给", "上", "用", "回")
+        for marker in ("表情包", "表情", "meme", "梗图")
+    )
+    request_action = any(
+        marker in compact
+        for marker in (
+            "发",
+            "来",
+            "整",
+            "甩",
+            "给",
+            "上",
+            "用",
+            "回",
+            "安排",
+            "赏",
+            "扔",
+            "配",
+            "斗图",
+        )
+    )
+    contextual_request = any(
+        marker in compact
+        for marker in (
+            "应景",
+            "氛围",
+            "心情",
+            "当前气氛",
+            "这个气氛",
+            "现在的气氛",
+            "这时候",
+            "现在",
+            "当前心情",
+            "表达心情",
+            "接住",
+            "接这个梗",
+            "节目效果",
+            "整活",
+            "符合",
+            "配一个",
+            "别打字",
+        )
+    )
+    if explicit_sticker:
+        if request_action:
+            return True
+        if re.search(
+            r"(有没有|有无|还有).{0,6}(表情包?|meme|梗图)",
+            compact,
+        ):
+            return True
+        return bool(
+            re.search(
+                r"(表情包?|meme|梗图)(呢|呗|有没有|有无|有吗|来一个|安排)$",
+                compact,
+            )
+        )
+    if any(marker in compact for marker in ("斗图", "节目效果")) or re.search(
+        r"整(?:个|点)?活",
+        compact,
     ):
+        return request_action or compact.endswith(("呢", "吗", "呗"))
+    if request_action and (contextual_request or "图" in compact):
         return True
-    return bool(re.search(r"(有没有|有无|还有).{0,4}表情", compact))
+    return bool(
+        re.search(
+            r"(发|来|整|甩|上|给).{0,6}"
+            r"(搞笑|好笑|无语|开心|可爱|生气|难过|震惊|嘲讽|安慰|加油)",
+            compact,
+        )
+    )
 
 
 _STICKER_CATEGORY_ALIASES = {
-    "开心": ("开心", "笑", "哈哈", "好笑", "搞笑", "庆祝", "赞", "棒", "妙"),
-    "无语": ("无语", "尴尬", "离谱", "服了", "汗", "沉默", "省略号"),
-    "震惊": ("震惊", "惊讶", "卧槽", "什么", "居然"),
-    "生气": ("生气", "恼火", "火大", "不满", "气死"),
-    "委屈": ("委屈", "难过", "哭", "心疼", "可怜"),
-    "嘲讽": ("嘲讽", "阴阳", "呵呵", "白眼", "讥讽"),
+    "开心": (
+        "开心", "笑", "哈哈", "好笑", "搞笑", "庆祝", "赞", "棒", "妙",
+        "绷不住", "笑不活", "乐死", "开香槟",
+    ),
+    "无语": (
+        "无语", "尴尬", "离谱", "服了", "汗", "沉默", "省略号",
+        "问号", "满头问号", "离大谱",
+    ),
+    "震惊": ("震惊", "惊讶", "卧槽", "什么", "居然", "傻眼", "裂开"),
+    "生气": ("生气", "恼火", "火大", "不满", "气死", "血压高", "烦死"),
+    "委屈": ("委屈", "难过", "哭", "心疼", "可怜", "破防", "难受"),
+    "嘲讽": ("嘲讽", "阴阳", "呵呵", "白眼", "讥讽", "阴阳怪气"),
     "赞同": ("赞同", "同意", "确实", "可以", "对"),
     "疑惑": ("疑惑", "问号", "懵", "不懂", "不理解"),
     "安慰": ("安慰", "抱抱", "别难过", "辛苦", "累", "心疼"),
-    "加油": ("加油", "鼓励", "努力", "冲", "顶住"),
+    "加油": ("加油", "鼓励", "努力", "冲", "顶住", "稳住", "别摆烂"),
+    "摸鱼": ("摸鱼", "摆烂", "偷懒", "不想上班", "躺平"),
     "日常": ("日常", "随意", "应景", "合适", "看看"),
 }
 
@@ -7383,6 +7491,38 @@ def _choose_explicit_sticker_fallback(
         return None
     ranked = _rank_sticker_candidates(candidates, request_text)
     return ranked[0] if ranked else None
+
+
+def _sticker_classification_image(
+    metadata: dict[str, object],
+) -> str:
+    local_path = str(metadata.get("local_path") or "").strip()
+    if local_path:
+        try:
+            with Image.open(local_path) as image:
+                image.seek(0)
+                image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+                rgba = image.convert("RGBA")
+                canvas = Image.new("RGB", rgba.size, "white")
+                canvas.paste(rgba, mask=rgba.getchannel("A"))
+                output = BytesIO()
+                canvas.save(
+                    output,
+                    format="JPEG",
+                    quality=88,
+                    optimize=True,
+                )
+            encoded = base64.b64encode(output.getvalue()).decode("ascii")
+            return f"data:image/jpeg;base64,{encoded}"
+        except (OSError, ValueError, UnidentifiedImageError):
+            logger.debug(
+                "Could not prepare local sticker image for vision",
+                exc_info=True,
+            )
+    image_source = str(metadata.get("image_source") or "").strip()
+    if image_source.startswith(("http://", "https://", "data:image/")):
+        return image_source
+    return ""
 
 
 def _sent_sticker_history_label(sticker: StickerSource) -> str:

@@ -600,6 +600,25 @@ $("#organize-stickers").addEventListener("click", async () => {
   }
 });
 
+$("#reclassify-stickers").addEventListener("click", async () => {
+  const button = $("#reclassify-stickers");
+  if (!confirm("会重新识别全部表情的画面、文字和适用场景，可能覆盖自动分类。继续吗？")) return;
+  button.disabled = true;
+  button.textContent = "重新判断中…";
+  try {
+    const data = await jsonRequest("/api/admin/stickers/organize", "POST", {
+      refresh_all: true,
+    });
+    alert(`已重新判断 ${data.organized} 个表情，失败 ${data.failed} 个。`);
+    await loadStickers();
+  } catch (error) {
+    alert(`重新判断失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = "按画面重新判断全部表情";
+  }
+});
+
 function bindStickerActions() {
   document.querySelectorAll("[data-save-sticker]").forEach((button) => {
     button.onclick = async () => {

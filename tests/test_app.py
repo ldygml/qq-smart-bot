@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 import json
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from PIL import Image
 from pydantic import SecretStr
 
 from qq_ai_bot.app import (
@@ -38,6 +40,7 @@ from qq_ai_bot.productivity import ProductivityStore
 from qq_ai_bot.quality import QualityStore
 from qq_ai_bot.shared_memory import SharedMemoryStore
 from qq_ai_bot.stickers import StickerAssetStore, StickerStore
+from qq_ai_bot.sticker_policy import StickerClassification
 from qq_ai_bot.topics import TopicCandidate, TopicStore
 from qq_ai_bot.tracing import MessageTraceStore
 from qq_ai_bot.vector_memory import VectorChunk, VectorMemoryStore
@@ -277,6 +280,32 @@ class FakeStickerDecider:
         return self.sticker_id
 
 
+class RecordingStickerOrganizer:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def classify(
+        self,
+        *,
+        summary: str,
+        recent_context: str = "",
+        image_url: str = "",
+    ) -> StickerClassification:
+        self.calls.append(
+            {
+                "summary": summary,
+                "recent_context": recent_context,
+                "image_url": image_url,
+            }
+        )
+        return StickerClassification(
+            "无语",
+            "朋友遇到离谱或尴尬的事情时用；适合熟人轻松吐槽，求助和严肃争议时不用",
+            ("汗", "无语", "尴尬"),
+            source="vision",
+        )
+
+
 class VerboseThenConciseChatClient(FakeChatClient):
     async def chat(
         self,
@@ -362,6 +391,11 @@ def test_natural_sticker_request_recognizes_conversational_variants() -> None:
         "用表情包回我",
         "有没有表情包",
         "表情包呢",
+        "这氛围不得来一张？",
+        "别打字了，整点节目效果",
+        "给我整个活",
+        "来个能接住这个梗的表情",
+        "发张应景的",
     ):
         assert _detect_natural_sticker_request(text), text
 
@@ -371,6 +405,8 @@ def test_natural_sticker_request_recognizes_conversational_variants() -> None:
         "表情包怎么收藏",
         "为什么发表情包",
         "你发表情包了吗",
+        "这个表情包真好笑",
+        "怎么收藏表情包",
     ):
         assert not _detect_natural_sticker_request(text), text
 
@@ -2666,6 +2702,87 @@ async def test_image_only_animation_sticker_is_collected_and_organized(
     assert metadata is not None
     assert metadata["category"] == "无语"
     assert metadata["usage_hint"]
+
+
+@pytest.mark.asyncio
+async def test_new_sticker_uses_saved_image_and_context_for_vision_classification(
+    tmp_path,
+) -> None:
+    image_buffer = BytesIO()
+    Image.new("RGB", (32, 32), (210, 40, 40)).save(image_buffer, format="PNG")
+    png_bytes = image_buffer.getvalue()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=png_bytes,
+            headers={"content-type": "image/png"},
+        )
+
+    asset_store = StickerAssetStore(
+        tmp_path / "sticker-assets",
+        transport=httpx.MockTransport(handler),
+    )
+    sticker_store = StickerStore(
+        tmp_path / "stickers.db",
+        asset_dir=asset_store.asset_dir,
+    )
+    organizer = RecordingStickerOrganizer()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            sticker_download_enabled=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=FakeOneBotClient(),
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        sticker_store=sticker_store,
+        sticker_asset_store=asset_store,
+        sticker_organizer=organizer,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 2755,
+                "message": [
+                    {
+                        "type": "image",
+                        "data": {
+                            "sub_type": "1",
+                            "summary": "汗",
+                            "url": "https://example.com/sweat.png",
+                        },
+                    }
+                ],
+            },
+        )
+        sticker_id = int(sticker_store.list_recent()[0]["id"])
+        await _wait_for_condition(
+            lambda: (
+                sticker_store.get_metadata(sticker_id) or {}
+            ).get("classification_source")
+            == "vision",
+            timeout=5.0,
+        )
+
+    metadata = sticker_store.get_metadata(sticker_id) or {}
+    assert metadata["has_local_asset"] is True
+    assert metadata["usage_hint"].startswith("朋友遇到离谱")
+    assert organizer.calls[0]["summary"] == "汗"
+    assert organizer.calls[0]["image_url"].startswith("data:image/jpeg;base64,")
+    assert "只发送了一个表情包" in organizer.calls[0]["recent_context"]
 
 
 @pytest.mark.asyncio
