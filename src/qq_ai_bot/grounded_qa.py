@@ -5,6 +5,7 @@ import html
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -81,7 +82,10 @@ async def grounded_lookup(
     question: str,
     trust_env: bool = False,
     transport: httpx.AsyncBaseTransport | None = None,
+    force_web_fetch: bool = False,
+    current_date: str | None = None,
 ) -> GroundedAnswer:
+    local_date = current_date or datetime.now().astimezone().date().isoformat()
     music_result = await music_catalog_lookup(
         question,
         trust_env=trust_env,
@@ -89,22 +93,32 @@ async def grounded_lookup(
     )
     if music_result is not None:
         return music_result
-    if _explicit_search_request(question):
+    # Once the caller has classified a request as needing live information,
+    # fetch real result pages first instead of relying on a provider's optional
+    # "search" flag, which can return no sources at all.
+    search_pages: list[GroundedSource] = []
+    if force_web_fetch or _explicit_search_request(question):
         search_pages = await _search_web_pages(
             question,
             trust_env=trust_env,
             transport=transport,
         )
-        if len(search_pages) >= 2:
-            searched = await _answer_from_search_pages(
-                chat_client,
-                model=model,
-                question=question,
-                sources=search_pages,
-            )
-            if searched is not None:
-                return searched
+    if len(search_pages) >= 2 or _allows_single_live_source(
+        question,
+        search_pages,
+    ):
+        searched = await _answer_from_search_pages(
+            chat_client,
+            model=model,
+            question=question,
+            sources=search_pages,
+            current_date=local_date,
+        )
+        if searched is not None:
+            return searched
     reason = "没有获得可核验的事实答案。"
+    unverified_answer = ""
+    unverified_sources: list[GroundedSource] = []
     for attempt in range(2):
         prompt = _grounding_prompt(question, strict=attempt > 0)
         reply = await chat_client.chat(
@@ -138,6 +152,9 @@ async def grounded_lookup(
             question=question,
             answer=answer,
         )
+        if answer and candidates:
+            unverified_answer = answer
+            unverified_sources = candidates[:4]
         if len({urlparse(item.url).netloc.lower() for item in candidates}) < 2:
             reason = "检索结果缺少两个不同域名的可信来源，暂不下结论。"
             continue
@@ -149,15 +166,19 @@ async def grounded_lookup(
         )
         if (
             len({urlparse(item.url).netloc for item in verified}) < 2
-            or not any(
-                _is_authority_domain(urlparse(item.url).netloc)
-                for item in verified
+            or (
+                _requires_authority_sources(question)
+                and not any(
+                    _is_authority_domain(urlparse(item.url).netloc)
+                    for item in verified
+                )
             )
         ):
             accepted = (
                 _cross_domain_fallback(
                     candidates,
                     answer=answer,
+                    require_authority=_requires_authority_sources(question),
                 )
                 if allow_domain_fallback
                 else []
@@ -190,6 +211,25 @@ async def grounded_lookup(
             sources=tuple(verified),
             verified=True,
             verification_level="page_verified",
+        )
+    if search_pages:
+        return GroundedAnswer(
+            answer=(
+                "我联网查到了这些网页，但这次没整理出足够可靠的结论。"
+                "先把实际检索到的来源发你，避免假装搜过。"
+            ),
+            sources=tuple(search_pages[:4]),
+            verified=False,
+            reason="联网检索已执行，但没有完成交叉核验。",
+            verification_level="live_search_pages_unverified",
+        )
+    if unverified_answer:
+        return GroundedAnswer(
+            answer=unverified_answer,
+            sources=tuple(unverified_sources),
+            verified=False,
+            reason=reason,
+            verification_level="source_links_unverified",
         )
     return GroundedAnswer("", reason=reason)
 
@@ -433,6 +473,7 @@ def _candidate_sources(
             parsed.scheme not in {"http", "https"}
             or not parsed.netloc
             or not _is_trusted_domain(parsed.netloc)
+            or _is_low_quality_search_domain(parsed.netloc)
             or url in seen_urls
         ):
             continue
@@ -456,6 +497,7 @@ def _cross_domain_fallback(
     candidates: list[GroundedSource],
     *,
     answer: str,
+    require_authority: bool = True,
 ) -> list[GroundedSource]:
     selected: list[GroundedSource] = []
     domains: set[str] = set()
@@ -474,7 +516,7 @@ def _cross_domain_fallback(
         domains.add(host)
     if len(domains) < 2:
         return []
-    if not any(
+    if require_authority and not any(
         _is_authority_domain(urlparse(item.url).netloc)
         for item in selected
     ):
@@ -508,7 +550,7 @@ async def _verify_sources(
             try:
                 response = await client.get(source.url)
                 response.raise_for_status()
-                text = _html_to_text(response.text)
+                text = _html_to_text(_decode_html_response(response))
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code not in {401, 403, 429}:
                     allow_domain_fallback = False
@@ -540,22 +582,76 @@ async def _verify_sources(
 
 
 def _explicit_search_request(question: str) -> bool:
-    value = question.lower()
-    return any(
-        marker in value
-        for marker in (
-            "联网搜索",
-            "联网查",
-            "联网找",
-            "上网查",
-            "网上查",
-            "帮我搜",
-            "搜索一下",
-            "搜一下",
-            "现查",
-            "查资料",
-            "先搜索",
-            "先联网",
+    return is_explicit_search_request(question)
+
+
+def is_explicit_search_request(question: str) -> bool:
+    """Return true when the user clearly asks the bot to use the web."""
+    value = re.sub(r"\s+", "", question.lower())
+    direct_markers = (
+        "联网搜索",
+        "联网查",
+        "联网找",
+        "联网看看",
+        "联网浏览",
+        "联网检索",
+        "上网查",
+        "上网搜",
+        "上网看看",
+        "网上查",
+        "网上搜",
+        "网上看看",
+        "帮我搜",
+        "帮我查",
+        "给我搜",
+        "给我查",
+        "替我搜",
+        "替我查",
+        "搜索一下",
+        "搜索下",
+        "搜索看看",
+        "搜一下",
+        "搜下看看",
+        "搜一搜",
+        "搜搜看",
+        "检索一下",
+        "查一下",
+        "查下",
+        "查一查",
+        "查查",
+        "现查",
+        "去查",
+        "去搜",
+        "先搜索",
+        "先联网",
+        "用网络查",
+        "用互联网查",
+        "查资料",
+        "查最新",
+        "查新闻",
+    )
+    if any(marker in value for marker in direct_markers):
+        return True
+    if re.match(
+        r"^(?:请|麻烦(?:你)?|你)?(?:帮我|给我|替我)?"
+        r"(?:先|马上|直接)?搜索(?:一下|下|看看)?",
+        value,
+    ) and not re.match(
+        r"^(?:搜索算法|搜索引擎|搜索功能|搜索技术|搜索框|"
+        r"搜索记录|搜索历史|搜索排序|搜索建议)",
+        value,
+    ):
+        return True
+    return bool(
+        re.search(
+            r"(?:联网|上网|网上|互联网|网络)"
+            r".{0,10}(?:查|搜|找|看|浏览|检索|核实|验证)",
+            value,
+        )
+        or re.search(
+            r"(?:帮我|给我|替我|你去|你来|直接|马上|现在|先)"
+            r".{0,6}(?:查|搜|找|浏览|检索)",
+            value,
         )
     )
 
@@ -609,6 +705,7 @@ async def _search_web_pages(
                     or host.endswith("360.com")
                     or host.endswith("360kan.com")
                     or host.endswith("bing.com")
+                    or _is_low_quality_search_domain(host)
                     or url in seen
                 ):
                     continue
@@ -636,7 +733,7 @@ async def _search_web_pages(
                 try:
                     page = await client.get(url)
                     page.raise_for_status()
-                    text = _html_to_text(page.text)
+                    text = _html_to_text(_decode_html_response(page))
                 except (httpx.HTTPError, ValueError):
                     return None
             if len(text) < 200:
@@ -668,6 +765,19 @@ async def _search_web_pages(
 
 def _clean_search_query(question: str) -> str:
     value = question.strip()
+    # Strip the complete request wrapper before replacing shorter markers below.
+    # Otherwise "你联网查一下今天..." first becomes "你 今天...", leaving the
+    # pronoun embedded in the actual search query.
+    value = re.sub(
+        r"^(?:请|麻烦|你|能不能|可以)?(?:先|马上|直接)?"
+        r"(?:联网|上网|网上|用互联网|用网络)?"
+        r"(?:帮我|给我|替我)?"
+        r"(?:搜索|搜|查|找|浏览|检索)"
+        r"(?:一下|下|看看|一查|查)?"
+        r"[：:，,\s]*",
+        "",
+        value,
+    )
     for marker in (
         "帮我联网搜索",
         "帮我上网查",
@@ -686,6 +796,23 @@ def _clean_search_query(question: str) -> str:
         "现查",
     ):
         value = value.replace(marker, " ")
+    # Remove any remaining leading politeness/network wrappers without treating
+    # query words such as "下载" as request particles.
+    wrapper = re.compile(
+        r"^(?:请|麻烦(?:你)?|你|能不能|可以|帮我|给我|替我|"
+        r"联网|上网|网上|用互联网|用网络|先|马上|直接|"
+        r"[：:，,\s]+)+"
+    )
+    previous = None
+    while previous != value:
+        previous = value
+        value = wrapper.sub("", value, count=1)
+    value = re.sub(
+        r"[，,\s]*(?:再)?(?:给我|把)?(?:来源|出处|链接).*$",
+        "",
+        value,
+    )
+    value = re.sub(r"(?:然后|之后再|再).*$", "", value)
     return re.sub(r"\s+", " ", value).strip() or question
 
 
@@ -718,7 +845,9 @@ async def _answer_from_search_pages(
     model: str,
     question: str,
     sources: list[GroundedSource],
+    current_date: str,
 ) -> GroundedAnswer | None:
+    single_source_allowed = _allows_single_live_source(question, sources)
     materials = "\n\n".join(
         (
             f"来源编号：{index}\n"
@@ -734,6 +863,11 @@ async def _answer_from_search_pages(
         "说明时间范围和关键结论。"
         if summary
         else "answer 用一到三句话直接回答。"
+    )
+    source_instruction = (
+        "从下面唯一的可信实时数据源中提取答案，并在结论后标注 [来源1]。"
+        if single_source_allowed
+        else "从下面来源中选择至少两个能支撑答案的编号。"
     )
     try:
         reply = await chat_client.chat(
@@ -753,8 +887,9 @@ async def _answer_from_search_pages(
                     "role": "user",
                     "content": (
                         f"用户问题：{question}\n"
+                        f"当前日期：{current_date}\n"
                         f"要求：{answer_instruction}\n"
-                        "从下面来源中选择至少两个能支撑答案的编号。"
+                        f"{source_instruction}"
                         '返回格式：{"answer":"整理后的答案",'
                         '"source_ids":[1,2]}。\n\n'
                         f"{materials}"
@@ -785,21 +920,39 @@ async def _answer_from_search_pages(
                 source = sources[index - 1]
                 if source not in selected:
                     selected.append(source)
-    if len(selected) < 2:
+    if len(selected) < 2 and not single_source_allowed:
         answer_terms = _important_terms(answer)
         selected = [
             source
             for source in sources
             if any(term in source.page_text for term in answer_terms)
         ][:4]
+    if single_source_allowed and not selected:
+        selected = sources[:1]
     domains = {urlparse(item.url).netloc.lower() for item in selected}
-    if len(domains) < 2:
+    if len(domains) < 2 and not single_source_allowed:
         return None
-    if not any(
-        _is_authority_domain(urlparse(item.url).netloc)
-        for item in selected
+    if (
+        _requires_authority_sources(question)
+        and not any(
+            _is_authority_domain(urlparse(item.url).netloc)
+            for item in selected
+        )
     ):
         return None
+    stale_date = _stale_today_date(question, answer, current_date)
+    if stale_date:
+        return GroundedAnswer(
+            answer=(
+                f"我联网查到的页面标注的是 {stale_date}，不是今天"
+                f"（{current_date}）。这份页面可能还没更新，不能拿它冒充"
+                "今天的赛程。"
+            ),
+            sources=tuple(selected[:4]),
+            verified=False,
+            reason="联网页面日期与今天不一致。",
+            verification_level="stale_live_source",
+        )
     if summary and not re.search(r"(?m)^\s*1[.、]", answer):
         organized = await _organize_grounded_answer(
             chat_client,
@@ -815,6 +968,42 @@ async def _answer_from_search_pages(
         verified=True,
         verification_level="live_search_pages",
     )
+
+
+def _allows_single_live_source(
+    question: str,
+    sources: list[GroundedSource],
+) -> bool:
+    if len(sources) != 1:
+        return False
+    host = urlparse(sources[0].url).netloc.lower()
+    return host in {"okooo.com", "www.okooo.com"} and any(
+        marker in question
+        for marker in ("赛程", "比分", "比赛", "对阵")
+    )
+
+
+def _stale_today_date(
+    question: str,
+    answer: str,
+    current_date: str,
+) -> str:
+    if not any(marker in question for marker in ("今天", "今日")):
+        return ""
+    normalized_current = current_date.replace("-", "")
+    dates: list[str] = []
+    for value in re.findall(
+        r"(20\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})",
+        answer,
+    ):
+        year, month, day = value
+        dates.append(f"{int(year):04d}-{int(month):02d}-{int(day):02d}")
+    dates = list(dict.fromkeys(dates))
+    if not dates:
+        return ""
+    if any(value.replace("-", "") == normalized_current for value in dates):
+        return ""
+    return dates[0]
 
 
 def _wants_organized_answer(question: str) -> bool:
@@ -901,6 +1090,29 @@ def _is_authority_domain(netloc: str) -> bool:
     )
 
 
+def _is_low_quality_search_domain(netloc: str) -> bool:
+    """Filter generated SEO pages that imitate current sports/news data."""
+    host = netloc.lower().split(":", 1)[0]
+    label = host.split(".", 1)[0]
+    keyword_tokens = (
+        "zuqiu",
+        "saicheng",
+        "bisai",
+        "jinri",
+        "yilan",
+        "chaxun",
+        "zhibo",
+        "bifen",
+    )
+    token_count = sum(token in label for token in keyword_tokens)
+    return (
+        token_count >= 2
+        or (token_count >= 1 and len(label) >= 16)
+        or bool(re.search(r"[a-z]{16,}\d+[a-z0-9]*", label))
+        or label.startswith(("zuqiujinri", "jinrizuqi", "zuqusaicheng"))
+    )
+
+
 def _important_terms(answer: str) -> set[str]:
     compact = re.sub(
         r"[^\u4e00-\u9fffA-Za-z0-9]",
@@ -928,6 +1140,35 @@ def _html_to_text(value: str) -> str:
     )
     value = re.sub(r"(?s)<[^>]+>", " ", value)
     return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def _decode_html_response(response: httpx.Response) -> str:
+    raw = response.content
+    declared = re.search(
+        br"<meta[^>]+charset\s*=\s*[\"']?([a-zA-Z0-9_.-]+)",
+        raw[:16384],
+        re.IGNORECASE,
+    )
+    encodings = [
+        declared.group(1).decode("ascii", "ignore") if declared else "",
+        response.charset_encoding or "",
+        "utf-8",
+        "gb18030",
+    ]
+    best = ""
+    best_score = None
+    for encoding in dict.fromkeys(item for item in encodings if item):
+        try:
+            text = raw.decode(encoding, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+        score = text.count("\ufffd")
+        if best_score is None or score < best_score:
+            best = text
+            best_score = score
+        if score == 0:
+            break
+    return best or raw.decode("utf-8", errors="replace")
 
 
 def _parse_json(reply: str) -> dict[str, Any]:

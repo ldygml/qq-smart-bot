@@ -57,7 +57,11 @@ from .group_policy import (
 )
 from .group_behavior import GroupBehaviorStore
 from .group_profiles import GroupPolicy, GroupProfileStore
-from .grounded_qa import GroundedAnswer, grounded_lookup
+from .grounded_qa import (
+    GroundedAnswer,
+    grounded_lookup,
+    is_explicit_search_request,
+)
 from .history_sync import (
     HISTORY_RESULT_STATE,
     history_cursor_key,
@@ -1807,13 +1811,14 @@ def create_app(
                     model=config.llm_model,
                     question=text,
                     trust_env=config.llm_trust_env,
+                    force_web_fetch=True,
+                    current_date=datetime.now(
+                        ZoneInfo(config.timezone)
+                    ).date().isoformat(),
                 )
             except LLMError as exc:
                 return JSONResponse({"detail": str(exc)}, status_code=502)
-            reply = grounded.formatted() if grounded.verified else (
-                grounded.reason
-                or "没有找到两个可交叉验证的可信来源，暂不下结论。"
-            )
+            reply = _format_grounded_reply(grounded)
             return {
                 "ok": True,
                 "status": "replied" if grounded.verified else "unverified",
@@ -4100,6 +4105,10 @@ def create_app(
                         model=config.llm_model,
                         question=text,
                         trust_env=config.llm_trust_env,
+                        force_web_fetch=True,
+                        current_date=datetime.now(
+                            ZoneInfo(config.timezone)
+                        ).date().isoformat(),
                     )
                 except LLMError as exc:
                     await _safe_send(target, str(exc))
@@ -4114,13 +4123,7 @@ def create_app(
                     ],
                     reason=grounded.reason,
                 )
-                if not grounded.verified:
-                    reply = (
-                        grounded.reason
-                        or "没有找到两个可交叉验证的可信来源，暂不下结论。"
-                    )
-                else:
-                    reply = grounded.formatted()
+                reply = _format_grounded_reply(grounded)
                 quality_id = quality.record(
                     conversation_id=conversation_id,
                     user_id=event.user_id,
@@ -6707,8 +6710,22 @@ def _human_file_size(value: Any) -> str:
     return "大小未知"
 
 
+def _format_grounded_reply(grounded: GroundedAnswer) -> str:
+    if grounded.verified:
+        return grounded.formatted()
+    if grounded.answer:
+        return (
+            "联网搜索已经执行了，但这些结果还没完成双源核验，"
+            "先按检索结果给你参考：\n"
+            f"{grounded.formatted()}"
+        )
+    return grounded.reason or "联网搜索没有返回可读结果，请稍后再试。"
+
+
 def _wants_forced_research(text: str) -> bool:
     value = text.strip().lower()
+    if is_explicit_search_request(value):
+        return True
     return any(
         marker in value
         for marker in (
