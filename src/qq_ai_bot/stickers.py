@@ -35,6 +35,121 @@ class StickerAsset:
     source: str
 
 
+_CLASSIFICATION_SOURCE_PRIORITY = {
+    "manual": 4,
+    "vision": 3,
+    "text": 2,
+    "fallback": 1,
+    "auto": 1,
+    "": 0,
+}
+
+
+def _classification_rank(row: sqlite3.Row) -> int:
+    if (
+        str(row["category"] or "未分类") == "未分类"
+        and not str(row["usage_hint"] or "").strip()
+    ):
+        return 0
+    source = str(row["classification_source"] or "").strip().lower()
+    return _CLASSIFICATION_SOURCE_PRIORITY.get(source, 1)
+
+
+def _merge_sticker_rows(
+    connection: sqlite3.Connection,
+    canonical: sqlite3.Row,
+    duplicate: sqlite3.Row,
+) -> None:
+    canonical_data = dict(canonical)
+    duplicate_data = dict(duplicate)
+    classification = (
+        duplicate_data
+        if _classification_rank(duplicate) > _classification_rank(canonical)
+        else canonical_data
+    )
+    connection.execute(
+        """
+        UPDATE sticker_catalog
+        SET image_source = ?,
+            local_path = ?,
+            asset_sha256 = ?,
+            mime_type = ?,
+            asset_verified_at = ?,
+            asset_error = '',
+            category = ?,
+            usage_hint = ?,
+            tags = ?,
+            classification_source = ?,
+            enabled = ?,
+            seen_at = ?,
+            use_count = ?
+        WHERE id = ?
+        """,
+        (
+            str(canonical_data.get("image_source") or "")
+            or str(duplicate_data.get("image_source") or ""),
+            str(canonical_data.get("local_path") or "")
+            or str(duplicate_data.get("local_path") or ""),
+            str(canonical_data.get("asset_sha256") or "")
+            or str(duplicate_data.get("asset_sha256") or ""),
+            str(canonical_data.get("mime_type") or "")
+            or str(duplicate_data.get("mime_type") or ""),
+            max(
+                str(canonical_data.get("asset_verified_at") or ""),
+                str(duplicate_data.get("asset_verified_at") or ""),
+            ),
+            str(classification.get("category") or "未分类"),
+            str(classification.get("usage_hint") or ""),
+            str(classification.get("tags") or "[]"),
+            str(classification.get("classification_source") or ""),
+            1
+            if int(canonical_data.get("enabled") or 0)
+            or int(duplicate_data.get("enabled") or 0)
+            else 0,
+            max(
+                str(canonical_data.get("seen_at") or ""),
+                str(duplicate_data.get("seen_at") or ""),
+            ),
+            int(canonical_data.get("use_count") or 0)
+            + int(duplicate_data.get("use_count") or 0),
+            int(canonical["id"]),
+        ),
+    )
+    connection.execute(
+        "DELETE FROM sticker_catalog WHERE id = ?",
+        (int(duplicate["id"]),),
+    )
+
+
+def _deduplicate_asset_group(
+    connection: sqlite3.Connection,
+    asset_sha256: str,
+) -> int | None:
+    rows = connection.execute(
+        "SELECT * FROM sticker_catalog WHERE asset_sha256 = ?",
+        (asset_sha256,),
+    ).fetchall()
+    if not rows:
+        return None
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            int(row["enabled"] or 0),
+            int(row["use_count"] or 0),
+            -int(row["id"]),
+        ),
+        reverse=True,
+    )
+    canonical = ordered[0]
+    for duplicate in ordered[1:]:
+        _merge_sticker_rows(connection, canonical, duplicate)
+        canonical = connection.execute(
+            "SELECT * FROM sticker_catalog WHERE id = ?",
+            (int(canonical["id"]),),
+        ).fetchone()
+    return int(canonical["id"])
+
+
 class StickerAssetStore:
     def __init__(
         self,
@@ -285,6 +400,31 @@ class StickerStore:
                 connection.execute(
                     "UPDATE sticker_catalog SET local_path = ? WHERE id = ?",
                     (str(relative), int(row["id"])),
+                )
+            duplicate_groups = connection.execute(
+                """
+                SELECT asset_sha256
+                FROM sticker_catalog
+                WHERE asset_sha256 != ''
+                GROUP BY asset_sha256
+                HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+            removed = 0
+            for row in duplicate_groups:
+                ids = connection.execute(
+                    "SELECT id FROM sticker_catalog WHERE asset_sha256 = ?",
+                    (str(row["asset_sha256"]),),
+                ).fetchall()
+                _deduplicate_asset_group(
+                    connection,
+                    str(row["asset_sha256"]),
+                )
+                removed += max(0, len(ids) - 1)
+            if removed:
+                logger.info(
+                    "Merged %s duplicate sticker catalog rows by asset hash",
+                    removed,
                 )
 
     def record(self, sticker: StickerSource) -> int | None:
@@ -554,7 +694,7 @@ class StickerStore:
         local_path: Path | str,
         sha256: str,
         mime_type: str,
-    ) -> bool:
+    ) -> int | None:
         asset = Path(local_path).expanduser().resolve()
         try:
             stored_path = str(asset.relative_to(self.asset_dir.resolve()))
@@ -576,7 +716,9 @@ class StickerStore:
                     sticker_id,
                 ),
             )
-            return cursor.rowcount > 0
+            if cursor.rowcount <= 0:
+                return None
+            return _deduplicate_asset_group(connection, sha256.strip())
 
     def mark_asset_failed(self, sticker_id: int, error: str) -> bool:
         with self._lock, self._connect() as connection:

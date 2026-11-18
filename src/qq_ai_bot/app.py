@@ -1287,7 +1287,7 @@ def create_app(
                     int(item["id"]),
                     source,
                 )
-                return saved, "" if saved else str(
+                return saved is not None, "" if saved is not None else str(
                     item.get("summary") or item["id"]
                 )
 
@@ -1342,6 +1342,8 @@ def create_app(
             async with gate:
                 sticker_id = int(item["id"])
                 metadata = stickers.get_metadata(sticker_id) or item
+                if str(metadata.get("classification_source") or "") == "manual":
+                    return False
                 image_url = await asyncio.to_thread(
                     _sticker_classification_image,
                     metadata,
@@ -3187,7 +3189,7 @@ def create_app(
     async def _persist_sticker_asset(
         sticker_id: int,
         sticker_source: str,
-    ) -> bool:
+    ) -> int | None:
         try:
             asset = await sticker_assets.persist(sticker_source)
         except (StickerAssetError, OSError, httpx.HTTPError) as exc:
@@ -3197,7 +3199,7 @@ def create_app(
                 sticker_id,
                 exc,
             )
-            return False
+            return None
         return stickers.attach_asset(
             sticker_id,
             local_path=asset.path,
@@ -3319,12 +3321,19 @@ def create_app(
 
         async def organize() -> None:
             try:
+                classification_id = sticker_id
                 if config.sticker_download_enabled and sticker_source:
                     logger.debug("Saving sticker %s before vision classification", sticker_id)
-                    await _persist_sticker_asset(sticker_id, sticker_source)
+                    attached_id = await _persist_sticker_asset(
+                        sticker_id,
+                        sticker_source,
+                    )
+                    if attached_id is None:
+                        return
+                    classification_id = attached_id
                     logger.debug("Sticker %s asset is ready for classification", sticker_id)
                 await _classify_and_store_sticker(
-                    sticker_id,
+                    classification_id,
                     summary=summary,
                     context=context,
                 )
@@ -3349,6 +3358,8 @@ def create_app(
     ) -> bool:
         metadata = stickers.get_metadata(sticker_id)
         if metadata is None:
+            return False
+        if str(metadata.get("classification_source") or "") == "manual":
             return False
         image_url = await asyncio.to_thread(
             _sticker_classification_image,

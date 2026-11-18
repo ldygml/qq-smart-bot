@@ -51,6 +51,37 @@ if (-not (Test-LocalPort -Port $port)) {
     throw "Control plane did not start. Check .runtime\control.stderr.log."
 }
 
+$publicUrl = ""
+$autoTunnel = $env:CLOUDFLARE_AUTO_START
+if ($autoTunnel -ne "false") {
+    $cloudflareScript = Join-Path $projectRoot "cloudflare.ps1"
+    if (Test-Path -LiteralPath $cloudflareScript) {
+        try {
+            & powershell.exe `
+                -NoProfile `
+                -ExecutionPolicy Bypass `
+                -File $cloudflareScript `
+                start
+            if ($LASTEXITCODE -eq 0) {
+                $cloudflareUrlFile = Join-Path $projectRoot ".runtime\cloudflared.url"
+                if (Test-Path -LiteralPath $cloudflareUrlFile) {
+                    $publicUrl = (Get-Content `
+                        -LiteralPath $cloudflareUrlFile `
+                        -Encoding UTF8 | Out-String).Trim()
+                }
+            }
+        }
+        catch {
+            Write-Warning "Cloudflare tunnel was not started: $($_.Exception.Message)"
+        }
+    }
+}
+
 $url = "http://127.0.0.1:$port/"
 Start-Process $url
 Write-Host "Control plane is running: $url"
+if ($publicUrl) {
+    try { Set-Clipboard -Value $publicUrl } catch {}
+    Write-Host "Mobile URL: $publicUrl"
+    Write-Host "The current mobile URL has been copied to the clipboard."
+}
