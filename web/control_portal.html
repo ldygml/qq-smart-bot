@@ -18,6 +18,34 @@
       <div class="hero-stats"><article><small>API 供应商</small><strong id="provider-count">0</strong></article><article><small>机器人实例</small><strong id="instance-count">0</strong></article><article><small>在线实例</small><strong id="online-count">0</strong></article></div>
     </section>
 
+    <section id="dashboard" class="dashboard-grid">
+      <article class="panel dashboard-card">
+        <div class="panel-head"><div><p class="eyebrow">LIVE OVERVIEW</p><h2>运行概览</h2></div><button id="refresh-dashboard" class="text-button">刷新</button></div>
+        <div class="metric-grid">
+          <div><small>控制台</small><strong id="dashboard-control-status">检查中</strong></div>
+          <div><small>在线机器人</small><strong id="dashboard-online">0 / 0</strong></div>
+          <div><small>公网访问</small><strong id="dashboard-public">未启用</strong></div>
+        </div>
+        <div class="dashboard-security" id="dashboard-security">正在检查登录与 HTTPS 状态…</div>
+        <p class="eyebrow compact-label">RECENT ERRORS</p>
+        <div id="dashboard-errors" class="compact-list"><div class="empty">暂无近期错误</div></div>
+      </article>
+
+      <article id="cloudflare-panel" class="panel cloudflare-card">
+        <div class="panel-head"><div><p class="eyebrow">MOBILE ACCESS</p><h2>手机公网入口</h2></div><span id="cloudflare-badge" class="status"><i></i>未启动</span></div>
+        <p class="muted">Cloudflare 隧道只转发登录控制台，不会暴露机器人 8080、NapCat 3000 或 OneBot Token。公网访问仍然必须登录管理员账号。</p>
+        <div class="tunnel-form">
+          <label>隧道模式<select id="cloudflare-mode"><option value="quick">临时 Quick Tunnel</option><option value="token">Named Tunnel Token</option></select></label>
+          <label id="cloudflare-token-row" hidden>Named Tunnel Token<input id="cloudflare-token" type="password" autocomplete="off" placeholder="只用于本次启动，不写入数据库"></label>
+          <label>固定公网地址（可选）<input id="cloudflare-public-url" placeholder="https://bot.example.com，仅 Named Tunnel 使用"></label>
+          <div class="tunnel-actions"><button id="cloudflare-start" class="primary">启动公网访问</button><button id="cloudflare-stop">停止隧道</button></div>
+        </div>
+        <div id="cloudflare-url-row" class="public-url" hidden><a id="cloudflare-url" target="_blank" rel="noreferrer"></a><button id="copy-cloudflare-url">复制手机地址</button></div>
+        <div id="cloudflare-state" class="muted">cloudflared 状态检查中…</div>
+        <p id="cloudflare-error" class="error"></p>
+      </article>
+    </section>
+
     <section class="panel-grid">
       <article class="panel">
         <div class="panel-head"><div><p class="eyebrow">PROVIDERS</p><h2>API 供应商</h2></div><button class="text-button" data-open="provider-form">新增</button></div>
@@ -222,6 +250,19 @@
       <p id="routes-result" class="muted"></p>
     </section>
 
+    <section id="logs-panel" class="form-panel logs-panel" hidden>
+      <div class="panel-head"><div><p class="eyebrow">LIVE LOGS</p><h2>运行日志</h2></div><button class="close" data-close="logs-panel">×</button></div>
+      <div class="settings-fields">
+        <label>日志来源<select id="log-source"><option value="control">控制台输出</option><option value="control-error">控制台错误</option><option value="cloudflared">Cloudflare 隧道</option><option value="napcat">NapCat</option><option value="instance">机器人实例</option></select></label>
+        <label id="log-instance-row" hidden>机器人实例<select id="log-instance"></select></label>
+        <label>日志流<select id="log-stream"><option value="all">标准输出 + 错误</option><option value="stdout">仅标准输出</option><option value="stderr">仅错误</option></select></label>
+      </div>
+      <button id="refresh-logs" class="primary">刷新日志</button>
+      <pre id="log-output" class="log-output">选择来源后刷新。</pre>
+      <p id="log-error" class="error"></p>
+      <p class="muted">日志中的 Token、API Key、密码和签名参数会自动脱敏。</p>
+    </section>
+
     <section id="provider-form" class="form-panel" hidden>
       <div class="panel-head"><div><p class="eyebrow">NEW / EDIT PROVIDER</p><h2>配置 API</h2></div><button class="close" data-close="provider-form">×</button></div>
       <form id="provider-editor">
@@ -266,6 +307,12 @@
 
     <section class="notice"><b>QQ 绑定方式</b><span>实例启动后进入对应 NapCat WebUI 扫码登录。本站不提供 QQ 密码输入框，也不会处理你的 QQ 密码。</span></section>
   </main>
-  <script src="/portal/control.js?v=20261106-admin2"></script>
+  <nav class="mobile-dock" aria-label="手机快捷导航">
+    <a href="#dashboard">概览</a>
+    <a href="#instances">实例</a>
+    <a href="#cloudflare-panel">公网</a>
+    <button data-open="logs-panel">日志</button>
+  </nav>
+  <script src="/portal/control.js?v=20261118-mobile1"></script>
 </body>
 </html>

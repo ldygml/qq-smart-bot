@@ -10,12 +10,22 @@ const state = {
 };
 
 const $ = (selector) => document.querySelector(selector);
+const adminApiBase = window.QQ_ADMIN_API_BASE || "/api/admin";
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
 }[char]));
 
+function scopedAdminPath(path) {
+  if (!path || !path.startsWith("/api/admin")) return path;
+  return `${adminApiBase}${path.slice("/api/admin".length)}`;
+}
+
 async function api(path, options = {}) {
-  const response = await fetch(path, options);
+  const headers = {...(options.headers || {})};
+  if (window.QQ_ADMIN_CSRF && options.method && options.method !== "GET") {
+    headers["X-CSRF-Token"] = window.QQ_ADMIN_CSRF;
+  }
+  const response = await fetch(scopedAdminPath(path), {...options, headers});
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
   return data;
@@ -539,9 +549,11 @@ $("#reflect-now").addEventListener("click", async () => {
 async function loadStickers() {
   const data = await api("/api/admin/stickers");
   $("#sticker-list").innerHTML = data.stickers.length
-    ? data.stickers.map((item) => `
+    ? data.stickers.map((item) => {
+      const stickerUrl = scopedAdminPath(item.asset_url || item.image_source || "");
+      return `
       <article class="sticker">
-        <div class="sticker-preview">${item.asset_url || item.image_source ? `<img src="${esc(item.asset_url || item.image_source)}" alt="${esc(item.summary)}" loading="lazy">` : `<span>${esc(item.summary)}</span>`}</div>
+        <div class="sticker-preview">${stickerUrl ? `<img src="${esc(stickerUrl)}" alt="${esc(item.summary)}" loading="lazy">` : `<span>${esc(item.summary)}</span>`}</div>
         <strong>${esc(item.summary)}</strong>
         <div class="row-meta">${item.has_local_asset ? "本地文件已保存" : (item.asset_error ? "保存失败，可稍后补齐" : "等待补存图片")}</div>
         <div class="row-meta">emoji ${esc(item.emoji_id || "-")} · 使用 ${esc(item.use_count)} 次</div>
@@ -550,7 +562,8 @@ async function loadStickers() {
         <label>适用场景<input data-sticker-hint="${item.id}" value="${esc(item.usage_hint || "")}" placeholder="例如：无语、震惊、庆祝"></label>
         <label class="check"><input type="checkbox" data-sticker-enabled="${item.id}" ${item.enabled ? "checked" : ""}> 启用自动选择</label>
         <div class="item-actions"><button data-save-sticker="${item.id}">保存</button><button class="danger" data-delete-sticker="${item.id}">删除</button></div>
-      </article>`).join("")
+      </article>`;
+    }).join("")
     : `<div class="empty">表情库为空。先让别人给机器人发几个表情包。</div>`;
   bindStickerActions();
 }
@@ -1173,7 +1186,8 @@ $("#generate-submit").addEventListener("click", async () => {
       prompt: $("#generate-prompt").value,
       research: $("#generate-research").checked,
     });
-    resultBox.innerHTML = `<div class="generated-result"><strong>${esc(result.summary)}</strong><br><a href="${esc(result.download_url)}">下载 ${esc(result.name)}</a>${result.kind === "image" ? `<br><img src="${esc(result.download_url)}" alt="${esc(result.name)}">` : ""}</div>`;
+    const artifactUrl = scopedAdminPath(result.download_url);
+    resultBox.innerHTML = `<div class="generated-result"><strong>${esc(result.summary)}</strong><br><a href="${esc(artifactUrl)}">下载 ${esc(result.name)}</a>${result.kind === "image" ? `<br><img src="${esc(artifactUrl)}" alt="${esc(result.name)}">` : ""}</div>`;
   } catch (error) {
     errorBox.textContent = error.message;
   } finally {

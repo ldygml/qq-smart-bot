@@ -1,6 +1,7 @@
 let csrf = "";
 let providers = [];
 let instances = [];
+let latestDashboard = null;
 let groupDetails = {knowledge: [], members: [], relationships: []};
 let groupFiles = [];
 
@@ -32,6 +33,70 @@ async function loadMe() {
   const me = await api("/api/auth/me");
   csrf = me.csrf_token;
   document.querySelector("#user-label").textContent = me.username;
+}
+
+function setText(selector, value) {
+  const element = document.querySelector(selector);
+  if (element) element.textContent = value;
+}
+
+function renderDashboard(data) {
+  latestDashboard = data;
+  const counts = data.counts || {};
+  setText("#dashboard-control-status", data.site?.https ? "HTTPS 安全连接" : "本地 HTTP");
+  setText("#dashboard-online", `${counts.online || 0} / ${counts.instances || 0}`);
+  setText("#dashboard-public", data.cloudflare?.running ? "Cloudflare 已连接" : "未启用");
+  setText(
+    "#dashboard-security",
+    data.site?.https
+      ? "管理员登录已启用 · Cookie 使用 Secure · CSRF 防护开启"
+      : "管理员登录已启用 · 当前是本机 HTTP；手机公网访问请通过 Cloudflare HTTPS 隧道。"
+  );
+  const errors = data.recent_errors || [];
+  document.querySelector("#dashboard-errors").innerHTML = errors.length
+    ? errors.map((item) => `
+      <a class="compact-row" href="#instances">
+        <span class="compact-method">${esc(item.method)}</span>
+        <span class="compact-path">${esc(item.path)}</span>
+        <span class="compact-code">${esc(item.status_code)}</span>
+      </a>`).join("")
+    : `<div class="empty">暂无近期错误</div>`;
+  renderCloudflare(data.cloudflare || {});
+}
+
+function renderCloudflare(status) {
+  const running = Boolean(status.running);
+  const badge = document.querySelector("#cloudflare-badge");
+  if (badge) {
+    badge.className = `status ${running ? "online" : ""}`;
+    badge.innerHTML = `<i></i>${running ? "运行中" : "未启动"}`;
+  }
+  const start = document.querySelector("#cloudflare-start");
+  const stop = document.querySelector("#cloudflare-stop");
+  if (start) start.disabled = running || !status.available;
+  if (stop) stop.disabled = !running;
+  const state = document.querySelector("#cloudflare-state");
+  if (state) {
+    state.textContent = running
+      ? `隧道进程 ${status.pid || "-"} 正在运行；手机打开下方地址后仍需管理员登录。`
+      : status.available
+        ? "cloudflared 已安装，启动后生成临时 HTTPS 地址。"
+        : "未找到 cloudflared。请先安装 Cloudflare Tunnel 客户端。";
+  }
+  const row = document.querySelector("#cloudflare-url-row");
+  const link = document.querySelector("#cloudflare-url");
+  if (link && status.public_url) {
+    link.href = status.public_url;
+    link.textContent = status.public_url;
+    if (row) row.hidden = false;
+  } else if (row) {
+    row.hidden = true;
+  }
+}
+
+async function loadDashboard() {
+  const data = await api("/api/dashboard");
+  renderDashboard(data);
 }
 
 async function loadProviders() {
@@ -92,12 +157,13 @@ function bindInstanceActions() {
   document.querySelectorAll("[data-model-routes]").forEach((b) => b.onclick = () => openModelRoutes(Number(b.dataset.modelRoutes)));
   document.querySelectorAll("[data-edit-instance]").forEach((b) => b.onclick = () => editInstance(Number(b.dataset.editInstance)));
   document.querySelectorAll("[data-delete-instance]").forEach((b) => b.onclick = () => deleteInstance(Number(b.dataset.deleteInstance)));
+  document.querySelector("#log-instance").innerHTML = instances.map((item) => `<option value="${item.id}">${esc(item.name)} · ${item.status}</option>`).join("");
 }
 
 async function instanceAction(id, action) {
   try {
     await api(`/api/instances/${id}/${action}`, {method:"POST"});
-    await loadInstances();
+    await Promise.all([loadInstances(), loadDashboard()]);
   } catch (error) { alert(error.message); }
 }
 
@@ -1165,6 +1231,96 @@ document.querySelector("#load-evolution-topics").addEventListener("click", async
   }
 });
 
+document.querySelector("#refresh-dashboard").addEventListener("click", () => {
+  loadDashboard().catch((error) => {
+    setText("#dashboard-security", `刷新失败：${error.message}`);
+  });
+});
+
+document.querySelector("#cloudflare-mode").addEventListener("change", (event) => {
+  document.querySelector("#cloudflare-token-row").hidden = event.target.value !== "token";
+});
+
+document.querySelector("#cloudflare-start").addEventListener("click", async () => {
+  const button = document.querySelector("#cloudflare-start");
+  const error = document.querySelector("#cloudflare-error");
+  error.textContent = "";
+  const mode = document.querySelector("#cloudflare-mode").value;
+  const token = document.querySelector("#cloudflare-token").value.trim();
+  const publicUrl = document.querySelector("#cloudflare-public-url").value.trim();
+  if (mode === "token" && !token) {
+    error.textContent = "Named Tunnel 需要填写 Token。";
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "正在建立隧道…";
+  try {
+    await api("/api/cloudflare/start", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({mode, token, public_url:publicUrl}),
+    });
+    document.querySelector("#cloudflare-token").value = "";
+    await loadDashboard();
+  } catch (err) {
+    error.textContent = err.message;
+  } finally {
+    button.textContent = "启动公网访问";
+    button.disabled = false;
+  }
+});
+
+document.querySelector("#cloudflare-stop").addEventListener("click", async () => {
+  const error = document.querySelector("#cloudflare-error");
+  error.textContent = "";
+  try {
+    await api("/api/cloudflare/stop", {method:"POST"});
+    await loadDashboard();
+  } catch (err) {
+    error.textContent = err.message;
+  }
+});
+
+document.querySelector("#copy-cloudflare-url").addEventListener("click", async () => {
+  const link = document.querySelector("#cloudflare-url");
+  const text = link?.href || "";
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    document.querySelector("#copy-cloudflare-url").textContent = "已复制";
+    setTimeout(() => document.querySelector("#copy-cloudflare-url").textContent = "复制手机地址", 1600);
+  } catch {
+    window.prompt("复制手机访问地址", text);
+  }
+});
+
+document.querySelector("#log-source").addEventListener("change", (event) => {
+  document.querySelector("#log-instance-row").hidden = event.target.value !== "instance";
+});
+
+document.querySelector("#refresh-logs").addEventListener("click", loadLogs);
+document.querySelectorAll('[data-open="logs-panel"]').forEach((button) => {
+  button.addEventListener("click", () => loadLogs().catch((error) => {
+    document.querySelector("#log-error").textContent = error.message;
+  }));
+});
+
+async function loadLogs() {
+  const source = document.querySelector("#log-source").value;
+  const instanceId = Number(document.querySelector("#log-instance").value);
+  const stream = document.querySelector("#log-stream").value;
+  const error = document.querySelector("#log-error");
+  const output = document.querySelector("#log-output");
+  error.textContent = "";
+  if (source === "instance" && !instanceId) {
+    error.textContent = "请先创建或导入机器人实例。";
+    return;
+  }
+  const sourceValue = source === "instance" ? `instance:${instanceId}:${stream}` : source;
+  const data = await api(`/api/logs?source=${encodeURIComponent(sourceValue)}&lines=240`);
+  output.textContent = data.lines?.length ? data.lines.join("\n") : "暂无日志。";
+}
+
 async function fileToBase64(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
   let binary = "";
@@ -1178,7 +1334,10 @@ async function fileToBase64(file) {
 async function init() {
   try {
     await loadMe();
-    await Promise.all([loadProviders(), loadInstances()]);
+    await Promise.all([loadProviders(), loadInstances(), loadDashboard()]);
+    setInterval(() => {
+      if (!document.hidden) loadDashboard().catch(() => {});
+    }, 30000);
   } catch (error) {
     location.href = "/login";
   }

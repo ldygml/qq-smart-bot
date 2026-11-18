@@ -151,6 +151,90 @@ async def test_control_plane_rejects_missing_csrf(tmp_path, monkeypatch) -> None
     assert response.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_dashboard_logs_secure_cookie_and_scoped_admin_page(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = ControlStore(tmp_path / "control.db")
+    box = SecretBox()
+    monkeypatch.setattr(control_plane, "store", store)
+    monkeypatch.setattr(control_plane, "secrets_box", box)
+    monkeypatch.setattr(control_plane, "cloudflare_process", None)
+    monkeypatch.setattr(control_plane, "cloudflare_public_url", "")
+    monkeypatch.setattr(control_plane, "CLOUDFLARE_LOG", tmp_path / "cloudflared.log")
+    monkeypatch.setattr(
+        control_plane,
+        "CLOUDFLARE_STDERR_LOG",
+        tmp_path / "cloudflared.stderr.log",
+    )
+    monkeypatch.setattr(
+        control_plane,
+        "CLOUDFLARE_PID_FILE",
+        tmp_path / "cloudflared.pid",
+    )
+    monkeypatch.setattr(
+        control_plane,
+        "CLOUDFLARE_URL_FILE",
+        tmp_path / "cloudflared.url",
+    )
+    user_id = store.create_user("owner", "secure-password")
+    provider_id = store.save_provider(
+        user_id=user_id,
+        provider_id=None,
+        name="provider",
+        provider_type="custom",
+        base_url="https://api.example.com/v1",
+        model="chat",
+        api_key_encrypted=box.encrypt("secret"),
+    )
+    instance_id = store.save_instance(
+        user_id=user_id,
+        instance_id=None,
+        name="mobile",
+        port=18081,
+        onebot_api_base="http://127.0.0.1:13000",
+        onebot_token_encrypted=box.encrypt("admin-token"),
+        provider_id=provider_id,
+        database_path="data/mobile.db",
+    )
+    (tmp_path / "cloudflared.log").write_text(
+        "api_key=abc123 token=top-secret\n",
+        encoding="utf-8",
+    )
+    transport = httpx.ASGITransport(app=control_plane.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://127.0.0.1:8090",
+        headers={"X-Forwarded-Proto": "https"},
+    ) as client:
+        login = await client.post(
+            "/api/auth/login",
+            json={"username": "owner", "password": "secure-password"},
+        )
+        assert login.status_code == 200
+        assert "Secure" in login.headers["set-cookie"]
+        csrf = login.json()["csrf_token"]
+        dashboard = await client.get("/api/dashboard")
+        assert dashboard.status_code == 200
+        assert dashboard.json()["counts"]["instances"] == 1
+        assert dashboard.json()["site"]["https"] is True
+        logs = await client.get("/api/logs", params={"source": "cloudflared"})
+        assert logs.status_code == 200
+        assert "top-secret" not in logs.text
+        assert "<redacted>" in logs.text
+        admin = await client.get(f"/instances/{instance_id}/admin")
+        assert admin.status_code == 200
+        assert f'/instances/{instance_id}/api/admin' in admin.text
+        assert csrf in admin.text
+        redirect = await client.get(
+            f"/api/instances/{instance_id}/open-admin",
+            follow_redirects=False,
+        )
+        assert redirect.status_code == 307
+        assert redirect.headers["location"].startswith(f"/instances/{instance_id}/admin")
+
+
 def test_import_current_config_encrypts_local_secrets(tmp_path, monkeypatch) -> None:
     store = ControlStore(tmp_path / "control.db")
     box = SecretBox()

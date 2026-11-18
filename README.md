@@ -382,6 +382,7 @@ powershell -ExecutionPolicy Bypass -File .\control.ps1
 | [启动机器人.cmd](启动机器人.cmd) | 启动便携 NapCat、等待登录、同步依赖并启动机器人 |
 | [停止机器人.cmd](停止机器人.cmd) | 关闭项目机器人和项目内便携 NapCat，不影响主 QQ |
 | [启动控制台.cmd](启动控制台.cmd) | 启动 `8090` 登录控制台并打开网页 |
+| [cloudflare.cmd](cloudflare.cmd) | `start` / `status` / `stop` 管理手机公网隧道 |
 | [群聊免艾特.cmd](群聊免艾特.cmd) | 切换全局和所有已有群的“免 @ 智能参与”配置 |
 | [群聊必须艾特.cmd](群聊必须艾特.cmd) | 切换全局和所有已有群的“必须 @”配置 |
 
@@ -721,7 +722,8 @@ http://127.0.0.1:8090/
 - 图表、文档、文件与代码生成
 
 控制台登录后通过一次性保护的内部请求访问实例。`8080/admin` 不再是日常入口；
-开启 `ADMIN_REQUIRE_AUTH` 后，裸访问会显示授权提示；通过控制台“打开完整后台”可正常进入。
+开启 `ADMIN_REQUIRE_AUTH` 后，裸访问会显示授权提示；通过控制台“打开完整后台”会进入
+控制台同一域名下的反代后台，因此手机和 Cloudflare 公网地址也能正常使用。
 
 ### 登录控制台：8090
 
@@ -747,11 +749,46 @@ http://127.0.0.1:8090/
 - 为八类能力配置独立供应商、模型和备用链
 - 下载全部实例的加密备份
 - 停止实例并恢复备份
+- 仪表盘查看在线实例、最近错误和 HTTPS / Cookie 安全状态
+- 查看控制台、机器人、NapCat 和 Cloudflare 日志，敏感字段自动脱敏
+- 在手机上启动和停止 Cloudflare 公网隧道
 
 控制台使用 HttpOnly Cookie、CSRF Token、PBKDF2 密码哈希和登录尝试限流。
 
-> 控制台是本地单管理员工具，不是已经完成公网安全加固的多租户 SaaS。不要直接把
-> `8090` 暴露到公网。
+### 手机通过 Cloudflare 登录
+
+手机访问只开放登录控制台 `8090`，不要直接开放机器人 `8080`、NapCat `3000` 或
+OneBot Token。推荐使用 Cloudflare Tunnel：
+
+1. 先运行 `启动控制台.cmd`，确认本机 `http://127.0.0.1:8090/` 能登录。
+2. 双击 `cloudflare.cmd`，或执行：
+
+   ```powershell
+   .\cloudflare.cmd start
+   ```
+
+3. 脚本会显示一个 `https://xxxx.trycloudflare.com` 地址。手机打开该地址后必须先输入
+   管理员账号密码，未登录不能调用管理 API。
+4. 停止隧道：
+
+   ```powershell
+   .\cloudflare.cmd stop
+   ```
+
+也可以在控制台“手机公网入口”卡片里启动/停止 Quick Tunnel，并直接复制手机地址。
+Quick Tunnel 每次启动地址会变化；关闭电脑或停止控制台后，公网地址会失效。
+
+已经配置 Cloudflare Named Tunnel 的用户，可以在网页里选择 `Named Tunnel Token`，
+填写 Tunnel Token 和固定公网域名后启动。Token 只交给 `cloudflared` 进程，不写入控制台
+数据库；也可以使用脚本：
+
+```powershell
+.\cloudflare.cmd start -Token "<tunnel-token>" -PublicUrl "https://bot.example.com"
+```
+
+公网模式要求使用 Cloudflare 提供的 HTTPS。控制台会为该连接设置 `Secure`、`HttpOnly`、
+`SameSite=Strict` 会话 Cookie，并继续校验 CSRF Token。不要直接把 `8090` 端口映射到
+公网；建议在 Cloudflare 侧再加一层 Access 或 WAF 规则。
 
 ### 加密备份与恢复
 
@@ -1046,7 +1083,7 @@ data/
 
 - 不要把 `.env`、API Key、OneBot Token 发给其他人。
 - 不要提交 `.runtime/control-master.key`。
-- 不要直接把 `8080` 或 `8090` 暴露到公网。
+- 不要直接把 `8080` 或 `8090` 暴露到公网；手机访问只通过 Cloudflare 隧道转发 `8090`。
 - QQ 登录只使用 NapCat 扫码，不向本项目提供 QQ 密码。
 - 完整共享记忆可能让 A 的信息影响 B 的回答，必须确保参与者知情。
 - 运行模型生成的代码前应人工检查。

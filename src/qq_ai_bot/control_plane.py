@@ -6,7 +6,9 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -38,6 +40,10 @@ SESSION_COOKIE = "qq_control_session"
 SESSION_HOURS = 24
 BACKUP_MAGIC = b"QQBOTBK1"
 MAX_BACKUP_BYTES = 300 * 1024 * 1024
+CLOUDFLARE_LOG = RUNTIME_ROOT / "cloudflared.log"
+CLOUDFLARE_STDERR_LOG = RUNTIME_ROOT / "cloudflared.stderr.log"
+CLOUDFLARE_PID_FILE = RUNTIME_ROOT / "cloudflared.pid"
+CLOUDFLARE_URL_FILE = RUNTIME_ROOT / "cloudflared.url"
 
 
 def _control_key() -> bytes:
@@ -891,9 +897,17 @@ class RestorePayload(BackupPayload):
     content_base64: str = Field(min_length=16)
 
 
+class CloudflareStartPayload(BaseModel):
+    mode: str = Field(default="quick", pattern="^(quick|token)$")
+    token: str = Field(default="", max_length=4096)
+    public_url: str = Field(default="", max_length=500)
+
+
 store = ControlStore()
 secrets_box = SecretBox()
 processes: dict[int, subprocess.Popen[bytes]] = {}
+cloudflare_process: subprocess.Popen[bytes] | None = None
+cloudflare_public_url = ""
 login_attempts: dict[str, list[float]] = {}
 
 
@@ -914,12 +928,24 @@ def _require_csrf(request: Request, user: sqlite3.Row) -> None:
         raise HTTPException(status_code=403, detail="invalid csrf token")
 
 
-def _set_session_cookie(response: Response, token: str) -> None:
+def _request_is_https(request: Request | None) -> bool:
+    if request is None:
+        return False
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",", 1)[0]
+    return request.url.scheme == "https" or forwarded.strip().lower() == "https"
+
+
+def _set_session_cookie(
+    response: Response,
+    token: str,
+    request: Request | None = None,
+) -> None:
     response.set_cookie(
         SESSION_COOKIE,
         token,
         httponly=True,
         samesite="strict",
+        secure=_request_is_https(request),
         max_age=SESSION_HOURS * 3600,
         path="/",
     )
@@ -964,6 +990,255 @@ def _listening_pid(port: int) -> int | None:
         ):
             return int(connection.pid)
     return None
+
+
+def _control_port() -> int:
+    raw = os.getenv("CONTROL_PORT", "").strip()
+    if not raw:
+        raw = str(
+            dotenv_values(PROJECT_ROOT / ".env").get(
+                "CONTROL_PORT",
+                "8090",
+            )
+            or "8090"
+        ).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 8090
+
+
+def _tail_file(path: Path, limit: int = 120, max_bytes: int = 262144) -> list[str]:
+    if not path.is_file():
+        return []
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - max_bytes))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    return text.splitlines()[-max(1, min(500, limit)) :]
+
+
+def _redact_log_line(line: str) -> str:
+    line = line.replace("\ufeff", "").replace("\x00", "")
+    line = re.sub(
+        r"(?i)((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*)([^\s,;]+)",
+        r"\1<redacted>",
+        line,
+    )
+    line = re.sub(
+        r"(?i)([?&](?:token|key|secret|password)=)[^&\s]+",
+        r"\1<redacted>",
+        line,
+    )
+    line = re.sub(r"\bsk-[A-Za-z0-9._-]{12,}", "sk-<redacted>", line)
+    return line[:4000]
+
+
+def _cloudflare_url_from_log() -> str:
+    text = "\n".join(
+        _tail_file(CLOUDFLARE_LOG, limit=500, max_bytes=524288)
+        + _tail_file(CLOUDFLARE_STDERR_LOG, limit=500, max_bytes=524288)
+    )
+    match = re.search(
+        r"https://[A-Za-z0-9.-]+\.trycloudflare\.com",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return match.group(0) if match else ""
+
+
+def _find_cloudflared() -> Path | None:
+    found = shutil.which("cloudflared")
+    if found:
+        return Path(found)
+    candidates = [
+        Path(r"C:\Program Files (x86)\cloudflared\cloudflared.exe"),
+        Path(r"C:\Program Files\cloudflared\cloudflared.exe"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _stored_cloudflare_process() -> psutil.Process | None:
+    try:
+        pid = int(CLOUDFLARE_PID_FILE.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        process = psutil.Process(pid)
+        command = " ".join(process.cmdline()).lower()
+        if "cloudflared" not in command:
+            return None
+        return process
+    except (psutil.Error, OSError, ValueError):
+        return None
+
+
+def _cloudflare_status() -> dict[str, Any]:
+    global cloudflare_process
+    managed = cloudflare_process
+    if managed is not None and managed.poll() is not None:
+        cloudflare_process = None
+        managed = None
+    stored = _stored_cloudflare_process() if managed is None else None
+    process = managed or stored
+    configured_url = (
+        cloudflare_public_url
+        or os.getenv("CLOUDFLARE_PUBLIC_URL", "").strip()
+    )
+    try:
+        saved_url = CLOUDFLARE_URL_FILE.read_text(
+            encoding="utf-8",
+        ).strip().lstrip("\ufeff")
+    except OSError:
+        saved_url = ""
+    url = configured_url or saved_url
+    if not url:
+        url = _cloudflare_url_from_log()
+    if process is None:
+        running = False
+    elif isinstance(process, subprocess.Popen):
+        running = process.poll() is None
+    else:
+        running = process.is_running()
+    if not running and not configured_url:
+        url = ""
+    log_lines = [
+        _redact_log_line(line)
+        for line in _tail_file(CLOUDFLARE_LOG, 25)
+        + _tail_file(CLOUDFLARE_STDERR_LOG, 25)
+    ][-25:]
+    return {
+        "available": _find_cloudflared() is not None,
+        "binary": str(_find_cloudflared() or ""),
+        "running": running,
+        "pid": int(process.pid) if process else None,
+        "public_url": url if running else url,
+        "log_path": str(CLOUDFLARE_LOG),
+        "recent_log": log_lines,
+    }
+
+
+def _clear_cloudflare_pid() -> None:
+    try:
+        CLOUDFLARE_PID_FILE.unlink(missing_ok=True)
+        CLOUDFLARE_URL_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _stop_cloudflare() -> dict[str, Any]:
+    global cloudflare_process, cloudflare_public_url
+    process = cloudflare_process or _stored_cloudflare_process()
+    cloudflare_process = None
+    cloudflare_public_url = ""
+    if process is not None:
+        if isinstance(process, subprocess.Popen):
+            try:
+                process.terminate()
+                process.wait(timeout=8)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        else:
+            try:
+                for child in process.children(recursive=True):
+                    child.terminate()
+                process.terminate()
+                psutil.wait_procs([process], timeout=8)
+            except (psutil.Error, OSError):
+                pass
+    _clear_cloudflare_pid()
+    return _cloudflare_status()
+
+
+def _start_cloudflare(
+    mode: str,
+    token: str = "",
+    public_url: str = "",
+) -> dict[str, Any]:
+    global cloudflare_process, cloudflare_public_url
+    mode = mode.strip().lower()
+    if mode not in {"quick", "token"}:
+        raise ValueError("Cloudflare mode must be quick or token")
+    current = _cloudflare_status()
+    if current["running"]:
+        return current
+    binary = _find_cloudflared()
+    if binary is None:
+        raise ValueError("cloudflared is not installed")
+    if mode == "token" and not token.strip():
+        raise ValueError("Named tunnel token is required")
+    public_url = public_url.strip()
+    if public_url and not re.match(r"^https?://", public_url):
+        raise ValueError("Public URL must start with http:// or https://")
+    if token and ("\n" in token or "\r" in token):
+        raise ValueError("Invalid tunnel token")
+    RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    with CLOUDFLARE_LOG.open("ab") as log:
+        log.write(
+            (
+                f"\n[{_utc_now()}] starting cloudflared mode={mode} "
+                f"target=http://127.0.0.1:{_control_port()}\n"
+            ).encode("utf-8")
+        )
+        if mode == "quick":
+            command = [
+                str(binary),
+                "tunnel",
+                "--url",
+                f"http://127.0.0.1:{_control_port()}",
+                "--no-autoupdate",
+            ]
+        else:
+            command = [
+                str(binary),
+                "tunnel",
+                "--no-autoupdate",
+                "run",
+                "--token",
+                token.strip(),
+            ]
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | subprocess.CREATE_NO_WINDOW
+            )
+        try:
+            cloudflare_process = subprocess.Popen(
+                command,
+                cwd=str(PROJECT_ROOT),
+                stdout=log,
+                stderr=log,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            raise ValueError(f"cloudflared failed to start: {exc}") from exc
+    cloudflare_public_url = public_url
+    if public_url:
+        CLOUDFLARE_URL_FILE.write_text(public_url, encoding="utf-8")
+    CLOUDFLARE_PID_FILE.write_text(
+        str(cloudflare_process.pid),
+        encoding="ascii",
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if cloudflare_process.poll() is not None:
+            break
+        if mode == "token" or _cloudflare_url_from_log():
+            break
+        time.sleep(0.5)
+    status = _cloudflare_status()
+    status["started"] = bool(cloudflare_process and cloudflare_process.poll() is None)
+    return status
 
 
 def _instance_public(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -1224,6 +1499,147 @@ async def audit_log(request: Request) -> dict[str, Any]:
     return {"events": store.audit_events(limit=300)}
 
 
+@app.get("/api/dashboard")
+async def dashboard(request: Request) -> dict[str, Any]:
+    user = _request_user(request)
+    user_id = int(user["id"])
+    instance_rows = store.instances(user_id)
+    instance_items = [_instance_public(row) for row in instance_rows]
+    provider_rows = store.providers(user_id)
+    events = store.audit_events(limit=80)
+    recent_errors = [
+        event
+        for event in events
+        if int(event.get("status_code", 0)) >= 400
+    ][:10]
+    return {
+        "version": "0.1.0",
+        "now": _utc_now(),
+        "site": {
+            "https": _request_is_https(request),
+            "secure_cookie": _request_is_https(request),
+            "control_port": _control_port(),
+            "login_required": True,
+        },
+        "counts": {
+            "providers": len(provider_rows),
+            "instances": len(instance_items),
+            "online": sum(
+                1 for item in instance_items if item["status"] == "online"
+            ),
+        },
+        "instances": instance_items,
+        "providers": [
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "model": item["model"],
+                "api_key_configured": bool(item["api_key_encrypted"]),
+            }
+            for item in provider_rows
+        ],
+        "recent_events": events[:20],
+        "recent_errors": recent_errors,
+        "cloudflare": _cloudflare_status(),
+    }
+
+
+@app.get("/api/instances/{instance_id}/health")
+async def instance_health(instance_id: int, request: Request) -> dict[str, Any]:
+    user = _request_user(request)
+    row = store.instance(instance_id, int(user["id"]))
+    if row is None:
+        raise HTTPException(status_code=404, detail="instance not found")
+    return {"ok": True, "instance": _instance_public(row)}
+
+
+def _log_file_for_source(source: str, user_id: int) -> tuple[Path, str]:
+    source = source.strip().lower()
+    if source in {"control", "control-out"}:
+        return RUNTIME_ROOT / "control.stdout.log", "control stdout"
+    if source in {"control-error", "control-err"}:
+        return RUNTIME_ROOT / "control.stderr.log", "control stderr"
+    if source == "cloudflared":
+        return CLOUDFLARE_LOG, "cloudflared"
+    if source == "napcat":
+        raw = os.getenv("NAPCAT_LOG_PATH", "").strip()
+        if raw:
+            path = Path(raw)
+            if not path.is_absolute():
+                path = PROJECT_ROOT / path
+            return path, "NapCat"
+        return RUNTIME_ROOT / "napcat.log", "NapCat"
+    match = re.fullmatch(r"instance:(\d+)(?::(stdout|stderr|all))?", source)
+    if match:
+        instance_id = int(match.group(1))
+        if store.instance(instance_id, user_id) is None:
+            raise HTTPException(status_code=404, detail="instance not found")
+        stream = match.group(2) or "all"
+        base = RUNTIME_ROOT / "instances" / str(instance_id)
+        if stream == "stdout":
+            return Path(f"{base}.stdout.log"), f"instance {instance_id} stdout"
+        if stream == "stderr":
+            return Path(f"{base}.stderr.log"), f"instance {instance_id} stderr"
+        return base, f"instance {instance_id}"
+    raise HTTPException(status_code=400, detail="unknown log source")
+
+
+@app.get("/api/logs")
+async def logs(
+    request: Request,
+    source: str = "control",
+    lines: int = 120,
+) -> dict[str, Any]:
+    user = _request_user(request)
+    path, label = _log_file_for_source(source, int(user["id"]))
+    limit = max(10, min(500, lines))
+    paths = [path]
+    if path.suffix == "":
+        paths = [
+            Path(f"{path}.stdout.log"),
+            Path(f"{path}.stderr.log"),
+        ]
+    collected: list[str] = []
+    for item in paths:
+        collected.extend(_tail_file(item, limit=limit))
+    return {
+        "source": label,
+        "path": str(path),
+        "lines": [_redact_log_line(line) for line in collected[-limit:]],
+        "redacted": True,
+    }
+
+
+@app.get("/api/cloudflare/status")
+async def cloudflare_status(request: Request) -> dict[str, Any]:
+    _request_user(request)
+    return _cloudflare_status()
+
+
+@app.post("/api/cloudflare/start")
+async def cloudflare_start(
+    payload: CloudflareStartPayload,
+    request: Request,
+) -> dict[str, Any]:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    try:
+        return _start_cloudflare(
+            payload.mode,
+            payload.token,
+            payload.public_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/cloudflare/stop")
+async def cloudflare_stop(request: Request) -> dict[str, Any]:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return _stop_cloudflare()
+
+
 @app.get("/")
 async def root(request: Request) -> Response:
     token = request.cookies.get(SESSION_COOKIE, "")
@@ -1279,12 +1695,16 @@ async def auth_status() -> dict[str, Any]:
 
 
 @app.post("/api/auth/setup")
-async def setup(payload: AuthPayload, response: Response) -> dict[str, Any]:
+async def setup(
+    payload: AuthPayload,
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
     if store.user_count() > 0:
         raise HTTPException(status_code=409, detail="already initialized")
     user_id = store.create_user(payload.username, payload.password)
     token, csrf = store.create_session(user_id)
-    _set_session_cookie(response, token)
+    _set_session_cookie(response, token, request)
     return {"ok": True, "username": payload.username, "csrf_token": csrf}
 
 
@@ -1310,7 +1730,7 @@ async def login(
         raise HTTPException(status_code=401, detail="invalid credentials")
     login_attempts.pop(client, None)
     token, csrf = store.create_session(int(user["id"]))
-    _set_session_cookie(response, token)
+    _set_session_cookie(response, token, request)
     return {
         "ok": True,
         "username": user["username"],
@@ -1587,7 +2007,7 @@ def _instance_admin_entry_url(instance_id: int, user_id: int) -> str:
             "signature": signature,
         }
     )
-    return f"http://127.0.0.1:{instance['port']}/admin?{query}"
+    return f"/instances/{instance_id}/admin?{query}"
 
 
 @app.get("/api/instances/{instance_id}/open-admin")
@@ -1599,6 +2019,122 @@ async def open_instance_admin(
     return RedirectResponse(
         _instance_admin_entry_url(instance_id, int(user["id"]))
     )
+
+
+def _instance_admin_headers(instance: sqlite3.Row) -> dict[str, str]:
+    return {
+        "X-Bot-Admin-Token": secrets_box.decrypt(
+            str(instance["onebot_token_encrypted"])
+        )
+    }
+
+
+async def _proxy_instance_admin_request(
+    instance_id: int,
+    path: str,
+    request: Request,
+) -> Response:
+    user = _request_user(request)
+    method = request.method.upper()
+    if method not in {"GET", "POST", "PATCH", "PUT", "DELETE"}:
+        raise HTTPException(status_code=405, detail="method not allowed")
+    if method != "GET":
+        _require_csrf(request, user)
+    instance = store.instance(instance_id, int(user["id"]))
+    if instance is None:
+        raise HTTPException(status_code=404, detail="instance not found")
+    suffix = f"/api/admin/{path.lstrip('/')}" if path else "/api/admin"
+    query = request.url.query
+    target = f"http://127.0.0.1:{instance['port']}{suffix}"
+    if query:
+        target += f"?{query}"
+    headers = _instance_admin_headers(instance)
+    content_type = request.headers.get("content-type")
+    if content_type:
+        headers["Content-Type"] = content_type
+    body = await request.body()
+    try:
+        async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+            response = await client.request(
+                method,
+                target,
+                content=body,
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Instance service is not reachable",
+        ) from exc
+    response_headers = {
+        key: response.headers[key]
+        for key in ("content-type", "content-disposition", "cache-control")
+        if key in response.headers
+    }
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=response_headers,
+    )
+
+
+@app.get("/instances/{instance_id}/admin/admin.css")
+async def scoped_admin_css(instance_id: int, request: Request) -> FileResponse:
+    _ = instance_id
+    _request_user(request)
+    return FileResponse(WEB_ROOT / "admin.css")
+
+
+@app.get("/instances/{instance_id}/admin/admin.js")
+async def scoped_admin_js(instance_id: int, request: Request) -> FileResponse:
+    _ = instance_id
+    _request_user(request)
+    return FileResponse(WEB_ROOT / "admin.js")
+
+
+@app.get("/instances/{instance_id}/admin")
+async def scoped_admin_page(instance_id: int, request: Request) -> Response:
+    user = _request_user(request)
+    if store.instance(instance_id, int(user["id"])) is None:
+        raise HTTPException(status_code=404, detail="instance not found")
+    html = (WEB_ROOT / "admin.html").read_text(encoding="utf-8")
+    html = html.replace(
+        'href="/admin/admin.css"',
+        f'href="/instances/{instance_id}/admin/admin.css"',
+    )
+    html = html.replace(
+        'href="/api/admin/memory/export"',
+        f'href="/instances/{instance_id}/api/admin/memory/export"',
+    )
+    html = html.replace(
+        'src="/admin/admin.js"',
+        f'src="/instances/{instance_id}/admin/admin.js"',
+    )
+    marker = f'<script src="/instances/{instance_id}/admin/admin.js"></script>'
+    injection = (
+        '<script>window.QQ_ADMIN_API_BASE='
+        f'"/instances/{instance_id}/api/admin";'
+        f'window.QQ_ADMIN_CSRF="{user["csrf_token"]}";</script>\n'
+        + marker
+    )
+    html = html.replace(marker, injection)
+    return Response(
+        content=html,
+        media_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.api_route(
+    "/instances/{instance_id}/api/admin/{path:path}",
+    methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+)
+async def scoped_admin_api(
+    instance_id: int,
+    path: str,
+    request: Request,
+) -> Response:
+    return await _proxy_instance_admin_request(instance_id, path, request)
 
 
 @app.get("/api/instances/{instance_id}/people")
