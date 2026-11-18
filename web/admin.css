@@ -163,6 +163,12 @@ th { color: var(--muted); font-weight: 600; }
 .document-preview { width: 100%; min-height: 560px; margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
 .archive-list { display: grid; gap: 5px; margin-top: 10px; max-height: 300px; overflow: auto; }
 .archive-list code { padding: 5px 8px; background: #f7f4ed; border-radius: 6px; overflow-wrap: anywhere; }
+.group-file-preview, .storage-summary { margin-top: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+.group-file-preview img, .group-file-preview video { display: block; max-width: 100%; max-height: 70vh; margin: 10px auto 0; border-radius: 8px; }
+.group-file-preview audio { width: 100%; margin-top: 12px; }
+.group-file-preview .document-preview { min-height: 460px; }
+.storage-summary { font-size: 12px; line-height: 1.7; background: #f7f4ed; }
+.storage-summary strong { color: var(--accent); }
 .error { color: var(--danger); }
 @media (max-width: 760px) {
   .split { grid-template-columns: 1fr; }

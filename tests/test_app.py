@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from openpyxl import Workbook
 from PIL import Image
 from pydantic import SecretStr
 
@@ -3367,6 +3368,118 @@ async def test_group_file_can_be_previewed_and_downloaded_safely(
     assert "%E5%8D%B1%E9%99%A9.pdf" in download.headers[
         "content-disposition"
     ]
+
+
+@pytest.mark.asyncio
+async def test_group_spreadsheet_preview_extracts_rows_without_persisting(
+    tmp_path,
+) -> None:
+    sender = FakeOneBotClient()
+    sender.group_file_url = "https://cdn.example.com/temporary/sheet"
+    sender.group_file_name = "成绩表.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "成绩"
+    worksheet.append(["姓名", "成绩"])
+    worksheet.append(["张三", 90])
+    payload = BytesIO()
+    workbook.save(payload)
+    file_bytes = payload.getvalue()
+
+    async def file_handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == sender.group_file_url
+        assert request.headers.get("range") is None
+        return httpx.Response(
+            200,
+            content=file_bytes,
+            headers={
+                "content-type": (
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                )
+            },
+        )
+
+    generated_dir = tmp_path / "generated"
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            generated_media_dir=generated_dir,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        group_file_transport=httpx.MockTransport(file_handler),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        preview = await client.get(
+            "/api/admin/group-profiles/456/file-preview",
+            params={
+                "file_id": "sheet-1",
+                "busid": "102",
+                "name": "成绩表.xlsx",
+            },
+        )
+
+    assert preview.status_code == 200
+    result = preview.json()
+    assert result["preview_kind"] == "spreadsheet"
+    assert "姓名 | 成绩" in result["excerpt"]
+    assert "张三 | 90" in result["excerpt"]
+    assert result["temporary_cache"] is False
+    assert not generated_dir.exists() or list(generated_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_generation_workspace_lists_targets_and_local_storage(
+    tmp_path,
+) -> None:
+    shared = SharedMemoryStore(tmp_path / "shared.db")
+    shared.record_person(1172134688, "Aloha")
+    sender = FakeOneBotClient()
+    sender.groups = [{"group_id": 456, "group_name": "测试群"}]
+    generated_dir = tmp_path / "generated"
+    generated_dir.mkdir()
+    (generated_dir / "sample.txt").write_text("sample", encoding="utf-8")
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            generated_media_dir=generated_dir,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        shared_memory_store=shared,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        targets = await client.get("/api/admin/generated/targets")
+        history = await client.get("/api/admin/generated")
+
+    assert targets.status_code == 200
+    assert targets.json()["people"][0]["display_name"] == "Aloha"
+    assert any(
+        item["group_id"] == 456 and item["name"] == "测试群"
+        for item in targets.json()["groups"]
+    )
+    storage = history.json()["storage"]
+    assert storage["path"] == str(generated_dir)
+    assert storage["file_count"] == 1
+    assert storage["total_bytes"] == 6
+    assert storage["group_files_cached"] is False
 
 
 @pytest.mark.asyncio

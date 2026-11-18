@@ -11,6 +11,9 @@ const state = {
   groupFolderTrail: [{id: "", name: "根目录"}],
   generatedArtifacts: [],
   selectedGenerated: null,
+  generatedStorage: null,
+  generationTargets: {people: [], groups: []},
+  generationTargetsLoaded: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -81,7 +84,7 @@ document.querySelectorAll("nav button").forEach((button) => {
       knowledge: loadKnowledge,
       operations: loadOperations,
       evolution: loadEvolution,
-      generate: loadGeneratedHistory,
+      generate: loadGenerationWorkspace,
     };
     loaders[button.dataset.tab]?.().catch((error) => alert(error.message));
   });
@@ -915,7 +918,7 @@ function renderGroupFiles(data = null) {
     };
   });
   $("#group-file-list").innerHTML = state.groupFiles.length
-    ? state.groupFiles.map((item) => `
+    ? state.groupFiles.map((item, index) => `
       <article class="source-row">
         <div><span class="tag">${item.kind === "folder" ? "文件夹" : "文件"}</span>
         <strong>${esc(item.name)}</strong></div>
@@ -924,7 +927,7 @@ function renderGroupFiles(data = null) {
           : `${number(item.size)} 字节 · 上传者 ${esc(item.uploader || "未知")}`}</div>
         ${item.kind === "folder"
           ? `<button type="button" data-open-group-folder="${esc(item.folder_id)}" data-folder-name="${esc(item.name)}">打开</button>`
-          : `<div class="file-actions"><a class="button-link" target="_blank" rel="noopener" href="${esc(groupFileContentUrl(item, false))}">查看</a><a class="button-link" href="${esc(groupFileContentUrl(item, true))}">下载</a></div>`}
+          : `<div class="file-actions"><button type="button" data-preview-group-index="${index}">查看</button><a class="button-link" href="${esc(groupFileContentUrl(item, true))}">下载</a></div>`}
       </article>`).join("")
     : `<div class="muted">尚未读取群文件。</div>`;
   document.querySelectorAll("[data-open-group-folder]").forEach((button) => {
@@ -935,6 +938,12 @@ function renderGroupFiles(data = null) {
       loadGroupFiles(folderId, folderName, false).catch((error) => {
         $("#group-profile-status").textContent = error.message;
       });
+    };
+  });
+  document.querySelectorAll("[data-preview-group-index]").forEach((button) => {
+    button.onclick = () => {
+      const item = state.groupFiles[Number(button.dataset.previewGroupIndex)];
+      if (item) previewGroupFile(item);
     };
   });
 }
@@ -950,9 +959,50 @@ function groupFileContentUrl(item, download) {
   return `${scopedAdminPath(`/api/admin/group-profiles/${groupId}/file-content`)}?${params}`;
 }
 
+async function previewGroupFile(item) {
+  const panel = $("#group-file-preview");
+  panel.hidden = false;
+  panel.innerHTML = `<div class="muted">正在读取并解析文件…</div>`;
+  const groupId = Number($("#group-profile-select").value);
+  const params = new URLSearchParams({
+    file_id: String(item.file_id || ""),
+    busid: String(item.busid ?? ""),
+    name: String(item.name || ""),
+  });
+  try {
+    const data = await api(`/api/admin/group-profiles/${groupId}/file-preview?${params}`);
+    const inlineUrl = groupFileContentUrl(item, false);
+    let body = "";
+    if (data.preview_kind === "image") {
+      body = `<img src="${esc(inlineUrl)}" alt="${esc(data.file_name || item.name)}">`;
+    } else if (data.preview_kind === "audio") {
+      body = `<audio controls src="${esc(inlineUrl)}"></audio>`;
+    } else if (data.preview_kind === "video") {
+      body = `<video controls src="${esc(inlineUrl)}"></video>`;
+    } else if (data.preview_kind === "pdf") {
+      body = `<iframe class="document-preview" src="${esc(inlineUrl)}" title="${esc(data.file_name || item.name)}"></iframe>`;
+    } else if (data.preview_kind === "archive") {
+      body = `<div class="archive-list">${(data.entries || []).map((entry) => `<code>${esc(entry)}</code>`).join("")}</div>`;
+    } else if (data.excerpt) {
+      body = `<pre class="content-preview">${esc(data.excerpt)}</pre>`;
+    } else {
+      body = `<p class="muted">${esc(data.message || "这个格式暂不支持网页内预览，请下载后打开。")}</p>`;
+    }
+    panel.innerHTML = `
+      <div class="detail-head"><div><p class="eyebrow">FILE PREVIEW</p><h3>${esc(data.file_name || item.name)}</h3></div>
+      <a class="button-link" href="${esc(groupFileContentUrl(item, true))}">下载文件</a></div>
+      ${body}
+      <p class="row-meta">${data.temporary_cache === false ? "仅在预览请求期间临时读取，不会长期保存到机器人本地。" : ""}</p>`;
+  } catch (error) {
+    panel.innerHTML = `<div class="error">${esc(error.message)}</div>`;
+  }
+}
+
 async function loadGroupFiles(folderId = "", folderName = "", pushTrail = true) {
   const groupId = Number($("#group-profile-select").value);
   if (!groupId) return;
+  $("#group-file-preview").hidden = true;
+  $("#group-file-preview").innerHTML = "";
   const button = $("#load-group-files");
   button.disabled = true;
   button.textContent = "读取中…";
@@ -1285,7 +1335,63 @@ function generatedStatusLabel(item) {
 async function loadGeneratedHistory() {
   const data = await api("/api/admin/generated?limit=40");
   state.generatedArtifacts = data.artifacts || [];
+  state.generatedStorage = data.storage || null;
   renderGeneratedHistory();
+  renderGeneratedStorage();
+}
+
+async function loadGenerationWorkspace() {
+  await Promise.all([loadGeneratedHistory(), loadGenerationTargets()]);
+}
+
+async function loadGenerationTargets(force = false) {
+  if (state.generationTargetsLoaded && !force) {
+    renderGenerationTargets();
+    return;
+  }
+  const data = await api("/api/admin/generated/targets");
+  state.generationTargets = {
+    people: data.people || [],
+    groups: data.groups || [],
+  };
+  state.generationTargetsLoaded = true;
+  renderGenerationTargets();
+}
+
+function renderGenerationTargets() {
+  const select = $("#generate-send-target-select");
+  if (!select) return;
+  const type = $("#generate-send-type").value;
+  const items = type === "group" ? state.generationTargets.groups : state.generationTargets.people;
+  const placeholder = type === "group" ? "选择一个群聊" : "选择一个联系人";
+  select.innerHTML = [
+    `<option value="">${placeholder}</option>`,
+    ...items.map((item) => {
+      const id = type === "group" ? item.group_id : item.user_id;
+      const name = type === "group"
+        ? (item.name || `未命名群聊 ${id}`)
+        : (item.display_name || `QQ ${id}`);
+      return `<option value="${id}">${esc(name)} · ${id}</option>`;
+    }),
+  ].join("");
+  if (!items.length) {
+    select.innerHTML = `<option value="">暂无可选项，请在右侧手动填写</option>`;
+  }
+}
+
+function renderGeneratedStorage() {
+  const box = $("#generated-storage");
+  if (!box) return;
+  const storage = state.generatedStorage;
+  if (!storage) {
+    box.innerHTML = "";
+    return;
+  }
+  const megabytes = Number(storage.total_bytes || 0) / 1024 / 1024;
+  box.innerHTML = `
+    <strong>本机保存：${esc(storage.path)}</strong><br>
+    当前共有 ${number(storage.file_count)} 个生成文件，合计 ${number(megabytes, 2)} MB。重启电脑后仍会保留，点击单条记录的“删除”才会移除。
+    群文件在线查看只会临时读取，不会加入这个目录。`;
 }
 
 function renderGeneratedHistory() {
@@ -1348,6 +1454,8 @@ async function showGeneratedRecord(recordId) {
     body = `<img src="${esc(inlineUrl)}" alt="${esc(item.display_name)}">`;
   } else if (preview.preview_kind === "audio") {
     body = `<audio controls src="${esc(inlineUrl)}"></audio>`;
+  } else if (preview.preview_kind === "video") {
+    body = `<video controls src="${esc(inlineUrl)}"></video>`;
   } else if (preview.preview_kind === "pdf") {
     body = `<iframe class="document-preview" src="${esc(inlineUrl)}" title="${esc(item.display_name)}"></iframe>`;
   } else if (preview.preview_kind === "archive") {
@@ -1355,7 +1463,7 @@ async function showGeneratedRecord(recordId) {
   } else if (preview.excerpt) {
     body = `<pre class="content-preview">${esc(preview.excerpt)}</pre>`;
   } else {
-    body = `<p class="muted">这类文件没有网页内预览，请下载后打开。</p>`;
+    body = `<p class="muted">${esc(preview.message || "这类文件没有网页内预览，请下载后打开。")}</p>`;
   }
   $("#generate-result").innerHTML = `
     <div class="generated-result">
@@ -1370,12 +1478,24 @@ async function showGeneratedRecord(recordId) {
     </div>`;
   $("#generate-send-box").hidden = false;
   $("#generate-send-status").textContent = "";
+  loadGenerationTargets().catch(() => {});
 }
 
 $("#refresh-generated").addEventListener("click", () => {
-  loadGeneratedHistory().catch((error) => {
+  loadGenerationWorkspace().catch((error) => {
     $("#generate-error").textContent = error.message;
   });
+});
+
+$("#generate-send-type").addEventListener("change", () => {
+  $("#generate-send-target").value = "";
+  renderGenerationTargets();
+});
+
+$("#generate-send-target-select").addEventListener("change", (event) => {
+  if (event.target.value) {
+    $("#generate-send-target").value = event.target.value;
+  }
 });
 
 $("#generate-send").addEventListener("click", async () => {
@@ -1387,13 +1507,18 @@ $("#generate-send").addEventListener("click", async () => {
     errorBox.textContent = "请先生成或选择一个文件。";
     return;
   }
+  const targetId = Number($("#generate-send-target").value);
+  if (!Number.isInteger(targetId) || targetId <= 0) {
+    errorBox.textContent = "请从列表选择联系人或群聊，也可以手动填写有效 QQ 号/群号。";
+    return;
+  }
   const button = $("#generate-send");
   button.disabled = true;
   button.textContent = "发送中…";
   try {
     const data = await jsonRequest(`/api/admin/generated/records/${state.selectedGenerated}/send`, "POST", {
       target_type: $("#generate-send-type").value,
-      target_id: Number($("#generate-send-target").value),
+      target_id: targetId,
     });
     status.textContent = data.message;
   } catch (error) {

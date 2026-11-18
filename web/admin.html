@@ -242,6 +242,7 @@
             <button id="group-files-up" type="button">返回上级</button>
           </div>
           <div id="group-file-list" class="source-list"></div>
+          <div id="group-file-preview" class="group-file-preview" hidden></div>
         </div>
         <div class="section-box">
           <h3>群成员偏好</h3>
@@ -356,11 +357,14 @@
           <h3>发送到 QQ</h3>
           <div class="field-row">
             <select id="generate-send-type"><option value="private">私聊</option><option value="group">群文件</option></select>
-            <input id="generate-send-target" inputmode="numeric" placeholder="QQ 号或群号">
+            <select id="generate-send-target-select"><option value="">正在加载联系人和群聊…</option></select>
+            <input id="generate-send-target" inputmode="numeric" placeholder="也可手动输入 QQ 号或群号">
             <button id="generate-send" type="button">发送当前文件</button>
           </div>
+          <p class="muted">下拉框会列出已经保存画像的联系人和已识别的群聊；临时联系人仍可手动填写 QQ 号。</p>
           <p id="generate-send-status" class="muted"></p>
         </div>
+        <div id="generated-storage" class="storage-summary"></div>
         <div class="section-box">
           <h3>最近生成</h3>
           <div id="generated-history" class="source-list"></div>

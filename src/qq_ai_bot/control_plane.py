@@ -1043,7 +1043,7 @@ def _redact_log_line(line: str) -> str:
 
 
 def _cloudflare_url_from_log() -> str:
-    candidates: list[tuple[float, str]] = []
+    candidates: list[tuple[int, float, str]] = []
     for path in (CLOUDFLARE_LOG, CLOUDFLARE_STDERR_LOG):
         lines = _tail_file(path, limit=500, max_bytes=524288)
         if not lines:
@@ -1069,10 +1069,13 @@ def _cloudflare_url_from_log() -> str:
             modified = path.stat().st_mtime
         except OSError:
             modified = 0.0
-        candidates.append((modified, matches[-1]))
+        # A startup marker identifies a URL belonging to the current launch.
+        # Do not let an older stderr URL replace a URL logged after the newest
+        # marker merely because the stale file happened to be written later.
+        candidates.append((1 if markers else 0, modified, matches[-1]))
     if not candidates:
         return ""
-    return max(candidates, key=lambda item: item[0])[1]
+    return max(candidates)[2]
 
 
 def _find_cloudflared() -> Path | None:
@@ -2672,6 +2675,21 @@ async def instance_group_file_content(
         stream_file(),
         status_code=response.status_code,
         headers=response_headers,
+    )
+
+
+@app.get(
+    "/api/instances/{instance_id}/group-profiles/{group_id}/file-preview"
+)
+async def instance_group_file_preview(
+    instance_id: int,
+    group_id: int,
+    request: Request,
+) -> Response:
+    return await _proxy_instance_admin_request(
+        instance_id,
+        f"group-profiles/{group_id}/file-preview",
+        request,
     )
 
 

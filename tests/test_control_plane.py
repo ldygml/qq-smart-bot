@@ -695,3 +695,35 @@ async def test_control_file_proxy_streams_range_and_headers(
     assert captured["headers"]["Range"] == "bytes=0-3"
     assert captured["headers"]["X-Bot-Admin-Token"] == "owner-token"
     assert released == {"response": True, "client": True}
+
+
+@pytest.mark.asyncio
+async def test_control_file_preview_uses_admin_proxy(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_proxy(instance_id, path, request):
+        captured.update(
+            instance_id=instance_id,
+            path=path,
+            request=request,
+        )
+        return {"ok": True, "preview_kind": "spreadsheet"}
+
+    monkeypatch.setattr(
+        control_plane,
+        "_proxy_instance_admin_request",
+        fake_proxy,
+    )
+    marker = object()
+    result = await control_plane.instance_group_file_preview(
+        9,
+        456,
+        marker,
+    )
+
+    assert result == {"ok": True, "preview_kind": "spreadsheet"}
+    assert captured == {
+        "instance_id": 9,
+        "path": "group-profiles/456/file-preview",
+        "request": marker,
+    }

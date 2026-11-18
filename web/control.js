@@ -727,7 +727,7 @@ function renderGroupFiles() {
     };
   });
   list.innerHTML = groupFiles.length
-    ? groupFiles.map((item) => `
+    ? groupFiles.map((item, index) => `
       <article class="source-row">
         <div><span class="tag">${item.kind === "folder" ? "文件夹" : "文件"}</span>
         <strong>${esc(item.name)}</strong></div>
@@ -736,7 +736,7 @@ function renderGroupFiles() {
           : `${esc(item.size || 0)} 字节 · 上传者 ${esc(item.uploader || "未知")}`}</div>
         ${item.kind === "folder"
           ? `<button type="button" data-open-group-folder="${esc(item.folder_id)}" data-folder-name="${esc(item.name)}">打开</button>`
-          : `<div class="file-actions"><a class="button-link" target="_blank" rel="noopener" href="${esc(groupFileContentUrl(item, false))}">查看</a><a class="button-link" href="${esc(groupFileContentUrl(item, true))}">下载</a></div>`}
+          : `<div class="file-actions"><button type="button" data-preview-group-index="${index}">查看</button><a class="button-link" href="${esc(groupFileContentUrl(item, true))}">下载</a></div>`}
       </article>`).join("")
     : `<div class="empty">尚未读取群文件</div>`;
   list.querySelectorAll("[data-open-group-folder]").forEach((button) => {
@@ -749,6 +749,12 @@ function renderGroupFiles() {
       } catch (err) {
         document.querySelector("#profile-error").textContent = err.message;
       }
+    };
+  });
+  list.querySelectorAll("[data-preview-group-index]").forEach((button) => {
+    button.onclick = () => {
+      const item = groupFiles[Number(button.dataset.previewGroupIndex)];
+      if (item) previewGroupFile(item);
     };
   });
 }
@@ -765,10 +771,52 @@ function groupFileContentUrl(item, download) {
   return `/api/instances/${instanceId}/group-profiles/${groupId}/file-content?${params}`;
 }
 
+async function previewGroupFile(item) {
+  const panel = document.querySelector("#group-file-preview");
+  const instanceId = Number(document.querySelector("#settings-instance").value);
+  const groupId = Number(document.querySelector("#settings-profile-select").value);
+  panel.hidden = false;
+  panel.innerHTML = `<div class="empty">正在读取并解析文件…</div>`;
+  const params = new URLSearchParams({
+    file_id: String(item.file_id || ""),
+    busid: String(item.busid ?? ""),
+    name: String(item.name || ""),
+  });
+  try {
+    const data = await api(`/api/instances/${instanceId}/group-profiles/${groupId}/file-preview?${params}`);
+    const inlineUrl = groupFileContentUrl(item, false);
+    let body = "";
+    if (data.preview_kind === "image") {
+      body = `<img src="${esc(inlineUrl)}" alt="${esc(data.file_name || item.name)}">`;
+    } else if (data.preview_kind === "audio") {
+      body = `<audio controls src="${esc(inlineUrl)}"></audio>`;
+    } else if (data.preview_kind === "video") {
+      body = `<video controls src="${esc(inlineUrl)}"></video>`;
+    } else if (data.preview_kind === "pdf") {
+      body = `<iframe src="${esc(inlineUrl)}" title="${esc(data.file_name || item.name)}"></iframe>`;
+    } else if (data.preview_kind === "archive") {
+      body = `<div class="archive-list">${(data.entries || []).map((entry) => `<code>${esc(entry)}</code>`).join("")}</div>`;
+    } else if (data.excerpt) {
+      body = `<pre>${esc(data.excerpt)}</pre>`;
+    } else {
+      body = `<p class="item-meta">${esc(data.message || "这个格式暂不支持网页内预览，请下载后打开。")}</p>`;
+    }
+    panel.innerHTML = `
+      <div class="item-head"><div><span class="compact-label">FILE PREVIEW</span><b>${esc(data.file_name || item.name)}</b></div>
+      <a class="button-link" href="${esc(groupFileContentUrl(item, true))}">下载文件</a></div>
+      ${body}
+      <p class="item-meta">${data.temporary_cache === false ? "仅在预览请求期间临时读取，不会长期保存到机器人本地。" : ""}</p>`;
+  } catch (error) {
+    panel.innerHTML = `<div class="error">${esc(error.message)}</div>`;
+  }
+}
+
 async function loadGroupFiles(folderId = "", folderName = "", pushTrail = true) {
   const instanceId = Number(document.querySelector("#settings-instance").value);
   const groupId = Number(document.querySelector("#settings-profile-select").value);
   if (!instanceId || !groupId) return;
+  document.querySelector("#group-file-preview").hidden = true;
+  document.querySelector("#group-file-preview").innerHTML = "";
   const button = document.querySelector("#load-group-files");
   button.disabled = true;
   button.textContent = "读取中…";

@@ -10,9 +10,9 @@ import logging
 import mimetypes
 import random
 import re
+import tempfile
 import time
 import unicodedata
-import zipfile
 from collections import OrderedDict, deque
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
@@ -21,11 +21,10 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 import httpx
-from docx import Document as WordDocument
 from fastapi import Body, FastAPI, Request, Response
 from fastapi.responses import (
     FileResponse,
@@ -56,6 +55,7 @@ from .files import (
     split_document_text,
     summarize_documents,
 )
+from .file_preview import direct_preview_kind, extract_file_preview
 from .group_policy import (
     GroupMessage,
     GroupReplyDecider,
@@ -499,6 +499,26 @@ def create_app(
         if path.parent != root or not path.is_file():
             return None
         return path
+
+    def _generated_storage_summary() -> dict[str, Any]:
+        root = _generated_media_dir().resolve()
+        files = [
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+        ]
+        try:
+            display_path = str(root.relative_to(Path.cwd().resolve()))
+        except ValueError:
+            display_path = str(root)
+        return {
+            "path": display_path,
+            "file_count": len(files),
+            "total_bytes": sum(path.stat().st_size for path in files),
+            "local": True,
+            "retained_after_restart": True,
+            "group_files_cached": False,
+        }
 
     def _remember_generated_artifact(
         artifact: GeneratedArtifact,
@@ -2410,6 +2430,144 @@ def create_app(
             headers=response_headers,
         )
 
+    @app.get("/api/admin/group-profiles/{group_id}/file-preview")
+    async def admin_group_file_preview(
+        group_id: int,
+        file_id: str,
+        busid: str = "",
+        name: str = "",
+    ) -> Response:
+        if not file_id.strip():
+            return JSONResponse(
+                {"detail": "群文件 ID 不能为空"},
+                status_code=400,
+            )
+        resolver = getattr(sender, "get_group_file_url", None)
+        if not callable(resolver):
+            return JSONResponse(
+                {"detail": "当前 NapCat 客户端不支持读取群文件。"},
+                status_code=501,
+            )
+        try:
+            resolved = await resolver(
+                group_id,
+                file_id,
+                busid=busid or None,
+            )
+        except OneBotError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=502)
+        remote_url = str((resolved or {}).get("url") or "").strip()
+        if not remote_url.startswith(("https://", "http://")):
+            return JSONResponse(
+                {"detail": "NapCat 没有返回有效的群文件下载地址。"},
+                status_code=502,
+            )
+        file_name = _safe_download_name(
+            name or str((resolved or {}).get("file_name") or "") or file_id,
+            "qq-file",
+        )
+        content_type = _download_content_type(file_name)
+        query = urlencode(
+            {
+                "file_id": file_id,
+                "busid": busid,
+                "name": file_name,
+            }
+        )
+        content_path = (
+            f"/api/admin/group-profiles/{group_id}/file-content?{query}"
+        )
+        download_path = f"{content_path}&download=true"
+        inline_kind = direct_preview_kind(file_name, content_type)
+        if inline_kind:
+            return {
+                "ok": True,
+                "file_name": file_name,
+                "content_type": content_type,
+                "preview_kind": inline_kind,
+                "inline_url": content_path,
+                "download_url": download_path,
+                "temporary_cache": False,
+            }
+
+        client = httpx.AsyncClient(
+            follow_redirects=True,
+            trust_env=config.llm_trust_env,
+            timeout=httpx.Timeout(180.0, connect=20.0),
+            transport=group_file_transport,
+        )
+        spool = tempfile.SpooledTemporaryFile(
+            max_size=8 * 1024 * 1024,
+            mode="w+b",
+        )
+        try:
+            upstream_request = client.build_request(
+                "GET",
+                remote_url,
+                headers={"Accept-Encoding": "identity"},
+            )
+            upstream = await client.send(upstream_request, stream=True)
+            if upstream.is_error:
+                status_code = upstream.status_code
+                await upstream.aclose()
+                return JSONResponse(
+                    {
+                        "detail": (
+                            "QQ 文件服务器拒绝读取该文件 "
+                            f"(HTTP {status_code})，链接可能已过期。"
+                        )
+                    },
+                    status_code=502,
+                )
+            try:
+                async for chunk in upstream.aiter_bytes(64 * 1024):
+                    if chunk:
+                        spool.write(chunk)
+            finally:
+                await upstream.aclose()
+            spool.seek(0)
+            try:
+                preview = await asyncio.to_thread(
+                    extract_file_preview,
+                    spool,
+                    file_name,
+                    content_type,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not parse group file preview: %s",
+                    file_name,
+                    exc_info=True,
+                )
+                preview = {
+                    "preview_kind": "download",
+                    "message": (
+                        "文件已读取，但格式无法在网页中解析，请下载后打开。"
+                    ),
+                }
+        except (httpx.HTTPError, OSError, ValueError):
+            logger.warning(
+                "Group file preview download failed: %s",
+                file_name,
+                exc_info=True,
+            )
+            return JSONResponse(
+                {"detail": "读取群文件失败，请稍后重试。"},
+                status_code=502,
+            )
+        finally:
+            spool.close()
+            await client.aclose()
+        return {
+            "ok": True,
+            "file_name": file_name,
+            "content_type": content_type,
+            **preview,
+            "inline_url": content_path,
+            "download_url": download_path,
+            "temporary_cache": False,
+        }
+
     @app.post("/api/admin/group-profiles/{group_id}/knowledge")
     async def admin_add_group_knowledge(
         group_id: int,
@@ -2629,6 +2787,14 @@ def create_app(
             }
         )
 
+    @app.get("/api/admin/generated/targets")
+    async def admin_generated_targets() -> dict[str, Any]:
+        await _ensure_known_group_profiles()
+        return {
+            "people": shared_memory.list_people(limit=300),
+            "groups": group_profiles.list_all(),
+        }
+
     @app.get("/api/admin/generated")
     async def admin_generated_history(
         limit: int = 40,
@@ -2645,7 +2811,11 @@ def create_app(
                 )
             items = item
             records.append(items)
-        return {"ok": True, "artifacts": records}
+        return {
+            "ok": True,
+            "artifacts": records,
+            "storage": _generated_storage_summary(),
+        }
 
     @app.get("/api/admin/generated/records/{record_id}/preview")
     async def admin_generated_preview(record_id: int) -> dict[str, Any]:
@@ -2661,71 +2831,35 @@ def create_app(
                 {"detail": "生成文件已被移动或删除，请重新生成。"},
                 status_code=404,
             )
-        suffix = path.suffix.lower()
         content_type = mimetypes.guess_type(record.display_name)[0] or (
             mimetypes.guess_type(path.name)[0]
             or "application/octet-stream"
         )
-        preview_kind = "download"
-        excerpt = ""
-        entries: list[str] = []
-        if suffix in {
-            ".txt",
-            ".md",
-            ".csv",
-            ".json",
-            ".py",
-            ".js",
-            ".ts",
-            ".tsx",
-            ".jsx",
-            ".html",
-            ".css",
-            ".java",
-            ".c",
-            ".cpp",
-            ".h",
-            ".go",
-            ".rs",
-            ".sql",
-            ".yaml",
-            ".yml",
-            ".xml",
-        }:
-            preview_kind = "text"
-            excerpt = path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )[:24_000]
-        elif suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
-            preview_kind = "image"
-        elif suffix in {".mp3", ".wav", ".ogg", ".m4a"}:
-            preview_kind = "audio"
-        elif suffix == ".pdf":
-            preview_kind = "pdf"
-        elif suffix == ".docx":
-            preview_kind = "document"
-            document = WordDocument(path)
-            excerpt = "\n".join(
-                paragraph.text
-                for paragraph in document.paragraphs[:40]
-                if paragraph.text.strip()
-            )[:24_000]
-        elif suffix == ".zip":
-            preview_kind = "archive"
-            with zipfile.ZipFile(path) as archive:
-                entries = [
-                    info.filename
-                    for info in archive.infolist()[:120]
-                    if not info.is_dir()
-                ]
+        try:
+            with path.open("rb") as source:
+                preview = extract_file_preview(
+                    source,
+                    record.display_name or path.name,
+                    content_type,
+                )
+        except Exception:
+            logger.warning(
+                "Could not parse generated file preview: %s",
+                record.file_name,
+                exc_info=True,
+            )
+            preview = {
+                "preview_kind": "download",
+                "message": (
+                    "\u6587\u4ef6\u65e0\u6cd5\u5728\u7f51\u9875\u4e2d\u89e3\u6790\uff0c"
+                    "\u8bf7\u4e0b\u8f7d\u540e\u6253\u5f00\u3002"
+                ),
+            }
         return {
             "ok": True,
             "artifact": record.to_dict(),
             "content_type": content_type,
-            "preview_kind": preview_kind,
-            "excerpt": excerpt,
-            "entries": entries,
+            **preview,
             "download_url": f"/api/admin/generated/{record.file_name}",
             "inline_url": (
                 f"/api/admin/generated/{record.file_name}?inline=true"
