@@ -2116,7 +2116,10 @@ def create_app(
             payload.get("conversation_id") or "replay"
         )
         history = _history_for_current_turn(
-            store.history(conversation_id, config.history_messages),
+            _enrich_sticker_history(
+                store.history(conversation_id, config.history_messages),
+                stickers,
+            ),
             store.last_message_at(conversation_id),
             user_message,
             config.timezone,
@@ -5423,8 +5426,14 @@ def create_app(
 
             last_activity = store.last_message_at(conversation_id)
             history = _history_for_current_turn(
-                quality.filter_history(
-                    store.history(conversation_id, config.history_messages)
+                _enrich_sticker_history(
+                    quality.filter_history(
+                        store.history(
+                            conversation_id,
+                            config.history_messages,
+                        )
+                    ),
+                    stickers,
                 ),
                 last_activity,
                 text,
@@ -6841,9 +6850,12 @@ def create_app(
             sticker_context = value
             contact_context = _sticker_contact_context(target)
             sticker_id = await sticker_decider.choose(
-                history=store.history(
-                    target.conversation_id,
-                    config.history_messages,
+                history=_enrich_sticker_history(
+                    store.history(
+                        target.conversation_id,
+                        config.history_messages,
+                    ),
+                    stickers,
                 ),
                 user_text=sticker_context,
                 assistant_text="",
@@ -6918,9 +6930,12 @@ def create_app(
         sticker_context = user_text
         contact_context = _sticker_contact_context(target)
         choice_id = await sticker_decider.choose(
-            history=store.history(
-                target.conversation_id,
-                config.history_messages,
+            history=_enrich_sticker_history(
+                store.history(
+                    target.conversation_id,
+                    config.history_messages,
+                ),
+                stickers,
             ),
             user_text=sticker_context,
             assistant_text=assistant_text,
@@ -8836,6 +8851,35 @@ def _received_sticker_history_label(
         suffix = f"；{details}" if details else ""
         values.append(f"{summary or '无文字说明'}{suffix}")
     return "[对方发来表情包：" + "；".join(values) + "]"
+
+
+def _enrich_sticker_history(
+    history: Sequence[dict[str, Any]],
+    catalog: StickerStore,
+) -> list[dict[str, Any]]:
+    """Refresh old sent-sticker records with current visual knowledge."""
+    enriched: list[dict[str, Any]] = []
+    pattern = re.compile(r"^\[我刚刚发了一个表情包：([^；\]]+)(.*)\]$")
+    for item in history:
+        content = str(item.get("content") or "")
+        match = pattern.match(content)
+        if not match or "画面/情绪：" in content:
+            enriched.append(item)
+            continue
+        summary = match.group(1).strip()
+        details = _sticker_visual_details(
+            StickerSource(summary=summary),
+            catalog,
+        )
+        if not details:
+            enriched.append(item)
+            continue
+        updated = dict(item)
+        updated["content"] = (
+            f"[我刚刚发了一个表情包：{summary}；{details}]"
+        )
+        enriched.append(updated)
+    return enriched
 
 
 async def _qq_history_media_url(

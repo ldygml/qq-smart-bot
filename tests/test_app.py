@@ -17,6 +17,7 @@ from qq_ai_bot.app import (
     _admin_access_signature,
     _clean_model_reply,
     _detect_natural_sticker_request,
+    _enrich_sticker_history,
     _history_for_current_turn,
     _is_simple_fact_lookup,
     _is_unsolicited_presence_ping,
@@ -2194,6 +2195,37 @@ async def test_sticker_uses_casual_chat_not_vision_model(tmp_path) -> None:
     history = chat_memory.history("private:123", 10)
     assert history[0]["content"] == "[对方发来表情包：奶龙]"
     assert history[1]["content"] == "[我刚刚发了一个表情包：奶龙]"
+
+
+def test_old_sent_sticker_history_gets_current_visual_context(
+    tmp_path,
+) -> None:
+    sticker_store = StickerStore(tmp_path / "stickers.db")
+    sticker_id = sticker_store.record(
+        StickerSource(summary="无语", emoji_id="old-sticker")
+    )
+    assert sticker_id is not None
+    sticker_store.update_classification(
+        sticker_id,
+        category="无语",
+        usage_hint="对方说了离谱的话时使用",
+        tags=("白眼", "离谱"),
+        source="manual",
+    )
+
+    history = _enrich_sticker_history(
+        [
+            {
+                "role": "assistant",
+                "content": "[我刚刚发了一个表情包：无语]",
+            }
+        ],
+        sticker_store,
+    )
+
+    assert "画面/情绪：无语" in history[0]["content"]
+    assert "标签：白眼、离谱" in history[0]["content"]
+    assert "适合：对方说了离谱的话时使用" in history[0]["content"]
 
 
 @pytest.mark.asyncio
