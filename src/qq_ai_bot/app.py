@@ -91,6 +91,7 @@ from .onebot import (
     AudioSource,
     FileSource,
     ReplyTarget,
+    StickerSource,
     extract_message_content,
     split_reply,
     strip_trigger_prefix,
@@ -1258,6 +1259,7 @@ def create_app(
                 status_code=502,
             )
         messages: list[dict[str, Any]] = []
+        media_gate = asyncio.Semaphore(4)
         for item in raw_messages:
             sender_info = item.get("sender")
             sender_info = sender_info if isinstance(sender_info, dict) else {}
@@ -1273,6 +1275,12 @@ def create_app(
                 self_id=self_id,
                 raw_message=str(item.get("raw_message") or ""),
             ).text.strip()
+            attachments = await _qq_web_history_attachments(
+                item.get("message"),
+                stickers=stickers,
+                sticker_assets=sticker_assets,
+                media_gate=media_gate,
+            )
             messages.append(
                 {
                     "message_id": str(
@@ -1286,6 +1294,7 @@ def create_app(
                         or (config.bot_name if role == "assistant" else sender_id)
                     ).strip()[:120],
                     "content": content or "[暂不支持预览的消息]",
+                    "attachments": attachments,
                     "timestamp": int(item.get("time") or 0),
                 }
             )
@@ -1886,6 +1895,22 @@ def create_app(
             media_type=media_type,
             content_disposition_type="inline",
             headers={"Cache-Control": "private, max-age=3600"},
+        )
+
+    @app.get("/api/admin/qq-web/media/{sha256}")
+    async def admin_qq_web_media(sha256: str) -> Response:
+        asset = sticker_assets.find_by_sha256(sha256)
+        if asset is None:
+            return JSONResponse(
+                {"detail": "QQ media not found"},
+                status_code=404,
+            )
+        return FileResponse(
+            asset.path,
+            filename=asset.path.name,
+            media_type=asset.mime_type,
+            content_disposition_type="inline",
+            headers={"Cache-Control": "private, max-age=86400"},
         )
 
     @app.post("/api/admin/stickers/organize")
@@ -4896,8 +4921,11 @@ def create_app(
                     sticker_source=sticker.image_source,
                 )
         if sticker_summaries:
-            sticker_text = "、".join(dict.fromkeys(sticker_summaries))
-            text = f"[对方发了一个表情包：{sticker_text}] {text}".strip()
+            sticker_text = _received_sticker_history_label(
+                sticker_sources,
+                stickers,
+            )
+            text = f"{sticker_text} {text}".strip()
         quality.mark_follow_up(target.conversation_id, text)
         if group_profile is not None and event.group_id is not None:
             blocked = [
@@ -5152,10 +5180,12 @@ def create_app(
                 )
                 if sent_sticker:
                     user_sticker_text = _received_sticker_history_label(
-                        content.sticker_sources
+                        content.sticker_sources,
+                        stickers,
                     )
                     assistant_sticker_text = _sent_sticker_history_label(
-                        sent_sticker
+                        sent_sticker,
+                        stickers,
                     )
                     store.append_exchange(
                         target.conversation_id,
@@ -5182,7 +5212,11 @@ def create_app(
                 trace.skip("表情库为空或自动表情已关闭")
             return
 
-        social_reply = _social_only_reply(text)
+        social_reply = (
+            None
+            if image_sources or file_sources or audio_sources
+            else _social_only_reply(text)
+        )
         if social_reply is not None:
             await _safe_send(target, social_reply)
             return
@@ -5830,7 +5864,7 @@ def create_app(
                 explicit_request=False,
             )
             if sent_sticker is not None:
-                sticker_text = _sent_sticker_history_label(sent_sticker)
+                sticker_text = _sent_sticker_history_label(sent_sticker, stickers)
                 store.append_message(
                     target.conversation_id,
                     "assistant",
@@ -6837,7 +6871,7 @@ def create_app(
             except OneBotError as exc:
                 await _safe_send(target, f"表情包发送失败：{exc}")
                 return True
-            sticker_text = _sent_sticker_history_label(sticker)
+            sticker_text = _sent_sticker_history_label(sticker, stickers)
             store.append_exchange(
                 target.conversation_id,
                 text,
@@ -7985,7 +8019,9 @@ def _expand_ai_command(text: str) -> tuple[str, str | None]:
 
 def _file_instruction(text: str) -> str:
     value = text.strip()
-    if not value:
+    if not value or (
+        not value.startswith("/") and _social_only_reply(value) is not None
+    ):
         return "请全面总结这些文件，提炼关键信息、结论和行动项。"
     command, _, argument = value.partition(" ")
     argument = argument.strip()
@@ -8736,20 +8772,177 @@ def _sticker_classification_image(
     return ""
 
 
-def _sent_sticker_history_label(sticker: StickerSource) -> str:
+def _sticker_history_source(data: dict[str, Any]) -> StickerSource:
+    return StickerSource(
+        summary=str(data.get("summary") or "表情包"),
+        emoji_id=str(data.get("emoji_id") or ""),
+        emoji_package_id=str(data.get("emoji_package_id") or ""),
+        key=str(data.get("key") or ""),
+        image_source=str(
+            data.get("url")
+            or data.get("path")
+            or data.get("file")
+            or ""
+        ),
+    )
+
+
+def _sticker_visual_details(
+    sticker: StickerSource,
+    catalog: StickerStore,
+) -> str:
+    metadata = catalog.find_metadata(sticker) or {}
+    details: list[str] = []
+    category = str(metadata.get("category") or "").strip()
+    if category and category != "未分类":
+        details.append(f"画面/情绪：{category[:80]}")
+    tags = metadata.get("tags")
+    if isinstance(tags, list):
+        clean_tags = [
+            re.sub(r"\s+", " ", str(tag)).strip()[:30]
+            for tag in tags
+            if str(tag).strip()
+        ]
+        if clean_tags:
+            details.append("标签：" + "、".join(clean_tags[:6]))
+    usage_hint = re.sub(
+        r"\s+",
+        " ",
+        str(metadata.get("usage_hint") or ""),
+    ).strip()[:180]
+    if usage_hint:
+        details.append(f"适合：{usage_hint}")
+    return "；".join(details)
+
+
+def _sent_sticker_history_label(
+    sticker: StickerSource,
+    catalog: StickerStore,
+) -> str:
     summary = re.sub(r"\s+", " ", sticker.summary).strip()[:100]
-    return f"[我刚刚发了一个表情包：{summary or '无文字说明'}]"
+    details = _sticker_visual_details(sticker, catalog)
+    suffix = f"；{details}" if details else ""
+    return f"[我刚刚发了一个表情包：{summary or '无文字说明'}{suffix}]"
 
 
 def _received_sticker_history_label(
     stickers: Sequence[StickerSource],
+    catalog: StickerStore,
 ) -> str:
-    summaries = [
-        re.sub(r"\s+", " ", sticker.summary).strip()[:100]
-        for sticker in stickers
-    ]
-    values = [value or "无文字说明" for value in summaries]
+    values: list[str] = []
+    for sticker in stickers:
+        summary = re.sub(r"\s+", " ", sticker.summary).strip()[:100]
+        details = _sticker_visual_details(sticker, catalog)
+        suffix = f"；{details}" if details else ""
+        values.append(f"{summary or '无文字说明'}{suffix}")
     return "[对方发来表情包：" + "；".join(values) + "]"
+
+
+async def _qq_history_media_url(
+    source: str,
+    *,
+    sticker_assets: StickerAssetStore,
+    media_gate: asyncio.Semaphore,
+) -> tuple[str, str]:
+    value = source.strip()
+    if not value:
+        return "", ""
+    async with media_gate:
+        try:
+            asset = await sticker_assets.persist(value)
+        except (StickerAssetError, OSError):
+            logger.warning("Unable to cache QQ history media", exc_info=True)
+            return "", ""
+    return f"/api/admin/qq-web/media/{asset.sha256}", asset.mime_type
+
+
+async def _qq_web_history_attachments(
+    message: Any,
+    *,
+    stickers: StickerStore,
+    sticker_assets: StickerAssetStore,
+    media_gate: asyncio.Semaphore,
+) -> list[dict[str, Any]]:
+    if not isinstance(message, list):
+        return []
+    attachments: list[dict[str, Any]] = []
+    for segment in message:
+        if not isinstance(segment, dict):
+            continue
+        segment_type = str(segment.get("type") or "")
+        data = segment.get("data")
+        data = data if isinstance(data, dict) else {}
+        if segment_type in {"image", "mface"}:
+            is_sticker = segment_type == "mface" or any(
+                data.get(key)
+                for key in ("emoji_id", "emoji_package_id", "key")
+            ) or str(data.get("sub_type", "")) == "1"
+            sticker = _sticker_history_source(data) if is_sticker else None
+            attachment: dict[str, Any] = {
+                "type": "sticker" if is_sticker else "image",
+                "name": (
+                    str(data.get("summary") or "表情包")[:120]
+                    if is_sticker
+                    else "图片"
+                ),
+                "url": "",
+                "mime_type": "",
+                "size": 0,
+            }
+            if sticker is not None:
+                metadata = stickers.find_metadata(sticker) or {}
+                if metadata.get("has_local_asset") and metadata.get("asset_url"):
+                    attachment["url"] = str(metadata["asset_url"])
+                    attachment["mime_type"] = str(
+                        metadata.get("mime_type") or ""
+                    )
+                elif sticker.image_source:
+                    url, mime_type = await _qq_history_media_url(
+                        sticker.image_source,
+                        sticker_assets=sticker_assets,
+                        media_gate=media_gate,
+                    )
+                    attachment["url"] = url
+                    attachment["mime_type"] = mime_type
+            else:
+                source = str(data.get("url") or data.get("file") or "")
+                url, mime_type = await _qq_history_media_url(
+                    source,
+                    sticker_assets=sticker_assets,
+                    media_gate=media_gate,
+                )
+                attachment["url"] = url
+                attachment["mime_type"] = mime_type
+            attachments.append(attachment)
+        elif segment_type == "file":
+            try:
+                size = int(data.get("file_size") or data.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            attachments.append(
+                {
+                    "type": "file",
+                    "name": str(data.get("name") or data.get("file") or "文件")[:240],
+                    "url": "",
+                    "mime_type": "",
+                    "size": max(0, size),
+                }
+            )
+        elif segment_type == "record":
+            try:
+                size = int(data.get("file_size") or data.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            attachments.append(
+                {
+                    "type": "audio",
+                    "name": "语音",
+                    "url": "",
+                    "mime_type": "",
+                    "size": max(0, size),
+                }
+            )
+    return attachments
 
 
 def _needs_casual_rewrite(user_text: str, reply: str) -> bool:

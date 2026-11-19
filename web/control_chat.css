@@ -562,6 +562,98 @@
   color: var(--bg);
 }
 
+.qq-message-attachments {
+  display: grid;
+  gap: 7px;
+  justify-items: end;
+  margin-top: 5px;
+}
+
+.qq-message.user .qq-message-attachments {
+  justify-items: start;
+}
+
+.qq-message-image-link {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--panel2);
+  overflow: hidden;
+  line-height: 0;
+}
+
+.qq-message-image-link.sticker {
+  border-color: transparent;
+  background: transparent;
+  border-radius: 10px;
+}
+
+.qq-message-image {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: min(320px, 100%);
+  max-height: 300px;
+  object-fit: contain;
+}
+
+.qq-message-image-link.sticker .qq-message-image {
+  max-width: min(190px, 100%);
+  max-height: 190px;
+}
+
+.qq-attachment-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: min(260px, 100%);
+  max-width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--panel2);
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.qq-attachment-card.unavailable {
+  opacity: .78;
+}
+
+.qq-attachment-icon {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--lime);
+  font: 800 8px/1 Consolas, monospace;
+}
+
+.qq-attachment-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.qq-attachment-copy strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qq-attachment-copy small {
+  color: var(--muted);
+  font: 8px/1.4 Consolas, monospace;
+}
+
 .qq-message-time {
   margin-top: 4px;
   color: var(--muted);

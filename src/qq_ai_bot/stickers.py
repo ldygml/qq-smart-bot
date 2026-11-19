@@ -231,6 +231,28 @@ class StickerAssetStore:
             return False
         return candidate.is_file()
 
+    def find_by_sha256(self, digest: str) -> StickerAsset | None:
+        value = digest.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            return None
+        mime_types = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".bmp": "image/bmp",
+        }
+        for suffix, mime_type in mime_types.items():
+            path = (self.asset_dir / f"{value}{suffix}").resolve()
+            if self.contains(path):
+                return StickerAsset(
+                    path,
+                    value,
+                    mime_type,
+                    "cached-media",
+                )
+        return None
+
     async def close(self) -> None:
         await self._local_client.aclose()
         await self._external_client.aclose()
@@ -686,6 +708,32 @@ class StickerStore:
             else ""
         )
         return item
+
+    def find_metadata(self, sticker: StickerSource) -> dict[str, object] | None:
+        """Find catalog metadata for a sticker segment without changing usage."""
+        summary = sticker.summary.strip() or "表情包"
+        clauses = ["summary = ?"]
+        values: list[object] = [summary]
+        if sticker.emoji_id:
+            clauses.append("emoji_id = ?")
+            values.append(sticker.emoji_id)
+        if sticker.emoji_package_id:
+            clauses.append("emoji_package_id = ?")
+            values.append(sticker.emoji_package_id)
+        if sticker.key:
+            clauses.append("sticker_key = ?")
+            values.append(sticker.key)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT id FROM sticker_catalog
+                WHERE {' AND '.join(clauses)}
+                ORDER BY use_count DESC, id DESC
+                LIMIT 1
+                """,
+                tuple(values),
+            ).fetchone()
+        return self.get_metadata(int(row["id"])) if row else None
 
     def attach_asset(
         self,

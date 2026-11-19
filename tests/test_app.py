@@ -2336,13 +2336,21 @@ async def test_casual_reply_can_trigger_contextual_sticker_without_keywords(
     sender = FakeOneBotClient()
     chat_memory = ChatMemory(tmp_path / "memory.db")
     sticker_store = StickerStore(tmp_path / "stickers.db")
-    sticker_store.record(
+    sticker_id = sticker_store.record(
         StickerSource(
             summary="安慰",
             emoji_id="sticker-1",
             emoji_package_id="pack-1",
             key="sticker-key",
         )
+    )
+    assert sticker_id is not None
+    sticker_store.update_classification(
+        sticker_id,
+        category="安慰",
+        usage_hint="朋友说累或情绪低落时使用",
+        tags=("抱抱", "安慰", "温柔"),
+        source="manual",
     )
     decider = FakeStickerDecider(1)
     app = create_app(
@@ -2391,9 +2399,11 @@ async def test_casual_reply_can_trigger_contextual_sticker_without_keywords(
     assert decider.calls == 1
     assert decider.last_kwargs["explicit_request"] is False
     assert sender.stickers[0][1].summary == "安慰"
-    assert chat_memory.history("private:123", 10)[-1]["content"] == (
-        "[我刚刚发了一个表情包：安慰]"
-    )
+    sent_sticker_context = chat_memory.history("private:123", 10)[-1]["content"]
+    assert sent_sticker_context.startswith("[我刚刚发了一个表情包：安慰；")
+    assert "画面/情绪：安慰" in sent_sticker_context
+    assert "标签：抱抱、安慰、温柔" in sent_sticker_context
+    assert "适合：朋友说累或情绪低落时使用" in sent_sticker_context
 
 
 @pytest.mark.asyncio
@@ -3336,6 +3346,168 @@ async def test_qq_web_console_distinguishes_friends_and_group_members(
         "role": "assistant",
         "content": "网页私聊消息",
     }
+
+
+@pytest.mark.asyncio
+async def test_qq_web_history_returns_cached_images_and_stickers(
+    tmp_path,
+) -> None:
+    sender = FakeOneBotClient()
+    sender.friends = [
+        {
+            "user_id": 123,
+            "nickname": "Aloha",
+            "display_name": "Aloha",
+        }
+    ]
+    image_path = tmp_path / "received.png"
+    sticker_path = tmp_path / "sticker.png"
+    Image.new("RGB", (4, 4), (40, 120, 220)).save(image_path)
+    Image.new("RGB", (8, 8), (220, 80, 60)).save(sticker_path)
+
+    asset_store = StickerAssetStore(tmp_path / "assets")
+    sticker_store = StickerStore(
+        tmp_path / "stickers.db",
+        asset_dir=asset_store.asset_dir,
+    )
+    sticker_id = sticker_store.record(
+        StickerSource(
+            summary="无语",
+            emoji_id="emoji-1",
+            emoji_package_id="pack-1",
+            key="sticker-key",
+        )
+    )
+    assert sticker_id is not None
+    stored = await asset_store.persist(str(sticker_path))
+    sticker_store.attach_asset(
+        sticker_id,
+        local_path=stored.path,
+        sha256=stored.sha256,
+        mime_type=stored.mime_type,
+    )
+    sender.private_history = [
+        {
+            "post_type": "message",
+            "message_id": "image-1",
+            "time": 1_700_000_010,
+            "sender": {"user_id": 123, "nickname": "Aloha"},
+            "message": [
+                {
+                    "type": "image",
+                    "data": {"file": str(image_path)},
+                }
+            ],
+        },
+        {
+            "post_type": "message_sent",
+            "message_id": "sticker-1",
+            "time": 1_700_000_020,
+            "sender": {"user_id": 999, "nickname": "测试机器人"},
+            "message": [
+                {
+                    "type": "mface",
+                    "data": {
+                        "summary": "无语",
+                        "emoji_id": "emoji-1",
+                        "emoji_package_id": "pack-1",
+                        "key": "sticker-key",
+                    },
+                }
+            ],
+        },
+    ]
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        sticker_store=sticker_store,
+        sticker_asset_store=asset_store,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        history = await client.get(
+            "/api/admin/qq-web/history",
+            params={"target_type": "private", "target_id": 123},
+        )
+        assert history.status_code == 200
+        payload = history.json()
+        image_url = payload["messages"][0]["attachments"][0]["url"]
+        sticker_url = payload["messages"][1]["attachments"][0]["url"]
+        image_preview = await client.get(image_url)
+
+    assert payload["messages"][0]["attachments"] == [
+        {
+            "type": "image",
+            "name": "图片",
+            "url": image_url,
+            "mime_type": "image/png",
+            "size": 0,
+        }
+    ]
+    assert payload["messages"][1]["attachments"][0]["type"] == "sticker"
+    assert payload["messages"][1]["attachments"][0]["name"] == "无语"
+    assert sticker_url == f"/api/admin/stickers/{sticker_id}/asset"
+    assert str(tmp_path) not in history.text
+    assert image_preview.status_code == 200
+    assert image_preview.content == image_path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_file_without_caption_is_summarized_instead_of_social_ping(
+    tmp_path,
+) -> None:
+    sender = FakeOneBotClient()
+    loader = FakeDocumentLoader(
+        ParsedDocument("课程笔记.txt", "第一页讲文件解析，第二页讲总结。")
+    )
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=loader,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 3200,
+                "message": [
+                    {
+                        "type": "file",
+                        "data": {
+                            "name": "课程笔记.txt",
+                            "file": "course-notes.txt",
+                            "file_size": 42,
+                        },
+                    }
+                ],
+            },
+        )
+        await _wait_for_condition(lambda: len(sender.sent) >= 2)
+
+    replies = [text for _, text in sender.sent]
+    assert replies[0] != "在呢。"
+    assert all(text not in {"在呢。", "在，怎么了。"} for text in replies)
+    assert loader.sources == ["课程笔记.txt"]
+    assert replies[-1] == "测试回复"
 
 
 @pytest.mark.asyncio

@@ -420,15 +420,72 @@ async function loadMembers(groupId) {
   }
 }
 
+function resolveQQMediaUrl(url) {
+  const value = String(url || "");
+  if (value.startsWith("/api/admin/") && currentInstanceId) {
+    return `/instances/${currentInstanceId}${value}`;
+  }
+  return value;
+}
+
+function formatAttachmentSize(value) {
+  let size = Number(value || 0);
+  if (!Number.isFinite(size) || size <= 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`;
+}
+
+function attachmentsMarkup(message) {
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  if (!attachments.length) return "";
+  return `<div class="qq-message-attachments">${attachments.map((item) => {
+    const type = String(item.type || "file");
+    const name = String(item.name || (type === "image" ? "图片" : "文件"));
+    const url = resolveQQMediaUrl(item.url);
+    if ((type === "image" || type === "sticker") && url) {
+      return `
+        <a class="qq-message-image-link ${type === "sticker" ? "sticker" : ""}" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="打开原图">
+          <img class="qq-message-image" src="${esc(url)}" alt="${esc(name)}" loading="lazy" referrerpolicy="no-referrer">
+        </a>`;
+    }
+    const label = type === "audio" ? "VOICE" : type === "image" || type === "sticker" ? "IMG" : "FILE";
+    const typeText = type === "audio" ? "语音" : type === "sticker" ? "表情包" : type === "image" ? "图片" : "文件";
+    const size = formatAttachmentSize(item.size);
+    const body = `
+      <span class="qq-attachment-icon">${label}</span>
+      <span class="qq-attachment-copy">
+        <strong>${esc(name)}</strong>
+        <small>${esc(typeText)}${size ? ` · ${esc(size)}` : ""}</small>
+      </span>`;
+    return url
+      ? `<a class="qq-attachment-card" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${body}</a>`
+      : `<div class="qq-attachment-card unavailable">${body}</div>`;
+  }).join("")}</div>`;
+}
+
+function visibleMessageContent(content) {
+  return String(content || "")
+    .replace(/\[(?:图片|表情包|语音)\]/g, "")
+    .replace(/\[文件:[^\]]*\]/g, "")
+    .trim();
+}
+
 function messageMarkup(message) {
   const assistant = message.role === "assistant";
   const sender = assistant ? (message.sender_name || "机器人") : (message.sender_name || "群成员");
+  const content = visibleMessageContent(message.content);
   return `
     <article class="qq-message ${assistant ? "assistant" : "user"}">
       <span class="qq-message-avatar">${initials(sender)}</span>
       <div class="qq-message-body">
         <div class="qq-message-sender">${esc(sender)}</div>
-        <div class="qq-message-bubble">${esc(message.content || "")}</div>
+        ${content ? `<div class="qq-message-bubble">${esc(content)}</div>` : ""}
+        ${attachmentsMarkup(message)}
         <div class="qq-message-time">${esc(formatTime(message.timestamp))}</div>
       </div>
     </article>`;
