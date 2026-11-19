@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import unicodedata
@@ -31,6 +32,10 @@ class QQMediaItem:
     kind: str
     created_at: str
     last_used_at: str
+    note: str = ""
+    tags: str = ""
+    favorite: bool = False
+    use_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +48,11 @@ class QQMediaItem:
             "type": self.kind,
             "sha256": self.sha256,
             "created_at": self.created_at,
+            "last_used_at": self.last_used_at,
+            "note": self.note,
+            "tags": self.tags,
+            "favorite": self.favorite,
+            "use_count": self.use_count,
         }
 
 
@@ -153,6 +163,27 @@ class QQMediaStore:
                 ON qq_media_items(created_at DESC)
                 """
             )
+            self._ensure_item_columns(connection)
+
+    @staticmethod
+    def _ensure_item_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(qq_media_items)"
+            ).fetchall()
+        }
+        additions = {
+            "note": "TEXT NOT NULL DEFAULT ''",
+            "tags": "TEXT NOT NULL DEFAULT ''",
+            "favorite": "INTEGER NOT NULL DEFAULT 0",
+            "use_count": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE qq_media_items ADD COLUMN {name} {definition}"
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=20)
@@ -439,10 +470,157 @@ class QQMediaStore:
             ).fetchall()
         return [self._item(row) for row in rows]
 
+    def batch_delete(self, item_ids: list[int]) -> dict[str, Any]:
+        deleted: list[int] = []
+        missing: list[int] = []
+        for item_id in dict.fromkeys(int(value) for value in item_ids):
+            if self.delete(item_id):
+                deleted.append(item_id)
+            else:
+                missing.append(item_id)
+        return {"deleted": deleted, "missing": missing}
+
+    def storage_stats(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, stored_name, size, kind, last_used_at,
+                       favorite, use_count
+                FROM qq_media_items
+                """
+            ).fetchall()
+        known = {str(row["stored_name"]) for row in rows}
+        files = [path for path in self.files_dir.iterdir() if path.is_file()]
+        orphans = [path for path in files if path.name not in known]
+        upload_files = [
+            path for path in self.uploads_dir.rglob("*") if path.is_file()
+        ]
+        total_bytes = sum(int(row["size"] or 0) for row in rows)
+        usage = shutil.disk_usage(self.root_dir)
+        kinds: dict[str, int] = {}
+        for row in rows:
+            kind = str(row["kind"] or "file")
+            kinds[kind] = kinds.get(kind, 0) + 1
+        return {
+            "path": str(self.root_dir),
+            "item_count": len(rows),
+            "total_bytes": total_bytes,
+            "upload_temp_files": len(upload_files),
+            "upload_temp_bytes": sum(path.stat().st_size for path in upload_files),
+            "orphan_files": len(orphans),
+            "orphan_bytes": sum(path.stat().st_size for path in orphans),
+            "favorite_count": sum(1 for row in rows if row["favorite"]),
+            "kinds": kinds,
+            "disk_total_bytes": usage.total,
+            "disk_free_bytes": usage.free,
+            "disk_used_bytes": usage.used,
+        }
+
+    def cleanup(
+        self,
+        *,
+        older_than_days: int | None = None,
+        kind: str = "",
+        orphaned: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        cutoff = ""
+        if older_than_days is not None and int(older_than_days) >= 0:
+            cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(days=max(0, int(older_than_days)))
+            ).isoformat(timespec="seconds")
+        with self._connect() as connection:
+            clauses = ["favorite = 0"]
+            values: list[Any] = []
+            has_item_filter = False
+            if cutoff:
+                clauses.append("last_used_at < ?")
+                values.append(cutoff)
+                has_item_filter = True
+            if kind in {"image", "video", "audio", "file"}:
+                clauses.append("kind = ?")
+                values.append(kind)
+                has_item_filter = True
+            rows = (
+                connection.execute(
+                    "SELECT id, size, original_name FROM qq_media_items WHERE "
+                    + " AND ".join(clauses),
+                    values,
+                ).fetchall()
+                if has_item_filter
+                else []
+            )
+            known = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT stored_name FROM qq_media_items"
+                ).fetchall()
+            }
+        candidates = [int(row["id"]) for row in rows]
+        candidate_bytes = sum(int(row["size"] or 0) for row in rows)
+        orphan_paths = [
+            path
+            for path in self.files_dir.iterdir()
+            if path.is_file() and path.name not in known
+        ]
+        result: dict[str, Any] = {
+            "dry_run": bool(dry_run),
+            "item_ids": candidates,
+            "item_count": len(candidates),
+            "item_bytes": candidate_bytes,
+            "orphan_files": len(orphan_paths),
+            "orphan_bytes": sum(path.stat().st_size for path in orphan_paths),
+            "deleted_count": 0,
+            "orphan_deleted": 0,
+        }
+        if dry_run:
+            return result
+        if orphaned:
+            for path in orphan_paths:
+                path.unlink(missing_ok=True)
+            result["orphan_deleted"] = len(orphan_paths)
+        for item_id in candidates:
+            if self.delete(item_id):
+                result["deleted_count"] += 1
+        return result
+
+    def update_metadata(
+        self,
+        item_id: int,
+        *,
+        note: str | None = None,
+        tags: str | None = None,
+        favorite: bool | None = None,
+    ) -> QQMediaItem | None:
+        updates: list[str] = []
+        values: list[Any] = []
+        if note is not None:
+            updates.append("note = ?")
+            values.append(str(note).strip()[:2000])
+        if tags is not None:
+            updates.append("tags = ?")
+            values.append(str(tags).strip()[:500])
+        if favorite is not None:
+            updates.append("favorite = ?")
+            values.append(1 if favorite else 0)
+        if updates:
+            values.append(int(item_id))
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE qq_media_items SET " + ", ".join(updates) + " WHERE id = ?",
+                    values,
+                )
+        return self.get(item_id)
+
     def mark_used(self, item_id: int) -> None:
         with self._connect() as connection:
             connection.execute(
-                "UPDATE qq_media_items SET last_used_at = ? WHERE id = ?",
+                """
+                UPDATE qq_media_items
+                SET last_used_at = ?, use_count = use_count + 1
+                WHERE id = ?
+                """,
                 (self._now(), int(item_id)),
             )
 
@@ -514,4 +692,8 @@ class QQMediaStore:
             kind=str(row["kind"] or "file"),
             created_at=str(row["created_at"] or ""),
             last_used_at=str(row["last_used_at"] or ""),
+            note=str(row["note"] if "note" in row.keys() else ""),
+            tags=str(row["tags"] if "tags" in row.keys() else ""),
+            favorite=bool(row["favorite"] if "favorite" in row.keys() else False),
+            use_count=int(row["use_count"] if "use_count" in row.keys() else 0),
         )

@@ -15,6 +15,18 @@ let uploadingCount = 0;
 let uploadQueueTotal = 0;
 let uploadQueueDone = 0;
 let currentFileProgress = 0;
+let quoteTarget = null;
+let forwardMessages = [];
+let targetSelection = new Set();
+let liveEvents = null;
+let uploadPaused = false;
+let uploadCancelled = false;
+let uploadFailures = 0;
+let uploadRunToken = 0;
+let activeUploadId = "";
+let uploadAbortController = null;
+let currentMessages = [];
+let pendingMentions = [];
 
 const elements = {
   instance: document.querySelector("#chat-instance"),
@@ -35,6 +47,9 @@ const elements = {
   roomBadge: document.querySelector("#qq-room-badge"),
   roomMeta: document.querySelector("#qq-room-meta"),
   reload: document.querySelector("#qq-reload-history"),
+  liveState: document.querySelector("#qq-live-state"),
+  searchButton: document.querySelector("#qq-search-button"),
+  multiButton: document.querySelector("#qq-multi-button"),
   messages: document.querySelector("#qq-messages"),
   form: document.querySelector("#qq-send-form"),
   targetLabel: document.querySelector("#qq-send-target"),
@@ -42,11 +57,17 @@ const elements = {
   input: document.querySelector("#qq-message-input"),
   send: document.querySelector("#qq-send-button"),
   attach: document.querySelector("#qq-attach-button"),
+  mention: document.querySelector("#qq-mention-button"),
   fileInput: document.querySelector("#qq-file-input"),
   pending: document.querySelector("#qq-pending-attachments"),
   uploadProgress: document.querySelector("#qq-upload-progress"),
   uploadProgressText: document.querySelector("#qq-upload-progress-text"),
   uploadProgressBar: document.querySelector("#qq-upload-progress-bar"),
+  uploadPause: document.querySelector("#qq-upload-pause"),
+  uploadCancel: document.querySelector("#qq-upload-cancel"),
+  quoteBar: document.querySelector("#qq-quote-bar"),
+  quoteText: document.querySelector("#qq-quote-text"),
+  quoteCancel: document.querySelector("#qq-quote-cancel"),
   hint: document.querySelector("#qq-compose-hint"),
   count: document.querySelector("#qq-message-count"),
   error: document.querySelector("#qq-error"),
@@ -59,6 +80,19 @@ const elements = {
   libraryGrid: document.querySelector("#qq-library-grid"),
   libraryCount: document.querySelector("#qq-library-count"),
   libraryMessage: document.querySelector("#qq-library-message"),
+  libraryStorage: document.querySelector("#qq-library-storage"),
+  libraryCleanup: document.querySelector("#qq-library-cleanup"),
+  targetDialog: document.querySelector("#qq-target-dialog"),
+  targetList: document.querySelector("#qq-target-list"),
+  targetSend: document.querySelector("#qq-target-send"),
+  targetMessage: document.querySelector("#qq-target-message"),
+  searchDialog: document.querySelector("#qq-search-dialog"),
+  globalQuery: document.querySelector("#qq-global-query"),
+  globalType: document.querySelector("#qq-global-type"),
+  globalFiles: document.querySelector("#qq-global-files"),
+  globalRun: document.querySelector("#qq-global-run"),
+  globalResults: document.querySelector("#qq-global-results"),
+  globalMessage: document.querySelector("#qq-global-message"),
   adminLink: document.querySelector("#chat-admin-link"),
   userLabel: document.querySelector("#chat-user-label"),
 };
@@ -173,6 +207,7 @@ async function loadInstances() {
   }
   updateInstanceUi();
   await loadContacts();
+  openLiveEvents();
 }
 
 function contactSearchMatches(text) {
@@ -372,6 +407,9 @@ async function selectContact(kind, id) {
 function clearTarget() {
   currentTarget = null;
   currentMembers = [];
+  currentMessages = [];
+  clearQuote();
+  clearMentions();
   pendingAttachments = [];
   renderPendingAttachments();
   elements.memberSection.hidden = true;
@@ -416,6 +454,7 @@ function updateComposer() {
   );
   elements.input.disabled = !canSend;
   elements.attach.disabled = !canSend;
+  elements.mention.disabled = !canSend || currentTarget?.kind !== "group";
   elements.send.disabled = !canSend || (!elements.input.value.trim() && !pendingAttachments.length);
   elements.reload.disabled = !currentTarget || currentTarget.kind === "member" && !currentTarget.can_send;
   if (!currentTarget) {
@@ -435,6 +474,58 @@ function updateComposer() {
       ? "将直接发送到当前 QQ 群"
       : "将直接发送到 QQ 好友私聊";
   }
+}
+
+function clearQuote() {
+  quoteTarget = null;
+  elements.quoteBar.hidden = true;
+  elements.quoteText.textContent = "";
+}
+
+function clearMentions() {
+  pendingMentions = [];
+}
+
+function addMention() {
+  if (currentTarget?.kind !== "group") return;
+  const choices = (currentMembers || [])
+    .filter((item) => Number(item.user_id) > 0)
+    .map((item) => `${item.user_id} ${item.display_name || ""}`.trim());
+  if (!choices.length) {
+    setError("当前没有可用的群成员列表");
+    return;
+  }
+  const raw = window.prompt(`输入要 @ 的群成员 QQ 号\n${choices.slice(0, 30).join("\n")}`);
+  const user_id = Number(String(raw || "").replace(/\D/g, ""));
+  const member = currentMembers.find((item) => Number(item.user_id) === user_id);
+  if (!member) {
+    setError("没有找到这个群成员");
+    return;
+  }
+  if (!pendingMentions.includes(user_id)) pendingMentions.push(user_id);
+  setError("");
+  updateComposer();
+}
+
+function useQuote(message) {
+  if (!message?.message_id) return;
+  quoteTarget = {
+    message_id: String(message.message_id),
+    content: visibleMessageContent(message.content) || "附件消息",
+    sender_name: message.sender_name || "",
+  };
+  elements.quoteText.textContent = `${quoteTarget.sender_name ? `${quoteTarget.sender_name}：` : ""}${quoteTarget.content.slice(0, 90)}`;
+  elements.quoteBar.hidden = false;
+}
+
+function messageActionButtons(message) {
+  if (!message?.message_id) return "";
+  const quote = `<button type="button" class="qq-message-action" data-quote-message="${esc(message.message_id)}">引用</button>`;
+  const forward = `<button type="button" class="qq-message-action" data-forward-message="${esc(message.message_id)}">转发</button>`;
+  const recall = message.role === "assistant"
+    ? `<button type="button" class="qq-message-action danger" data-recall-message="${esc(message.message_id)}">撤回</button>`
+    : "";
+  return `<div class="qq-message-actions">${quote}${forward}${recall}</div>`;
 }
 
 async function loadMembers(groupId) {
@@ -586,7 +677,7 @@ function messageMarkup(message) {
         <div class="qq-message-sender">${esc(sender)}</div>
         ${content ? `<div class="qq-message-bubble">${esc(content)}</div>` : ""}
         ${attachmentsMarkup(message)}
-        <div class="qq-message-time">${esc(formatTime(message.timestamp))}</div>
+        <div class="qq-message-time">${esc(formatTime(message.timestamp))}${messageActionButtons(message)}</div>
       </div>
     </article>`;
 }
@@ -621,6 +712,7 @@ async function loadHistory(showLoading = true) {
     );
     if (`${currentTarget?.kind}:${currentTarget?.id}` !== targetSnapshot) return;
     const messages = data.messages || [];
+    currentMessages = messages;
     if (!messages.length) {
       elements.messages.innerHTML = `
         <div class="qq-empty-state">
@@ -656,7 +748,73 @@ function updateUploadProgress(text, value = 0) {
   elements.uploadProgressBar.value = Math.max(0, Math.min(100, value));
 }
 
-async function uploadOneFile(file) {
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForUploadGate(token) {
+  while (uploadPaused && !uploadCancelled && token === uploadRunToken) {
+    await wait(150);
+  }
+  return !uploadCancelled && token === uploadRunToken;
+}
+
+async function uploadChunkWithRetry(instanceId, uploadId, index, blob, fileName, token) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (!(await waitForUploadGate(token))) throw new DOMException("上传已取消", "AbortError");
+    uploadAbortController = new AbortController();
+    try {
+      return await api(
+        `/instances/${instanceId}/api/admin/qq-web/uploads/${encodeURIComponent(uploadId)}/chunks/${index}`,
+        {
+          method: "POST",
+          headers: {"Content-Type": "application/octet-stream"},
+          body: blob,
+          signal: uploadAbortController.signal,
+        }
+      );
+    } catch (error) {
+      if (uploadCancelled || error.name === "AbortError") {
+        throw new DOMException("上传已取消", "AbortError");
+      }
+      lastError = error;
+      if (attempt < 3) {
+        elements.uploadProgressText.textContent = `${fileName} 上传中断，2 秒后重试（${attempt + 1}/3）`;
+        await wait(2000 * (attempt + 1));
+      }
+    } finally {
+      uploadAbortController = null;
+    }
+  }
+  throw lastError || new Error("分片上传失败");
+}
+
+async function completeUploadWithRetry(instanceId, uploadId, fileName, token) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (!(await waitForUploadGate(token))) throw new DOMException("上传已取消", "AbortError");
+    try {
+      return await api(
+        `/instances/${instanceId}/api/admin/qq-web/uploads/${encodeURIComponent(uploadId)}/complete`,
+        {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: "{}",
+        }
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) {
+        elements.uploadProgressText.textContent = `${fileName} 正在完成上传，稍后重试`;
+        await wait(1500 * (attempt + 1));
+      }
+    }
+  }
+  throw lastError || new Error("完成上传失败");
+}
+
+async function uploadOneFile(file, token) {
   const instanceId = currentInstanceId;
   const init = await api(`/instances/${instanceId}/api/admin/qq-web/uploads/init`, {
     method: "POST",
@@ -667,19 +825,17 @@ async function uploadOneFile(file) {
       mime_type: file.type || "application/octet-stream",
     }),
   });
+  if (uploadCancelled || token !== uploadRunToken) {
+    throw new DOMException("上传已取消", "AbortError");
+  }
+  activeUploadId = init.upload_id;
   const chunkSize = Number(init.chunk_size) || (4 * 1024 * 1024);
   const totalChunks = Number(init.total_chunks) || 1;
   for (let index = 0; index < totalChunks; index += 1) {
+    if (!(await waitForUploadGate(token))) throw new DOMException("上传已取消", "AbortError");
     const start = index * chunkSize;
     const blob = file.slice(start, Math.min(file.size, start + chunkSize));
-    await api(
-      `/instances/${instanceId}/api/admin/qq-web/uploads/${encodeURIComponent(init.upload_id)}/chunks/${index}`,
-      {
-        method: "POST",
-        headers: {"Content-Type": "application/octet-stream"},
-        body: blob,
-      }
-    );
+    await uploadChunkWithRetry(instanceId, init.upload_id, index, blob, file.name, token);
     currentFileProgress = totalChunks ? (index + 1) / totalChunks : 1;
     const completedUnits = uploadQueueDone + currentFileProgress;
     updateUploadProgress(
@@ -687,14 +843,8 @@ async function uploadOneFile(file) {
       uploadQueueTotal ? (completedUnits / uploadQueueTotal) * 100 : 0,
     );
   }
-  const completed = await api(
-    `/instances/${instanceId}/api/admin/qq-web/uploads/${encodeURIComponent(init.upload_id)}/complete`,
-    {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: "{}",
-    }
-  );
+  const completed = await completeUploadWithRetry(instanceId, init.upload_id, file.name, token);
+  activeUploadId = "";
   return completed.item;
 }
 
@@ -715,38 +865,91 @@ async function uploadFiles(fileList) {
   uploadQueueTotal = accepted.length;
   uploadQueueDone = 0;
   currentFileProgress = 0;
+  uploadFailures = 0;
+  uploadPaused = false;
+  uploadCancelled = false;
+  uploadRunToken += 1;
+  const runToken = uploadRunToken;
+  elements.uploadPause.textContent = "暂停";
+  elements.uploadPause.disabled = false;
+  elements.uploadCancel.disabled = false;
   updateComposer();
   renderPendingAttachments();
   updateUploadProgress(`准备上传 · 0/${uploadQueueTotal}`, 0);
   try {
     for (const file of accepted) {
+      if (uploadCancelled || runToken !== uploadRunToken) break;
       if (`${currentTarget?.kind}:${currentTarget?.id}` !== targetKey) {
         setError("发送对象已切换，上传完成的文件只保存在素材库，未加入当前消息");
         break;
       }
       try {
-        const item = await uploadOneFile(file);
+        const item = await uploadOneFile(file, runToken);
         if (`${currentTarget?.kind}:${currentTarget?.id}` === targetKey) {
           addPendingAttachment(item);
         }
         if (elements.libraryDialog.open) await loadLibrary(false);
       } catch (error) {
-        setError(`${file.name} 上传失败：${error.message}`);
+        if (error.name !== "AbortError" && !uploadCancelled) {
+          uploadFailures += 1;
+          setError(`${file.name} 上传失败：${error.message}`);
+        }
       } finally {
         uploadQueueDone += 1;
         currentFileProgress = 0;
       }
     }
   } finally {
+    const wasCancelled = uploadCancelled;
+    if (activeUploadId && currentInstanceId && wasCancelled) {
+      try {
+        await api(
+          `/instances/${currentInstanceId}/api/admin/qq-web/uploads/${encodeURIComponent(activeUploadId)}`,
+          {method: "DELETE"}
+        );
+      } catch {}
+    }
+    activeUploadId = "";
     uploadingCount = 0;
     uploadQueueTotal = 0;
     uploadQueueDone = 0;
     currentFileProgress = 0;
     updateUploadProgress("", 0);
     elements.uploadProgress.hidden = true;
+    uploadPaused = false;
+    uploadCancelled = false;
+    uploadAbortController = null;
+    elements.uploadPause.textContent = "暂停";
+    elements.uploadPause.disabled = false;
+    elements.uploadCancel.disabled = false;
     updateComposer();
     renderPendingAttachments();
+    if (wasCancelled) setError("已取消本次上传；已完成的分片记录已清理。");
+    else if (uploadFailures) setError(`本次有 ${uploadFailures} 个文件未上传成功，可重新选择文件重试。`);
   }
+}
+
+function toggleUploadPause() {
+  if (!uploadingCount) return;
+  uploadPaused = !uploadPaused;
+  elements.uploadPause.textContent = uploadPaused ? "继续" : "暂停";
+  if (uploadPaused) {
+    elements.uploadProgressText.textContent = "将在当前分片完成后暂停";
+  } else {
+    elements.uploadProgressText.textContent = "继续上传…";
+  }
+}
+
+async function cancelUploadQueue() {
+  if (!uploadingCount) return;
+  if (!window.confirm("取消当前上传队列？已上传的临时分片会被清理。")) return;
+  uploadCancelled = true;
+  uploadPaused = false;
+  uploadRunToken += 1;
+  elements.uploadPause.disabled = true;
+  elements.uploadCancel.disabled = true;
+  elements.uploadProgressText.textContent = "正在取消上传…";
+  uploadAbortController?.abort();
 }
 
 function chooseLocalFiles() {
@@ -795,6 +998,10 @@ function libraryCardMarkup(item) {
   const deleteButton = item.source === "upload"
     ? `<button class="qq-library-delete" type="button" data-delete-library="${esc(item.library_id)}" title="从站内素材库删除">删除</button>`
     : "";
+  const previewButton = `
+    <button class="qq-library-preview-button" type="button" data-preview-library="${esc(item.library_id)}">
+      查看内容
+    </button>`;
   return `
     <article class="qq-library-card ${selected ? "selected" : ""}">
       <button class="qq-library-select" type="button" data-select-library="${esc(item.library_id)}" title="${esc(name)}">
@@ -804,6 +1011,7 @@ function libraryCardMarkup(item) {
           <small>${esc(meta)}</small>
         </span>
       </button>
+      ${previewButton}
       ${deleteButton}
     </article>`;
 }
@@ -828,6 +1036,10 @@ async function loadLibrary(showLoading = true) {
   try {
     const data = await api(`/instances/${currentInstanceId}/api/admin/qq-web/library?limit=500`);
     libraryItems = Array.isArray(data.items) ? data.items : [];
+    if (data.storage && elements.libraryStorage) {
+      const storage = data.storage;
+      elements.libraryStorage.textContent = `本地 ${formatAttachmentSize(storage.total_bytes)} · 可用 ${formatAttachmentSize(storage.disk_free_bytes)}`;
+    }
   } catch (error) {
     libraryItems = [];
     elements.libraryMessage.textContent = error.message || "素材库读取失败";
@@ -855,6 +1067,33 @@ function closeLibrary() {
   else elements.libraryDialog.removeAttribute("open");
 }
 
+async function previewLibraryItem(item) {
+  if (!item || !currentInstanceId) return;
+  elements.libraryMessage.textContent = "正在解析预览…";
+  try {
+    const data = await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/library/${encodeURIComponent(item.library_id)}/preview`);
+    const preview = data.preview || {};
+    const text = preview.excerpt || preview.message || "该文件暂不支持网页内容预览，请下载查看。";
+    elements.libraryMessage.textContent = `${item.name}：${String(text).slice(0, 1200)}`;
+  } catch (error) {
+    elements.libraryMessage.textContent = error.message;
+  }
+}
+
+async function cleanupLibraryStorage() {
+  if (!currentInstanceId || !window.confirm("清理未被索引的孤立附件文件？收藏素材不会被删除。")) return;
+  try {
+    const data = await api(`/instances/${currentInstanceId}/api/admin/qq-web/storage/cleanup`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({orphaned: true}),
+    });
+    elements.libraryMessage.textContent = `已清理 ${data.orphan_deleted || 0} 个孤立文件`;
+    await loadLibrary(false);
+  } catch (error) {
+    elements.libraryMessage.textContent = error.message;
+  }
+}
+
 async function deleteLibraryUpload(item) {
   if (item?.source !== "upload") return;
   if (!window.confirm(`从站内素材库永久删除“${item.name}”？已经发送到 QQ 的消息不受影响。`)) return;
@@ -874,6 +1113,7 @@ async function sendMessage(event) {
   if (sending || uploadingCount || !currentTarget?.can_send) return;
   const text = elements.input.value.trim();
   const attachments = pendingAttachments.map((item) => item.library_id);
+  const replyTo = quoteTarget?.message_id || "";
   if (!text && !attachments.length) return;
   sending = true;
   setError("");
@@ -889,6 +1129,8 @@ async function sendMessage(event) {
             target_id: currentTarget.id,
             message: text,
             attachments,
+            reply_to: replyTo,
+            mentions: pendingMentions,
           }),
         })
       : await api(`/api/instances/${currentInstanceId}/qq-web/send`, {
@@ -898,10 +1140,14 @@ async function sendMessage(event) {
             target_type: currentTarget.target_type,
             target_id: currentTarget.id,
             message: text,
+            reply_to: replyTo,
+            mentions: pendingMentions,
           }),
         });
     elements.input.value = "";
     pendingAttachments = [];
+    clearQuote();
+    clearMentions();
     renderPendingAttachments();
     updateMessageCount();
     const divider = elements.messages.querySelector(".qq-day-divider");
@@ -946,6 +1192,183 @@ async function switchInstance(instanceId) {
   clearTarget();
   updateInstanceUi();
   await loadContacts();
+  openLiveEvents();
+}
+
+function closeLiveEvents() {
+  if (liveEvents) {
+    liveEvents.close();
+    liveEvents = null;
+  }
+  if (elements.liveState) elements.liveState.textContent = "实时同步未连接";
+}
+
+function openLiveEvents() {
+  closeLiveEvents();
+  if (!currentInstanceId || typeof EventSource === "undefined") return;
+  const instanceId = currentInstanceId;
+  liveEvents = new EventSource(`/api/instances/${instanceId}/api/admin/qq-web/events`);
+  liveEvents.onopen = () => {
+    if (elements.liveState) elements.liveState.textContent = "实时同步已连接";
+  };
+  liveEvents.onerror = () => {
+    if (elements.liveState) elements.liveState.textContent = "实时同步重连中";
+  };
+  liveEvents.addEventListener("message", (event) => {
+    let payload = null;
+    try { payload = JSON.parse(event.data || "{}"); } catch { return; }
+    if (!currentTarget || !payload.target_type || !payload.target_id) return;
+    const sameTarget = String(payload.target_type) === currentTarget.target_type
+      && Number(payload.target_id) === Number(currentTarget.id);
+    if (sameTarget) loadHistory(false).catch(() => {});
+  });
+  liveEvents.addEventListener("recall", (event) => {
+    let payload = null;
+    try { payload = JSON.parse(event.data || "{}"); } catch { return; }
+    if (currentTarget && String(payload.target_type) === currentTarget.target_type
+      && Number(payload.target_id) === Number(currentTarget.id)) {
+      loadHistory(false).catch(() => {});
+    }
+  });
+}
+
+function globalResultMarkup(item) {
+  const type = item.message_type === "group" ? "群聊" : "私聊";
+  const label = item.target_label || item.sender_name || item.target_id || "";
+  const targetKind = item.message_type === "group" ? "group" : "friend";
+  const targetId = item.message_type === "group" ? item.group_id : item.target_id;
+  return `<article class="qq-global-result">
+    <div><span class="qq-result-type">${type}</span><strong>${esc(label)}</strong>
+    <small>${esc(formatTime(item.event_time, true))} · ${esc(item.sender_name || "")}</small></div>
+    <p>${esc(item.snippet || item.content || "")}</p>
+    <button type="button" data-open-result-kind="${esc(targetKind)}" data-open-result-id="${esc(targetId)}">打开会话</button>
+  </article>`;
+}
+
+async function runGlobalSearch() {
+  if (!currentInstanceId) return;
+  elements.globalMessage.textContent = "";
+  elements.globalResults.innerHTML = "<div class=qq-global-empty>正在搜索…</div>";
+  const params = new URLSearchParams({
+    query: elements.globalQuery.value.trim(),
+    limit: "100",
+  });
+  if (elements.globalType.value) params.set("message_type", elements.globalType.value);
+  if (elements.globalFiles.checked) params.set("file_only", "true");
+  try {
+    const data = await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/search?${params}`);
+    const messages = data.messages || [];
+    elements.globalResults.innerHTML = messages.length
+      ? messages.map(globalResultMarkup).join("")
+      : "<div class=qq-global-empty>没有找到匹配消息</div>";
+    if (!messages.length) elements.globalMessage.textContent = "可以换关键词，或取消附件过滤。";
+  } catch (error) {
+    elements.globalResults.innerHTML = "";
+    elements.globalMessage.textContent = error.message;
+  }
+}
+
+function closeTargetDialog() {
+  if (elements.targetDialog.open) elements.targetDialog.close();
+  elements.targetMessage.textContent = "";
+}
+
+function targetOptionMarkup() {
+  const options = [];
+  for (const item of contacts?.friends || []) {
+    options.push(`<label><input type="checkbox" value="private:${item.user_id}" ${targetSelection.has(`private:${item.user_id}`) ? "checked" : ""}> <span>好友</span> ${esc(item.display_name)} <small>${esc(item.user_id)}</small></label>`);
+  }
+  for (const item of contacts?.groups || []) {
+    options.push(`<label><input type="checkbox" value="group:${item.group_id}" ${targetSelection.has(`group:${item.group_id}`) ? "checked" : ""}> <span>群聊</span> ${esc(item.display_name)} <small>${esc(item.group_id)}</small></label>`);
+  }
+  return options.join("") || "<div class=qq-global-empty>没有可发送目标</div>";
+}
+
+function openTargetDialog(mode = "send") {
+  if (!currentTarget?.can_send && mode === "send") {
+    setError("请先选择可发送的好友或群聊");
+    return;
+  }
+  targetSelection = new Set();
+  if (currentTarget?.can_send) targetSelection.add(`${currentTarget.target_type === "group" ? "group" : "private"}:${currentTarget.id}`);
+  elements.targetList.innerHTML = targetOptionMarkup();
+  elements.targetMessage.textContent = mode === "forward" ? "转发模式：将把选中消息发送到多个目标。" : "";
+  elements.targetList.querySelectorAll("input").forEach((input) => {
+    input.addEventListener("change", () => {
+      if (input.checked) targetSelection.add(input.value); else targetSelection.delete(input.value);
+    });
+  });
+  elements.targetSend.dataset.mode = mode;
+  if (typeof elements.targetDialog.showModal === "function") elements.targetDialog.showModal();
+  else elements.targetDialog.setAttribute("open", "");
+}
+
+async function sendToTargets() {
+  const mode = elements.targetSend.dataset.mode || "send";
+  const targets = Array.from(targetSelection).map((value) => {
+    const [target_type, id] = value.split(":");
+    return {target_type, target_id: Number(id)};
+  });
+  if (!targets.length) { elements.targetMessage.textContent = "至少选择一个目标"; return; }
+  elements.targetSend.disabled = true;
+  elements.targetMessage.textContent = "正在逐项发送…";
+  try {
+    let data;
+    if (mode === "forward" && forwardMessages.length) {
+      data = await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/forward`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({targets, messages: forwardMessages}),
+      });
+    } else {
+      data = await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/send-batch`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          targets,
+          message: elements.input.value.trim(),
+          attachments: pendingAttachments.map((item) => item.library_id),
+          reply_to: quoteTarget?.message_id || "",
+          mentions: pendingMentions,
+        }),
+      });
+    }
+    const failed = (data.results || []).filter((item) => !item.ok);
+    elements.targetMessage.textContent = failed.length
+      ? `完成 ${data.success_count || 0} 个，失败 ${failed.length} 个：${failed.map((item) => item.error).filter(Boolean).join("；")}`
+      : `已发送到 ${data.success_count || targets.length} 个目标`;
+    if (!failed.length) {
+      elements.input.value = "";
+      pendingAttachments = [];
+      forwardMessages = [];
+      renderPendingAttachments();
+      renderLibrary();
+      clearQuote();
+      clearMentions();
+      setTimeout(closeTargetDialog, 900);
+      loadHistory(false).catch(() => {});
+    }
+  } catch (error) {
+    elements.targetMessage.textContent = error.message;
+  } finally {
+    elements.targetSend.disabled = false;
+  }
+}
+
+async function recallMessage(messageId) {
+  if (!messageId || !currentTarget) return;
+  if (!window.confirm("确认撤回这条 QQ 消息？")) return;
+  try {
+    await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/recall`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        message_id: messageId,
+        target_type: currentTarget.target_type,
+        target_id: currentTarget.id,
+      }),
+    });
+    await loadHistory(false);
+  } catch (error) {
+    setError(error.message);
+  }
 }
 
 elements.instance.addEventListener("change", () => {
@@ -956,6 +1379,44 @@ document.querySelector("#qq-refresh-contacts").addEventListener("click", () => {
 });
 elements.search.addEventListener("input", renderContacts);
 elements.form.addEventListener("submit", sendMessage);
+elements.mention.addEventListener("click", addMention);
+elements.quoteCancel.addEventListener("click", clearQuote);
+elements.searchButton.addEventListener("click", () => {
+  if (!currentInstanceId) return;
+  if (typeof elements.searchDialog.showModal === "function") elements.searchDialog.showModal();
+  else elements.searchDialog.setAttribute("open", "");
+  elements.globalQuery.focus();
+});
+elements.multiButton.addEventListener("click", () => openTargetDialog("send"));
+elements.targetSend.addEventListener("click", () => sendToTargets().catch((error) => {
+  elements.targetMessage.textContent = error.message;
+}));
+document.querySelectorAll("[data-close-target]").forEach((button) => button.addEventListener("click", closeTargetDialog));
+document.querySelectorAll("[data-close-search]").forEach((button) => button.addEventListener("click", () => elements.searchDialog.close()));
+elements.globalRun.addEventListener("click", () => runGlobalSearch().catch((error) => setError(error.message)));
+elements.globalQuery.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); runGlobalSearch().catch((error) => setError(error.message)); }
+});
+elements.globalResults.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-open-result-kind]");
+  if (!button) return;
+  const kind = button.dataset.openResultKind;
+  const id = Number(button.dataset.openResultId);
+  elements.searchDialog.close();
+  selectContact(kind, id).catch((error) => setError(error.message));
+});
+elements.messages.addEventListener("click", (event) => {
+  const quoteButton = event.target.closest("[data-quote-message]");
+  const forwardButton = event.target.closest("[data-forward-message]");
+  const recallButton = event.target.closest("[data-recall-message]");
+  const id = quoteButton?.dataset.quoteMessage || forwardButton?.dataset.forwardMessage || recallButton?.dataset.recallMessage;
+  if (!id) return;
+  const message = currentMessages.find((item) => String(item.message_id) === String(id));
+  if (!message) return;
+  if (quoteButton) useQuote(message);
+  if (forwardButton) { forwardMessages = [message]; openTargetDialog("forward"); }
+  if (recallButton) recallMessage(id).catch((error) => setError(error.message));
+});
 elements.attach.addEventListener("click", () => {
   openLibrary().catch((error) => setError(error.message));
 });
@@ -968,6 +1429,10 @@ elements.fileInput.addEventListener("change", () => {
   const files = Array.from(elements.fileInput.files || []);
   elements.fileInput.value = "";
   uploadFiles(files).catch((error) => setError(error.message));
+});
+elements.uploadPause.addEventListener("click", toggleUploadPause);
+elements.uploadCancel.addEventListener("click", () => {
+  cancelUploadQueue().catch((error) => setError(error.message));
 });
 elements.form.addEventListener("dragover", (event) => {
   if (!event.dataTransfer?.types?.includes("Files")) return;
@@ -992,6 +1457,9 @@ elements.form.addEventListener("paste", (event) => {
   uploadFiles(files).catch((error) => setError(error.message));
 });
 elements.libraryUpload.addEventListener("click", chooseLocalFiles);
+elements.libraryCleanup.addEventListener("click", () => {
+  cleanupLibraryStorage().catch((error) => { elements.libraryMessage.textContent = error.message; });
+});
 elements.libraryClose.addEventListener("click", closeLibrary);
 elements.libraryDone.addEventListener("click", closeLibrary);
 elements.libraryDialog.addEventListener("click", (event) => {
@@ -1014,6 +1482,12 @@ elements.libraryGrid.addEventListener("click", (event) => {
     deleteLibraryUpload(item).catch((error) => {
       elements.libraryMessage.textContent = error.message;
     });
+    return;
+  }
+  const previewButton = event.target.closest("[data-preview-library]");
+  if (previewButton) {
+    const item = libraryItems.find((entry) => entry.library_id === previewButton.dataset.previewLibrary);
+    previewLibraryItem(item).catch((error) => { elements.libraryMessage.textContent = error.message; });
     return;
   }
   const selectButton = event.target.closest("[data-select-library]");
@@ -1043,7 +1517,13 @@ pollTimer = setInterval(() => {
   if (document.hidden || sending || uploadingCount || loadingHistory || !currentTarget?.can_send) return;
   loadHistory(false).catch(() => {});
 }, 15000);
-window.addEventListener("beforeunload", () => clearInterval(pollTimer));
+window.addEventListener("beforeunload", (event) => {
+  clearInterval(pollTimer);
+  if (uploadingCount) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
 
 autoResizeInput();
 renderPendingAttachments();

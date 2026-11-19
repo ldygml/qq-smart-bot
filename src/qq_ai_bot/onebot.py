@@ -109,7 +109,14 @@ class OneBotClient:
             trust_env=False,
         )
 
-    async def send_text(self, target: ReplyTarget, text: str) -> None:
+    async def send_text(
+        self,
+        target: ReplyTarget,
+        text: str,
+        *,
+        mentions: tuple[int, ...] | list[int] = (),
+        reply_to: int | str | None = None,
+    ) -> str | None:
         if target.message_type == "group":
             if target.group_id is None:
                 raise OneBotError("Group reply target has no group_id")
@@ -120,10 +127,17 @@ class OneBotClient:
             payload = {"user_id": target.user_id}
 
         message: list[dict[str, Any]] = []
-        if target.message_id is not None:
+        reply_id = reply_to if reply_to is not None else target.message_id
+        if reply_id is not None:
             message.append(
-                {"type": "reply", "data": {"id": str(target.message_id)}}
+                {"type": "reply", "data": {"id": str(reply_id)}}
             )
+        if target.message_type == "group":
+            for user_id in dict.fromkeys(int(value) for value in mentions):
+                if user_id > 0:
+                    message.append(
+                        {"type": "at", "data": {"qq": str(user_id)}}
+                    )
         message.append({"type": "text", "data": {"text": text}})
         payload["message"] = message
         response = await self._client.post(action, json=payload)
@@ -138,6 +152,32 @@ class OneBotClient:
             retcode = data.get("retcode")
             raise OneBotError(
                 f"OneBot {action} failed (HTTP {response.status_code}, retcode={retcode})"
+            )
+        result = data.get("data")
+        if isinstance(result, dict) and result.get("message_id") is not None:
+            return str(result["message_id"])
+        return None
+
+    async def delete_msg(self, message_id: int | str) -> None:
+        """Recall a message through OneBot's ``delete_msg`` action."""
+        identity = str(message_id or "").strip()
+        if not identity:
+            raise OneBotError("message_id is required for recall")
+        response = await self._client.post(
+            "delete_msg",
+            json={"message_id": identity},
+            timeout=20.0,
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                f"OneBot returned a non-JSON response (HTTP {response.status_code})"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            retcode = data.get("retcode")
+            raise OneBotError(
+                f"OneBot delete_msg failed (HTTP {response.status_code}, retcode={retcode})"
             )
 
     async def poke(self, target: ReplyTarget) -> None:
@@ -300,7 +340,7 @@ class OneBotClient:
         target: ReplyTarget,
         segment_type: str,
         data: dict[str, Any],
-    ) -> None:
+    ) -> str | None:
         if target.message_type == "group":
             if target.group_id is None:
                 raise OneBotError("Group target has no group_id")
@@ -328,6 +368,10 @@ class OneBotClient:
             raise OneBotError(
                 f"OneBot {action} failed (HTTP {response.status_code}, retcode={retcode})"
             )
+        response_data = result.get("data")
+        if isinstance(response_data, dict) and response_data.get("message_id") is not None:
+            return str(response_data["message_id"])
+        return None
 
     async def get_file(self, *, source: FileSource) -> dict[str, Any]:
         payload: dict[str, Any] = {}

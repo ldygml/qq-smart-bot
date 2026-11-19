@@ -689,6 +689,8 @@ async def test_qq_console_proxy_uses_real_qq_targets(
                 "target_type": "private",
                 "target_id": 123,
                 "message": "真实发送",
+                "reply_to": "",
+                "mentions": [],
             },
         ),
     ]

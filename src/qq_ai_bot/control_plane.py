@@ -44,7 +44,7 @@ CONTROL_DB = PROJECT_ROOT / "data" / "control.db"
 SESSION_COOKIE = "qq_control_session"
 SESSION_HOURS = 24
 BACKUP_MAGIC = b"QQBOTBK1"
-MAX_BACKUP_BYTES = 300 * 1024 * 1024
+MAX_BACKUP_BYTES = 1024 * 1024 * 1024
 CLOUDFLARE_LOG = RUNTIME_ROOT / "cloudflared.log"
 CLOUDFLARE_STDERR_LOG = RUNTIME_ROOT / "cloudflared.stderr.log"
 CLOUDFLARE_PID_FILE = RUNTIME_ROOT / "cloudflared.pid"
@@ -200,6 +200,31 @@ def build_encrypted_backup(
         "databases": [],
         "files": [],
     }
+    asset_roots: list[Path] = []
+    configured_roots = (
+        project_root / "data" / "qq_media" / "files",
+        project_root / "data" / "generated",
+        project_root / "data" / "sticker_assets",
+    )
+    for item in instances:
+        database_path = _project_path(str(item["database_path"]), project_root)
+        configured_roots += (
+            database_path.parent / "qq_media" / "files",
+            database_path.parent / "generated",
+            database_path.parent / "sticker_assets",
+        )
+    for candidate in configured_roots:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(project_root.resolve())
+        except ValueError:
+            continue
+        if resolved.is_dir() and resolved not in asset_roots:
+            asset_roots.append(resolved)
+    manifest["asset_roots"] = [
+        path.relative_to(project_root.resolve()).as_posix()
+        for path in asset_roots
+    ]
     archive_buffer = io.BytesIO()
     with zipfile.ZipFile(
         archive_buffer,
@@ -238,6 +263,28 @@ def build_encrypted_backup(
                     "path": relative_name,
                 }
             )
+        asset_number = 0
+        for root in asset_roots:
+            for path in sorted(root.rglob("*")):
+                if not path.is_file():
+                    continue
+                try:
+                    relative_name = path.resolve().relative_to(
+                        project_root.resolve()
+                    ).as_posix()
+                except ValueError:
+                    continue
+                archive_name = f"assets/{asset_number}/{path.name}"
+                archive.write(path, archive_name)
+                manifest["files"].append(
+                    {
+                        "archive": archive_name,
+                        "path": relative_name,
+                        "kind": "asset",
+                        "size": path.stat().st_size,
+                    }
+                )
+                asset_number += 1
         archive.writestr(
             "manifest.json",
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -321,10 +368,17 @@ def restore_encrypted_backup(
             temp_path.write_bytes(archive.read(archive_name))
             os.replace(temp_path, target)
             restored.append(relative_name)
+        asset_count = sum(
+            1
+            for item in manifest.get("files") or []
+            if isinstance(item, dict) and item.get("kind") == "asset"
+        )
     return {
         "restored": restored,
         "safety_directory": str(safety_dir),
         "created_at": manifest.get("created_at"),
+        "assets_restored": asset_count,
+        "backup_includes_assets": asset_count > 0,
     }
 
 
@@ -992,6 +1046,8 @@ class QQWebSendPayload(BaseModel):
     target_type: str = Field(pattern="^(private|group)$")
     target_id: int = Field(gt=0)
     message: str = Field(min_length=1, max_length=20000)
+    reply_to: str = Field(default="", max_length=200)
+    mentions: list[int] = Field(default_factory=list, max_length=100)
 
 
 class BackupPayload(BaseModel):
@@ -2158,6 +2214,8 @@ async def instance_qq_web_send(
             "target_type": payload.target_type,
             "target_id": payload.target_id,
             "message": payload.message,
+            "reply_to": payload.reply_to,
+            "mentions": payload.mentions,
         },
         timeout=60,
     )
@@ -2436,6 +2494,8 @@ async def _proxy_instance_admin_request(
         )
         if key in response.headers
     }
+    if response.headers.get("content-type", "").startswith("text/event-stream"):
+        response_headers["X-Accel-Buffering"] = "no"
 
     async def stream_response():
         try:

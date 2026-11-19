@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0e120e">
   <title>给她爱 · QQ 消息</title>
-  <link rel="stylesheet" href="/portal/control.css">
-  <link rel="stylesheet" href="/portal/chat.css">
+  <link rel="stylesheet" href="/portal/control.css?v=20261119-qq-ops2">
+  <link rel="stylesheet" href="/portal/chat.css?v=20261119-qq-ops2">
 </head>
 <body class="chat-page">
   <header class="topbar chat-topbar">
@@ -102,6 +102,11 @@
           </div>
         </div>
         <button id="qq-reload-history" type="button" disabled>刷新消息</button>
+        <div class="qq-room-tools">
+          <span id="qq-live-state" class="qq-live-state">实时同步中</span>
+          <button id="qq-search-button" type="button">全局搜索</button>
+          <button id="qq-multi-button" type="button">多目标发送</button>
+        </div>
       </header>
 
       <div id="qq-messages" class="qq-messages" role="log" aria-live="polite">
@@ -119,12 +124,19 @@
           <span id="qq-send-relation"></span>
         </div>
         <div id="qq-pending-attachments" class="qq-pending-attachments" hidden></div>
+        <div id="qq-quote-bar" class="qq-quote-bar" hidden>
+          <span>正在引用：<strong id="qq-quote-text"></strong></span>
+          <button id="qq-quote-cancel" type="button" aria-label="取消引用">取消</button>
+        </div>
         <div id="qq-upload-progress" class="qq-upload-progress" hidden>
           <span id="qq-upload-progress-text">正在上传…</span>
           <progress id="qq-upload-progress-bar" value="0" max="100"></progress>
+          <button id="qq-upload-pause" type="button">暂停</button>
+          <button id="qq-upload-cancel" type="button">取消</button>
         </div>
         <div class="qq-compose-row">
           <button id="qq-attach-button" class="qq-attach-button" type="button" title="添加表情包或文件" aria-label="添加表情包或文件" disabled>＋</button>
+          <button id="qq-mention-button" class="qq-attach-button" type="button" title="在群聊中 @ 成员" aria-label="在群聊中 @ 成员" disabled>@</button>
           <textarea id="qq-message-input" rows="2" maxlength="20000" placeholder="选择联系人后输入消息。Enter 发送，Shift+Enter 换行" disabled aria-label="QQ 消息内容"></textarea>
           <button id="qq-send-button" type="submit" disabled>发送到 QQ</button>
         </div>
@@ -168,11 +180,37 @@
       <p id="qq-library-message" class="qq-library-message" role="status"></p>
       <footer class="qq-library-foot">
         <span id="qq-library-count">0 个素材</span>
+        <span id="qq-library-storage" class="qq-library-storage"></span>
+        <button id="qq-library-cleanup" type="button">清理孤立文件</button>
         <button id="qq-library-done" type="button">完成</button>
       </footer>
     </div>
   </dialog>
 
-  <script src="/portal/chat.js?v=20261119-qq-attachments1"></script>
+  <dialog id="qq-target-dialog" class="qq-small-dialog" aria-labelledby="qq-target-title">
+    <div class="qq-small-shell">
+      <header><h2 id="qq-target-title">选择发送目标</h2><button data-close-target type="button">×</button></header>
+      <p class="muted">可多选好友或群聊。发送结果会逐项显示。</p>
+      <div id="qq-target-list" class="qq-target-list"></div>
+      <footer><button id="qq-target-send" type="button" class="primary">发送到所选目标</button><button data-close-target type="button">取消</button></footer>
+      <p id="qq-target-message" class="chat-error" role="alert"></p>
+    </div>
+  </dialog>
+
+  <dialog id="qq-search-dialog" class="qq-small-dialog" aria-labelledby="qq-search-title">
+    <div class="qq-small-shell">
+      <header><h2 id="qq-search-title">全局消息搜索</h2><button data-close-search type="button">×</button></header>
+      <div class="qq-search-tools">
+        <input id="qq-global-query" type="search" placeholder="搜索所有私聊和群聊消息" autocomplete="off">
+        <select id="qq-global-type"><option value="">全部</option><option value="private">私聊</option><option value="group">群聊</option></select>
+        <label><input id="qq-global-files" type="checkbox"> 只看附件</label>
+        <button id="qq-global-run" type="button">搜索</button>
+      </div>
+      <div id="qq-global-results" class="qq-global-results"></div>
+      <p id="qq-global-message" class="chat-error" role="alert"></p>
+    </div>
+  </dialog>
+
+  <script src="/portal/chat.js?v=20261119-qq-ops2"></script>
 </body>
 </html>

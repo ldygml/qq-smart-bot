@@ -577,6 +577,36 @@ def create_app(
     topic_message_counts: dict[str, int] = {}
     strategy_comparison_inflight: set[str] = set()
     history_sync_lock = asyncio.Lock()
+    qq_web_subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+
+    def _publish_qq_web_event(
+        event_type: str,
+        *,
+        target_type: str = "",
+        target_id: int | None = None,
+        message_id: int | str | None = None,
+        **extra: Any,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "type": event_type,
+            "target_type": target_type,
+            "target_id": target_id,
+            "message_id": str(message_id or ""),
+            "created_at": int(time.time()),
+            **extra,
+        }
+        for queue in tuple(qq_web_subscribers):
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(payload)
+                except asyncio.QueueFull:
+                    pass
 
     def _restore_group_message(
         group_id: int,
@@ -1259,7 +1289,164 @@ def create_app(
     async def admin_qq_web_library(
         limit: int = 300,
     ) -> dict[str, Any]:
-        return _qq_web_media_library(limit=limit)
+        result = _qq_web_media_library(limit=limit)
+        result["storage"] = qq_media.storage_stats()
+        return result
+
+    @app.get("/api/admin/qq-web/storage")
+    async def admin_qq_web_storage() -> dict[str, Any]:
+        generated = _generated_storage_summary()
+        sticker_root = sticker_assets.asset_dir
+        sticker_files = [
+            path for path in sticker_root.rglob("*") if path.is_file()
+        ] if sticker_root.is_dir() else []
+        return {
+            "ok": True,
+            "uploads": qq_media.storage_stats(),
+            "generated": generated,
+            "stickers": {
+                "path": str(sticker_root),
+                "file_count": len(sticker_files),
+                "total_bytes": sum(path.stat().st_size for path in sticker_files),
+            },
+        }
+
+    @app.post("/api/admin/qq-web/storage/cleanup")
+    async def admin_qq_web_storage_cleanup(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        raw_days = payload.get("older_than_days")
+        try:
+            older_than_days = (
+                None if raw_days in {None, ""} else int(raw_days)
+            )
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"detail": "older_than_days must be an integer"},
+                status_code=400,
+            )
+        if older_than_days is not None and not 0 <= older_than_days <= 36500:
+            return JSONResponse(
+                {"detail": "older_than_days is out of range"},
+                status_code=400,
+            )
+        kind = str(payload.get("kind") or "").strip().lower()
+        if kind and kind not in {"image", "video", "audio", "file"}:
+            return JSONResponse(
+                {"detail": "kind is invalid"},
+                status_code=400,
+            )
+        result = await asyncio.to_thread(
+            qq_media.cleanup,
+            older_than_days=older_than_days,
+            kind=kind,
+            orphaned=bool(payload.get("orphaned", False)),
+            dry_run=bool(payload.get("dry_run", False)),
+        )
+        return JSONResponse({"ok": True, **result, "storage": qq_media.storage_stats()})
+
+    @app.delete("/api/admin/qq-web/media-library/batch")
+    async def admin_qq_web_batch_delete_media(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        raw_ids = payload.get("ids")
+        if not isinstance(raw_ids, list):
+            return JSONResponse({"detail": "ids must be a list"}, status_code=400)
+        ids = [int(value) for value in raw_ids if str(value).strip().isdigit()]
+        if not ids:
+            return JSONResponse({"detail": "no valid media ids"}, status_code=400)
+        result = await asyncio.to_thread(qq_media.batch_delete, ids)
+        return JSONResponse({"ok": True, **result, "storage": qq_media.storage_stats()})
+
+    @app.patch("/api/admin/qq-web/media-library/{media_id}")
+    async def admin_qq_web_update_media(
+        media_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        item = await asyncio.to_thread(
+            qq_media.update_metadata,
+            media_id,
+            note=payload.get("note"),
+            tags=payload.get("tags"),
+            favorite=(
+                bool(payload.get("favorite"))
+                if "favorite" in payload
+                else None
+            ),
+        )
+        if item is None:
+            return JSONResponse({"detail": "media not found"}, status_code=404)
+        result = item.to_dict()
+        result["url"] = f"/api/admin/qq-web/uploads/{item.id}/asset"
+        return JSONResponse({"ok": True, "item": result})
+
+    @app.get("/api/admin/qq-web/library/{library_id}/preview")
+    async def admin_qq_web_library_preview(
+        library_id: str,
+    ) -> JSONResponse:
+        try:
+            item = _resolve_qq_web_library_item(library_id)
+        except QQMediaError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=404)
+        path = Path(item["path"])
+
+        def preview() -> dict[str, Any]:
+            with path.open("rb") as source:
+                return extract_file_preview(
+                    source,
+                    str(item["name"]),
+                    str(item.get("mime_type") or ""),
+                )
+
+        try:
+            result = await asyncio.to_thread(preview)
+        except Exception as exc:
+            logger.warning("Could not preview QQ media asset", exc_info=True)
+            return JSONResponse(
+                {"detail": f"preview failed: {exc}"},
+                status_code=422,
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "item": _qq_web_attachment_payload(item),
+                "preview": result,
+                "download_url": str(item.get("url") or ""),
+            }
+        )
+
+    @app.get("/api/admin/qq-web/events")
+    async def admin_qq_web_events(request: Request) -> StreamingResponse:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        qq_web_subscribers.add(queue)
+
+        async def stream():
+            try:
+                yield "retry: 2500\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        payload = await asyncio.wait_for(queue.get(), 15.0)
+                    except asyncio.TimeoutError:
+                        yield ": heartbeat\n\n"
+                        continue
+                    yield (
+                        f"event: {payload.get('type', 'message')}\n"
+                        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    )
+            finally:
+                qq_web_subscribers.discard(queue)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/api/admin/qq-web/uploads/init")
     async def admin_qq_web_upload_init(
@@ -1606,6 +1793,111 @@ def create_app(
             "messages": messages,
         }
 
+    @app.get("/api/admin/qq-web/search")
+    async def admin_qq_web_search(
+        query: str = "",
+        message_type: str = "",
+        target_id: int | None = None,
+        role: str = "",
+        since: int | None = None,
+        until: int | None = None,
+        file_only: bool = False,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        if message_type and message_type not in {"private", "group"}:
+            return JSONResponse(
+                {"detail": "message_type is invalid"},
+                status_code=400,
+            )
+        if role and role not in {"user", "assistant"}:
+            return JSONResponse(
+                {"detail": "role is invalid"},
+                status_code=400,
+            )
+        messages = store.search_messages(
+            query=query,
+            message_type=message_type,
+            target_id=target_id,
+            role=role,
+            since=since,
+            until=until,
+            file_only=file_only,
+            limit=limit,
+        )
+        friend_names: dict[int, str] = {}
+        if any(item.get("message_type") == "private" for item in messages):
+            try:
+                friend_names = {
+                    int(friend["user_id"]): str(friend["display_name"])
+                    for friend in await _qq_web_friends()
+                }
+            except OneBotError:
+                pass
+        for item in messages:
+            if item.get("message_type") == "group":
+                group_id = int(item.get("group_id") or 0)
+                item["target_label"] = group_name_cache.get(
+                    group_id,
+                    f"群 {group_id}",
+                )
+            else:
+                item["target_label"] = str(
+                    item.get("sender_name")
+                    or item.get("sender_user_id")
+                    or "私聊"
+                )
+        for item in messages:
+            if item.get("message_type") == "private":
+                chat_target_id = int(item.get("target_id") or 0)
+                item["target_label"] = friend_names.get(
+                    chat_target_id,
+                    f"QQ {chat_target_id}" if chat_target_id else "",
+                )
+        return {
+            "ok": True,
+            "query": query,
+            "count": len(messages),
+            "messages": messages,
+        }
+
+    @app.post("/api/admin/qq-web/recall")
+    async def admin_qq_web_recall(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        message_id = str(payload.get("message_id") or "").strip()
+        if not message_id:
+            return JSONResponse(
+                {"detail": "message_id is required"},
+                status_code=400,
+            )
+        delete_message = getattr(sender, "delete_msg", None)
+        if not callable(delete_message):
+            return JSONResponse(
+                {"detail": "current OneBot client cannot recall messages"},
+                status_code=501,
+            )
+        try:
+            await delete_message(message_id)
+        except OneBotError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=502)
+        hidden = store.mark_message_deleted(message_id)
+        target_type = str(payload.get("target_type") or "").strip()
+        target_id = _optional_int(payload.get("target_id"))
+        _publish_qq_web_event(
+            "recall",
+            target_type=target_type,
+            target_id=target_id,
+            message_id=message_id,
+            hidden_archive_rows=hidden,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "message_id": message_id,
+                "hidden_archive_rows": hidden,
+            }
+        )
+
     @app.post("/api/admin/qq-web/send")
     async def admin_qq_web_send(
         payload: dict[str, Any] = Body(...),
@@ -1613,6 +1905,18 @@ def create_app(
         target_type = str(payload.get("target_type") or "").strip()
         target_id = _optional_int(payload.get("target_id"))
         message = str(payload.get("message") or "").strip()
+        reply_to = str(payload.get("reply_to") or "").strip()
+        raw_mentions = payload.get("mentions")
+        mentions = tuple(
+            value
+            for value in (
+                _optional_int(item)
+                for item in (raw_mentions if isinstance(raw_mentions, list) else [])
+            )
+            if value is not None and value > 0
+        )
+        if target_type == "private":
+            mentions = ()
         if target_type not in {"private", "group"} or target_id is None:
             return JSONResponse(
                 {"detail": "请选择有效的好友或群聊"},
@@ -1651,7 +1955,11 @@ def create_app(
                     status_code=403,
                 )
             target_name = str(friend["display_name"])
-            target = ReplyTarget("private", target_id)
+            target = ReplyTarget(
+                "private",
+                target_id,
+                message_id=reply_to or None,
+            )
             conversation_id = f"private:{target_id}"
         else:
             try:
@@ -1676,10 +1984,22 @@ def create_app(
                 )
             target_name = str(group["display_name"])
             login = await _qq_web_login_info()
-            target = ReplyTarget("group", target_id, target_id)
+            target = ReplyTarget(
+                "group",
+                target_id,
+                target_id,
+                message_id=reply_to or None,
+            )
             conversation_id = f"group:{target_id}"
         try:
-            await sender.send_text(target, message)
+            if mentions:
+                sent_message_id = await sender.send_text(
+                    target,
+                    message,
+                    mentions=mentions,
+                )
+            else:
+                sent_message_id = await sender.send_text(target, message)
         except OneBotError as exc:
             return JSONResponse(
                 {"detail": f"QQ 消息发送失败：{exc}"},
@@ -1702,6 +2022,7 @@ def create_app(
                 event_time=sent_at,
                 add_to_chat=True,
                 max_rows=config.max_history_rows_per_chat,
+                message_id=sent_message_id,
             )
             if target_type == "group":
                 group_histories.setdefault(
@@ -1719,6 +2040,13 @@ def create_app(
                 "Could not store a message sent from the web console",
                 exc_info=True,
             )
+        _publish_qq_web_event(
+            "message",
+            target_type=target_type,
+            target_id=target_id,
+            message_id=sent_message_id,
+            role="assistant",
+        )
         return {
             "ok": True,
             "target": {
@@ -1727,6 +2055,7 @@ def create_app(
                 "display_name": target_name,
             },
             "message": {
+                "message_id": sent_message_id or "",
                 "role": "assistant",
                 "content": message,
                 "sender_name": str(login.get("nickname") or config.bot_name),
@@ -1741,6 +2070,18 @@ def create_app(
         target_type = str(payload.get("target_type") or "").strip()
         target_id = _optional_int(payload.get("target_id"))
         message = str(payload.get("message") or "").strip()
+        reply_to = str(payload.get("reply_to") or "").strip()
+        raw_mentions = payload.get("mentions")
+        mentions = tuple(
+            value
+            for value in (
+                _optional_int(item)
+                for item in (raw_mentions if isinstance(raw_mentions, list) else [])
+            )
+            if value is not None and value > 0
+        )
+        if target_type == "private":
+            mentions = ()
         raw_ids = payload.get("attachments")
         if not isinstance(raw_ids, list):
             raw_ids = []
@@ -1791,7 +2132,11 @@ def create_app(
                     status_code=403,
                 )
             target_name = str(friend["display_name"])
-            target = ReplyTarget("private", target_id)
+            target = ReplyTarget(
+                "private",
+                target_id,
+                message_id=reply_to or None,
+            )
             conversation_id = f"private:{target_id}"
         else:
             try:
@@ -1812,7 +2157,12 @@ def create_app(
                     status_code=404,
                 )
             target_name = str(group["display_name"])
-            target = ReplyTarget("group", target_id, target_id)
+            target = ReplyTarget(
+                "group",
+                target_id,
+                target_id,
+                message_id=reply_to or None,
+            )
             conversation_id = f"group:{target_id}"
 
         try:
@@ -1888,9 +2238,17 @@ def create_app(
             return "file"
 
         sent_methods: list[str] = []
+        text_message_id: str | None = None
         try:
             if message:
-                await sender.send_text(target, message)
+                if mentions:
+                    text_message_id = await sender.send_text(
+                        target,
+                        message,
+                        mentions=mentions,
+                    )
+                else:
+                    text_message_id = await sender.send_text(target, message)
             for item in resolved:
                 sent_methods.append(await send_one(item))
         except OneBotError as exc:
@@ -1938,6 +2296,8 @@ def create_app(
                 event_time=sent_at,
                 add_to_chat=True,
                 max_rows=config.max_history_rows_per_chat,
+                message_id=text_message_id,
+                attachments=rendered,
             )
             if target_type == "group":
                 group_histories.setdefault(
@@ -1955,6 +2315,14 @@ def create_app(
                 "Could not archive a web-console attachment message",
                 exc_info=True,
             )
+        _publish_qq_web_event(
+            "message",
+            target_type=target_type,
+            target_id=target_id,
+            message_id=text_message_id,
+            role="assistant",
+            attachment_count=len(rendered),
+        )
         return JSONResponse(
             {
                 "ok": True,
@@ -1964,6 +2332,7 @@ def create_app(
                     "display_name": target_name,
                 },
                 "message": {
+                    "message_id": text_message_id or "",
                     "role": "assistant",
                     "content": message,
                     "sender_name": str(
@@ -1975,6 +2344,137 @@ def create_app(
                 "sent_count": len(rendered),
             }
         )
+
+    def _response_json(response: Any) -> dict[str, Any]:
+        if isinstance(response, dict):
+            return response
+        body = getattr(response, "body", b"{}")
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (AttributeError, UnicodeDecodeError, ValueError):
+            parsed = {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @app.post("/api/admin/qq-web/send-batch")
+    async def admin_qq_web_send_batch(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        raw_targets = payload.get("targets")
+        if not isinstance(raw_targets, list):
+            raw_targets = []
+        targets: list[dict[str, Any]] = []
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                continue
+            target_type = str(item.get("target_type") or "").strip()
+            target_id = _optional_int(item.get("target_id"))
+            if target_type in {"private", "group"} and target_id is not None:
+                targets.append(
+                    {"target_type": target_type, "target_id": target_id}
+                )
+        unique: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for item in targets:
+            key = (str(item["target_type"]), int(item["target_id"]))
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        if not unique:
+            return JSONResponse(
+                {"detail": "请选择至少一个发送目标"},
+                status_code=400,
+            )
+        if len(unique) > 30:
+            return JSONResponse(
+                {"detail": "单次最多发送到 30 个目标"},
+                status_code=400,
+            )
+        message = str(payload.get("message") or "").strip()
+        raw_ids = payload.get("attachments")
+        attachments = [
+            str(value).strip()
+            for value in (raw_ids if isinstance(raw_ids, list) else [])
+            if str(value).strip()
+        ]
+        results: list[dict[str, Any]] = []
+        for target in unique:
+            body: dict[str, Any] = {
+                **target,
+                "message": message,
+                "reply_to": str(payload.get("reply_to") or "").strip(),
+            }
+            if attachments:
+                body["attachments"] = attachments
+                response = await admin_qq_web_send_attachments(body)
+            else:
+                body["mentions"] = (
+                    payload.get("mentions")
+                    if isinstance(payload.get("mentions"), list)
+                    else []
+                )
+                response = await admin_qq_web_send(body)
+            parsed = _response_json(response)
+            status_code = int(getattr(response, "status_code", 200))
+            results.append(
+                {
+                    **target,
+                    "ok": status_code < 400 and bool(parsed.get("ok")),
+                    "status_code": status_code,
+                    "message_id": (
+                        (parsed.get("message") or {}).get("message_id")
+                        if isinstance(parsed.get("message"), dict)
+                        else ""
+                    ),
+                    "error": str(parsed.get("detail") or ""),
+                }
+            )
+        return JSONResponse(
+            {
+                "ok": all(item["ok"] for item in results),
+                "partial": any(item["ok"] for item in results)
+                and not all(item["ok"] for item in results),
+                "results": results,
+                "success_count": sum(1 for item in results if item["ok"]),
+                "failure_count": sum(1 for item in results if not item["ok"]),
+            }
+        )
+
+    @app.post("/api/admin/qq-web/forward")
+    async def admin_qq_web_forward(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        raw_messages = payload.get("messages")
+        if not isinstance(raw_messages, list) or not raw_messages:
+            return JSONResponse(
+                {"detail": "请选择至少一条要转发的消息"},
+                status_code=400,
+            )
+        lines: list[str] = []
+        attachment_ids: list[str] = []
+        for item in raw_messages[:50]:
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content") or "").strip()
+            sender = str(item.get("sender_name") or "").strip()
+            if content:
+                lines.append(f"{sender}：{content}" if sender else content)
+            for attachment in item.get("attachments") or []:
+                if not isinstance(attachment, dict):
+                    continue
+                library_id = str(attachment.get("library_id") or "").strip()
+                if library_id:
+                    attachment_ids.append(library_id)
+        if not lines and not attachment_ids:
+            return JSONResponse(
+                {"detail": "选中的消息没有可转发内容"},
+                status_code=400,
+            )
+        forward_payload = {
+            "targets": payload.get("targets"),
+            "message": "\n".join(lines)[:20000],
+            "attachments": list(dict.fromkeys(attachment_ids)),
+        }
+        return await admin_qq_web_send_batch(forward_payload)
 
     @app.get("/api/admin/people")
     async def admin_people() -> dict[str, Any]:
@@ -4169,13 +4669,34 @@ def create_app(
                 or sender_info.get("nickname")
                 or event.user_id
             ).strip()
-            archived_content = extract_message_content(
+            content_info = extract_message_content(
                 event.message,
                 self_id=event.self_id,
                 raw_message=event.raw_message,
-            ).text.strip()
+            )
+            archived_content = content_info.text.strip()
             if not archived_content:
                 archived_content = event.raw_message.strip()
+            archived_attachments = [
+                {"type": "image", "name": f"图片 {index}"}
+                for index, _ in enumerate(content_info.image_sources, start=1)
+            ]
+            archived_attachments.extend(
+                {
+                    "type": "file",
+                    "name": str(source.name or "文件")[:240],
+                    "size": int(source.size or 0),
+                }
+                for source in content_info.file_sources
+            )
+            archived_attachments.extend(
+                {"type": "audio", "name": f"语音 {index}"}
+                for index, _ in enumerate(content_info.audio_sources, start=1)
+            )
+            archived_attachments.extend(
+                {"type": "sticker", "name": str(summary or "表情包")[:240]}
+                for summary in content_info.sticker_summaries
+            )
             try:
                 archived_new = store.archive_message(
                     external_key=(
@@ -4193,6 +4714,8 @@ def create_app(
                     role="user",
                     content=archived_content,
                     event_time=event_time or int(time.time()),
+                    message_id=event.message_id,
+                    attachments=archived_attachments,
                 )
                 shared_memory.set_state(
                     history_cursor_key(message_type, peer_id),
@@ -4223,6 +4746,16 @@ def create_app(
                         )
             except Exception:
                 logger.warning("Could not archive a live QQ message", exc_info=True)
+            if not is_pre_startup_event:
+                _publish_qq_web_event(
+                    "message",
+                    target_type=message_type,
+                    target_id=int(peer_id),
+                    message_id=event.message_id,
+                    role="user",
+                    sender_name=sender_name,
+                    attachment_count=len(archived_attachments),
+                )
 
         if is_pre_startup_event:
             return Response(status_code=204)
@@ -5289,7 +5822,10 @@ def create_app(
             trace.error(f"{type(exc).__name__}: {exc}")
             raise
         finally:
-            current_message_trace.reset(token)
+            try:
+                current_message_trace.reset(token)
+            except (RuntimeError, ValueError):
+                pass
             trace.finish()
 
     async def _process_event_inner(
