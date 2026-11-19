@@ -41,9 +41,6 @@ def _safe_meme_phrase(value: object) -> str:
         return ""
     if re.search(r"https?://|@\w|\d{5,}", phrase):
         return ""
-    harmful = ("傻逼", "脑残", "去死", "滚你", "尼玛", "妈的", "贱人", "废物")
-    if any(marker in phrase.lower() for marker in harmful):
-        return ""
     return phrase
 
 
@@ -717,7 +714,9 @@ async def learn_language_batch(
                     "接梗速度、标点力度、先接情绪还是先回答、是否打字简短。"
                     "不要复制某个人的独特口头禅，不输出姓名、QQ号、地址、"
                     "联系方式或私事。网络词只有在有明确含义和用法时才收录。"
-                    "辱骂、歧视、黄腔、引战词和一次性错别字一律不收录。"
+                    "熟人语境里的粗口、损人、攻击性回怼可以收录，但必须写清"
+                    "适用对象、关系、触发条件和语气，不能把它泛化成无差别辱骂。"
+                    "针对受保护身份的仇恨表达、现实人身威胁和威胁家人不收录。"
                     "严格输出 JSON，不要 Markdown。"
                 ),
             },
@@ -795,8 +794,9 @@ async def extract_trending_expressions(
                 "role": "system",
                 "content": (
                     "从给定联网资料中提取近期中文网络口语。不能使用资料外知识，"
-                    "不能编造出处。只保留含义和用法清楚、不是侮辱攻击、"
-                    "不是一次性缩写、适合正常聊天的词。严格输出 JSON。"
+                    "不能编造出处。只保留含义和用法清楚的表达；熟人语境中的粗口、"
+                    "损人和攻击性回怼也可保留，但 usage 必须写明关系和场景。"
+                    "不要收录一次性缩写或无来源内容。严格输出 JSON。"
                 ),
             },
             {

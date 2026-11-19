@@ -37,7 +37,7 @@ from qq_ai_bot.config import Settings
 from qq_ai_bot.files import DocumentSection, ParsedDocument
 from qq_ai_bot.grounded_qa import GroundedAnswer, GroundedSource
 from qq_ai_bot.memory import ChatMemory
-from qq_ai_bot.onebot import ReplyTarget, StickerSource
+from qq_ai_bot.onebot import OneBotError, ReplyTarget, StickerSource
 from qq_ai_bot.productivity import ProductivityStore
 from qq_ai_bot.quality import QualityStore
 from qq_ai_bot.shared_memory import SharedMemoryStore
@@ -101,6 +101,9 @@ class ClaimReviewChat(FakeChatClient):
 class FakeOneBotClient:
     def __init__(self) -> None:
         self.sent: list[tuple[ReplyTarget, str]] = []
+        self.mentions: list[tuple[ReplyTarget, tuple[int, ...]]] = []
+        self.forwarded_single: list[tuple[ReplyTarget, str]] = []
+        self.forwarded_nodes: list[tuple[ReplyTarget, list[dict[str, object]]]] = []
         self.poked: list[ReplyTarget] = []
         self.quoted_sender_id: int | None = 999
         self.images: list[tuple[ReplyTarget, str]] = []
@@ -124,8 +127,34 @@ class FakeOneBotClient:
         self.group_file_url = ""
         self.group_file_name = ""
 
-    async def send_text(self, target: ReplyTarget, text: str) -> None:
+    async def send_text(
+        self,
+        target: ReplyTarget,
+        text: str,
+        *,
+        mentions: tuple[int, ...] | list[int] = (),
+        reply_to: int | str | None = None,
+    ) -> str | None:
+        _ = reply_to
         self.sent.append((target, text))
+        self.mentions.append((target, tuple(int(value) for value in mentions)))
+        return "fake-message-id"
+
+    async def forward_single_message(
+        self,
+        target: ReplyTarget,
+        message_id: int | str,
+    ) -> str | None:
+        self.forwarded_single.append((target, str(message_id)))
+        return "fake-forward-id"
+
+    async def send_forward(
+        self,
+        target: ReplyTarget,
+        nodes: list[dict[str, object]],
+    ) -> str | None:
+        self.forwarded_nodes.append((target, nodes))
+        return "fake-merged-forward-id"
 
     async def poke(self, target: ReplyTarget) -> None:
         self.poked.append(target)
@@ -673,6 +702,50 @@ async def test_message_trace_records_group_silence_reason(tmp_path) -> None:
     trace = trace_store.list_recent(limit=1)[0]
     assert trace["status"] == "skipped"
     assert "@" in trace["reason"]
+
+
+@pytest.mark.asyncio
+async def test_group_mention_uses_login_id_when_event_self_id_is_missing(
+    tmp_path,
+) -> None:
+    sender = FakeOneBotClient()
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            enable_group=True,
+            group_require_mention=True,
+        ),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        response = await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "group",
+                "user_id": 123,
+                "group_id": 456,
+                "message_id": 807,
+                "message": [
+                    {"type": "at", "data": {"qq": "999"}},
+                    {"type": "text", "data": {"text": " 你怎么看"}},
+                ],
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert response.status_code == 204
+    assert sender.sent
+    assert sender.sent[0][0].message_type == "group"
 
 
 @pytest.mark.asyncio
@@ -3383,6 +3456,98 @@ async def test_qq_web_console_distinguishes_friends_and_group_members(
         "role": "assistant",
         "content": "网页私聊消息",
     }
+
+
+@pytest.mark.asyncio
+async def test_qq_web_group_mentions_and_forward(tmp_path) -> None:
+    sender = FakeOneBotClient()
+    sender.friends = [
+        {
+            "user_id": 123,
+            "nickname": "Aloha",
+            "display_name": "Aloha",
+        }
+    ]
+    sender.groups = [{"group_id": 456, "group_name": "测试群"}]
+    app = create_app(
+        settings=make_settings(tmp_path, enable_group=True),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=ChatMemory(tmp_path / "memory.db"),
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        mentioned = await client.post(
+            "/api/admin/qq-web/send",
+            json={
+                "target_type": "group",
+                "target_id": 456,
+                "message": "看这里",
+                "mentions": [123, 123, 789],
+            },
+        )
+        forwarded = await client.post(
+            "/api/admin/qq-web/forward",
+            json={
+                "targets": [{"target_type": "group", "target_id": 456}],
+                "messages": [
+                    {
+                        "message_id": "source-1",
+                        "sender_id": 789,
+                        "sender_name": "群友",
+                        "content": "原始消息",
+                        "attachments": [],
+                    }
+                ],
+            },
+        )
+
+        async def reject_direct_forward(
+            target: ReplyTarget,
+            message_id: int | str,
+        ) -> str | None:
+            _ = target, message_id
+            raise OneBotError("single forward unsupported")
+
+        sender.forward_single_message = reject_direct_forward  # type: ignore[method-assign]
+        merged = await client.post(
+            "/api/admin/qq-web/forward",
+            json={
+                "targets": [{"target_type": "group", "target_id": 456}],
+                "messages": [
+                    {
+                        "message_id": "source-2",
+                        "sender_id": 789,
+                        "sender_name": "群友",
+                        "content": "回退消息",
+                        "attachments": [],
+                    }
+                ],
+            },
+        )
+
+    assert mentioned.status_code == 200
+    assert sender.mentions[0] == (
+        ReplyTarget("group", 456, 456),
+        (123, 123, 789),
+    )
+    assert forwarded.status_code == 200
+    assert forwarded.json()["success_count"] == 1, forwarded.json()["results"]
+    assert forwarded.json()["results"][0]["method"] == "single_message"
+    assert sender.forwarded_single == [
+        (ReplyTarget("group", 456, 456), "source-1")
+    ]
+    assert merged.status_code == 200
+    assert merged.json()["results"][0]["method"] == "merged_nodes"
+    assert sender.forwarded_nodes[0][1][0]["data"]["content"] == [
+        {"type": "text", "data": {"text": "回退消息"}}
+    ]
 
 
 @pytest.mark.asyncio

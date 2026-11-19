@@ -158,6 +158,113 @@ class OneBotClient:
             return str(result["message_id"])
         return None
 
+    async def _send_action(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float = 20.0,
+    ) -> str | None:
+        response = await self._client.post(
+            action,
+            json=payload,
+            timeout=timeout,
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                f"OneBot returned a non-JSON response (HTTP {response.status_code})"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            retcode = data.get("retcode")
+            raise OneBotError(
+                f"OneBot {action} failed (HTTP {response.status_code}, retcode={retcode})"
+            )
+        result = data.get("data")
+        if isinstance(result, dict) and result.get("message_id") is not None:
+            return str(result["message_id"])
+        return None
+
+    async def send_forward(
+        self,
+        target: ReplyTarget,
+        nodes: list[dict[str, Any]],
+    ) -> str | None:
+        """Send a merged OneBot forward message."""
+        if not nodes:
+            raise OneBotError("Forward message needs at least one node")
+        if target.message_type == "group":
+            if target.group_id is None:
+                raise OneBotError("Group forward target has no group_id")
+            attempts = (
+                (
+                    "send_group_forward_msg",
+                    {"group_id": target.group_id, "messages": nodes},
+                ),
+                (
+                    "send_forward_msg",
+                    {
+                        "message_type": "group",
+                        "group_id": target.group_id,
+                        "messages": nodes,
+                    },
+                ),
+            )
+        else:
+            attempts = (
+                (
+                    "send_private_forward_msg",
+                    {"user_id": target.user_id, "messages": nodes},
+                ),
+                (
+                    "send_forward_msg",
+                    {
+                        "message_type": "private",
+                        "user_id": target.user_id,
+                        "messages": nodes,
+                    },
+                ),
+            )
+        failures: list[str] = []
+        for action, payload in attempts:
+            try:
+                return await self._send_action(
+                    action,
+                    payload,
+                    timeout=60.0,
+                )
+            except OneBotError as exc:
+                failures.append(str(exc))
+        raise OneBotError(
+            "No supported forward action succeeded: " + " | ".join(failures)
+        )
+
+    async def forward_single_message(
+        self,
+        target: ReplyTarget,
+        message_id: int | str,
+    ) -> str | None:
+        """Forward one existing QQ message without rebuilding its segments."""
+        identity = str(message_id or "").strip()
+        if not identity:
+            raise OneBotError("message_id is required for forwarding")
+        if target.message_type == "group":
+            if target.group_id is None:
+                raise OneBotError("Group forward target has no group_id")
+            action = "forward_group_single_msg"
+            payload = {
+                "group_id": target.group_id,
+                "message_id": identity,
+            }
+        else:
+            action = "forward_friend_single_msg"
+            payload = {
+                "user_id": target.user_id,
+                "message_id": identity,
+            }
+        return await self._send_action(action, payload, timeout=60.0)
+
     async def delete_msg(self, message_id: int | str) -> None:
         """Recall a message through OneBot's ``delete_msg`` action."""
         identity = str(message_id or "").strip()

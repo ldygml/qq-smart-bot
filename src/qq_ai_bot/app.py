@@ -2471,32 +2471,303 @@ def create_app(
                 {"detail": "请选择至少一条要转发的消息"},
                 status_code=400,
             )
-        lines: list[str] = []
-        attachment_ids: list[str] = []
+        raw_targets = payload.get("targets")
+        if not isinstance(raw_targets, list):
+            raw_targets = []
+        targets: list[dict[str, Any]] = []
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                continue
+            target_type = str(item.get("target_type") or "").strip()
+            target_id = _optional_int(item.get("target_id"))
+            if target_type in {"private", "group"} and target_id is not None:
+                targets.append(
+                    {"target_type": target_type, "target_id": target_id}
+                )
+        unique: list[dict[str, Any]] = []
+        seen_targets: set[tuple[str, int]] = set()
+        for item in targets:
+            key = (str(item["target_type"]), int(item["target_id"]))
+            if key not in seen_targets:
+                seen_targets.add(key)
+                unique.append(item)
+        if not unique:
+            return JSONResponse(
+                {"detail": "请选择至少一个发送目标"},
+                status_code=400,
+            )
+        if len(unique) > 30:
+            return JSONResponse(
+                {"detail": "单次最多转发到 30 个目标"},
+                status_code=400,
+            )
+
+        login = await _qq_web_login_info()
+        bot_user_id = _optional_int(login.get("user_id")) or 10000
+        bot_name = str(login.get("nickname") or config.bot_name)[:120]
+        nodes: list[dict[str, Any]] = []
+        source_message_id = ""
+        first_content = ""
+        attachment_count = 0
         for item in raw_messages[:50]:
             if not isinstance(item, dict):
                 continue
             content = str(item.get("content") or "").strip()
-            sender = str(item.get("sender_name") or "").strip()
+            sender_name = str(item.get("sender_name") or "").strip()
+            sender_id = (
+                _optional_int(item.get("sender_id"))
+                or _optional_int(item.get("sender_user_id"))
+                or bot_user_id
+            )
+            segments: list[dict[str, Any]] = []
             if content:
-                lines.append(f"{sender}：{content}" if sender else content)
+                segments.append(
+                    {"type": "text", "data": {"text": content[:20000]}}
+                )
             for attachment in item.get("attachments") or []:
                 if not isinstance(attachment, dict):
                     continue
-                library_id = str(attachment.get("library_id") or "").strip()
+                source = ""
+                library_id = str(
+                    attachment.get("library_id") or ""
+                ).strip()
                 if library_id:
-                    attachment_ids.append(library_id)
-        if not lines and not attachment_ids:
+                    try:
+                        resolved = _resolve_qq_web_library_item(library_id)
+                    except QQMediaError:
+                        resolved = {}
+                    source = str(resolved.get("path") or "")
+                raw_url = str(
+                    attachment.get("url")
+                    or attachment.get("source")
+                    or ""
+                ).strip()
+                if not source and raw_url:
+                    match = re.fullmatch(
+                        r"/api/admin/qq-web/media/([0-9a-f]{64})",
+                        raw_url,
+                    )
+                    if match:
+                        asset = sticker_assets.find_by_sha256(match.group(1))
+                        source = str(asset.path) if asset is not None else ""
+                    else:
+                        sticker_match = re.fullmatch(
+                            r"/api/admin/stickers/(\d+)/asset",
+                            raw_url,
+                        )
+                        if sticker_match:
+                            sticker_path = stickers.local_asset_path(
+                                int(sticker_match.group(1))
+                            )
+                            source = (
+                                str(sticker_path)
+                                if sticker_path is not None
+                                else ""
+                            )
+                        elif raw_url.startswith(
+                            ("http://", "https://", "file://", "base64://")
+                        ):
+                            source = raw_url
+                kind = str(attachment.get("type") or "").strip()
+                segment_type = {
+                    "image": "image",
+                    "sticker": "image",
+                    "video": "video",
+                    "audio": "record",
+                    "file": "file",
+                }.get(kind)
+                if segment_type and source:
+                    data: dict[str, Any] = {"file": source}
+                    if segment_type == "file":
+                        data["name"] = str(
+                            attachment.get("name") or Path(source).name
+                        )[:240]
+                    segments.append(
+                        {"type": segment_type, "data": data}
+                    )
+                    attachment_count += 1
+            if not segments:
+                continue
+            message_id = str(item.get("message_id") or "").strip()
+            if message_id and not source_message_id:
+                source_message_id = message_id
+            if content and not first_content:
+                first_content = content[:500]
+            nodes.append(
+                {
+                    "type": "node",
+                    "data": {
+                        "user_id": str(sender_id),
+                        "nickname": (sender_name or bot_name)[:120],
+                        "content": segments,
+                    },
+                }
+            )
+        if not nodes:
             return JSONResponse(
                 {"detail": "选中的消息没有可转发内容"},
                 status_code=400,
             )
-        forward_payload = {
-            "targets": payload.get("targets"),
-            "message": "\n".join(lines)[:20000],
-            "attachments": list(dict.fromkeys(attachment_ids)),
-        }
-        return await admin_qq_web_send_batch(forward_payload)
+
+        single_forwarder = getattr(sender, "forward_single_message", None)
+        merged_forwarder = getattr(sender, "send_forward", None)
+        results: list[dict[str, Any]] = []
+        for target_item in unique:
+            target_type = str(target_item["target_type"])
+            target_id = int(target_item["target_id"])
+            target_name = str(target_id)
+            error = ""
+            try:
+                if target_type == "private":
+                    friends = await _qq_web_friends()
+                    friend = next(
+                        (
+                            friend
+                            for friend in friends
+                            if int(friend["user_id"]) == target_id
+                        ),
+                        None,
+                    )
+                    if friend is None:
+                        raise OneBotError(
+                            "只能私聊机器人真实好友；同群成员不算好友"
+                        )
+                    target_name = str(friend["display_name"])
+                    target = ReplyTarget("private", target_id)
+                    conversation_id = f"private:{target_id}"
+                else:
+                    groups = await _qq_web_groups()
+                    group = next(
+                        (
+                            group
+                            for group in groups
+                            if int(group["group_id"]) == target_id
+                        ),
+                        None,
+                    )
+                    if group is None:
+                        raise OneBotError("群聊不存在或机器人尚未加入")
+                    target_name = str(group["display_name"])
+                    target = ReplyTarget("group", target_id, target_id)
+                    conversation_id = f"group:{target_id}"
+            except OneBotError as exc:
+                results.append(
+                    {
+                        **target_item,
+                        "display_name": target_name,
+                        "ok": False,
+                        "status_code": 502,
+                        "message_id": "",
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            sent_message_id: str | None = None
+            method = ""
+            direct_error = ""
+            if source_message_id and callable(single_forwarder):
+                try:
+                    sent_message_id = await single_forwarder(
+                        target,
+                        source_message_id,
+                    )
+                    method = "single_message"
+                except OneBotError as exc:
+                    direct_error = str(exc)
+            if not method:
+                if not callable(merged_forwarder):
+                    error = direct_error or "当前 OneBot 客户端不支持合并转发"
+                else:
+                    try:
+                        sent_message_id = await merged_forwarder(target, nodes)
+                        method = "merged_nodes"
+                    except OneBotError as exc:
+                        error = str(exc)
+                        if direct_error:
+                            error = f"单条转发失败：{direct_error}；合并转发失败：{error}"
+            if error:
+                results.append(
+                    {
+                        **target_item,
+                        "display_name": target_name,
+                        "ok": False,
+                        "status_code": 502,
+                        "message_id": "",
+                        "error": error,
+                    }
+                )
+                continue
+
+            sent_at = int(time.time())
+            summary_content = (
+                f"[合并转发 {len(nodes)} 条]"
+                + (f" {first_content}" if first_content else "")
+            )[:20000]
+            try:
+                store.archive_message(
+                    external_key=(
+                        f"web:{target_type}:{target_id}:{time.time_ns()}:forward"
+                    ),
+                    conversation_id=conversation_id,
+                    message_type=target_type,
+                    group_id=target_id if target_type == "group" else None,
+                    sender_user_id=bot_user_id,
+                    sender_name=bot_name,
+                    role="assistant",
+                    content=summary_content,
+                    event_time=sent_at,
+                    add_to_chat=True,
+                    max_rows=config.max_history_rows_per_chat,
+                    message_id=sent_message_id,
+                )
+                if target_type == "group":
+                    group_histories.setdefault(
+                        target_id,
+                        deque(maxlen=24),
+                    ).append(
+                        GroupMessage(
+                            role="assistant",
+                            sender=config.bot_name,
+                            content=summary_content,
+                        )
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not archive a forwarded QQ message",
+                    exc_info=True,
+                )
+            _publish_qq_web_event(
+                "message",
+                target_type=target_type,
+                target_id=target_id,
+                message_id=sent_message_id,
+                role="assistant",
+                forward_count=len(nodes),
+            )
+            results.append(
+                {
+                    **target_item,
+                    "display_name": target_name,
+                    "ok": True,
+                    "status_code": 200,
+                    "message_id": sent_message_id or "",
+                    "method": method,
+                    "error": "",
+                }
+            )
+        return JSONResponse(
+            {
+                "ok": all(item["ok"] for item in results),
+                "partial": any(item["ok"] for item in results)
+                and not all(item["ok"] for item in results),
+                "results": results,
+                "forward_count": len(nodes),
+                "attachment_count": attachment_count,
+                "success_count": sum(1 for item in results if item["ok"]),
+                "failure_count": sum(1 for item in results if not item["ok"]),
+            }
+        )
 
     @app.get("/api/admin/people")
     async def admin_people() -> dict[str, Any]:
@@ -6200,6 +6471,15 @@ def create_app(
 
     async def _process_event(event: OneBotEvent) -> None:
         assert event.user_id is not None
+        if event.message_type == "group" and event.self_id is None:
+            try:
+                login = await _qq_web_login_info()
+                event.self_id = _optional_int(login.get("user_id"))
+            except OneBotError:
+                logger.warning(
+                    "Could not recover the bot QQ id for mention detection",
+                    exc_info=True,
+                )
         target = ReplyTarget(
             event.message_type,
             event.user_id,
@@ -10702,7 +10982,8 @@ async def _rewrite_casual_reply(
                 "content": (
                     "你负责把一段过度完整的回复改成 QQ 熟人闲聊口吻。"
                     "像关系熟的普通朋友随口回消息，判断直接，允许冷嘲和毒舌，"
-                    "但只攻击事情和说法，不攻击身份或人格，不使用脏话、歧视或羞辱。"
+                    "关系熟和语境允许时可以带粗口、互损或攻击性回怼；"
+                    "不要对普通友好请求突然升级，也不要做极端仇恨或现实威胁。"
                     "如果原消息是在自嘲或低落，语气收一点。只保留核心意思。"
                     "通常一到三句，按原消息的事情多少决定长度；"
                     "对方正常问候或请求时不要硬加冷嘲。"

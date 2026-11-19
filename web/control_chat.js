@@ -1085,7 +1085,7 @@ async function previewLibraryItem(item) {
   if (!item || !currentInstanceId) return;
   elements.libraryMessage.textContent = "正在解析预览…";
   try {
-    const data = await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/library/${encodeURIComponent(item.library_id)}/preview`);
+    const data = await api(`/instances/${currentInstanceId}/api/admin/qq-web/library/${encodeURIComponent(item.library_id)}/preview`);
     const preview = data.preview || {};
     const text = preview.excerpt || preview.message || "该文件暂不支持网页内容预览，请下载查看。";
     elements.libraryMessage.textContent = `${item.name}：${String(text).slice(0, 1200)}`;
@@ -1221,7 +1221,7 @@ function openLiveEvents() {
   closeLiveEvents();
   if (!currentInstanceId || typeof EventSource === "undefined") return;
   const instanceId = currentInstanceId;
-  liveEvents = new EventSource(`/api/instances/${instanceId}/api/admin/qq-web/events`);
+  liveEvents = new EventSource(`/instances/${instanceId}/api/admin/qq-web/events`);
   liveEvents.onopen = () => {
     if (elements.liveState) elements.liveState.textContent = "实时同步已连接";
   };
@@ -1270,7 +1270,7 @@ async function runGlobalSearch() {
   if (elements.globalType.value) params.set("message_type", elements.globalType.value);
   if (elements.globalFiles.checked) params.set("file_only", "true");
   try {
-    const data = await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/search?${params}`);
+    const data = await api(`/instances/${currentInstanceId}/api/admin/qq-web/search?${params}`);
     const messages = data.messages || [];
     elements.globalResults.innerHTML = messages.length
       ? messages.map(globalResultMarkup).join("")
@@ -1329,12 +1329,12 @@ async function sendToTargets() {
   try {
     let data;
     if (mode === "forward" && forwardMessages.length) {
-      data = await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/forward`, {
+      data = await api(`/instances/${currentInstanceId}/api/admin/qq-web/forward`, {
         method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({targets, messages: forwardMessages}),
       });
     } else {
-      data = await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/send-batch`, {
+      data = await api(`/instances/${currentInstanceId}/api/admin/qq-web/send-batch`, {
         method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
           targets,
@@ -1371,7 +1371,7 @@ async function recallMessage(messageId) {
   if (!messageId || !currentTarget) return;
   if (!window.confirm("确认撤回这条 QQ 消息？")) return;
   try {
-    await api(`/api/instances/${currentInstanceId}/api/admin/qq-web/recall`, {
+    await api(`/instances/${currentInstanceId}/api/admin/qq-web/recall`, {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({
         message_id: messageId,

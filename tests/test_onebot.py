@@ -566,6 +566,97 @@ def test_at_another_user_is_not_bot_mention() -> None:
     assert content.mentioned_user_ids == (20002,)
 
 
+@pytest.mark.asyncio
+async def test_forward_message_falls_back_to_generic_action() -> None:
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.path, json.loads(request.content)))
+        if request.url.path.endswith("/send_group_forward_msg"):
+            return httpx.Response(404, json={"status": "failed", "retcode": 1404})
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "retcode": 0,
+                "data": {"message_id": 7788},
+            },
+        )
+
+    nodes = [
+        {
+            "type": "node",
+            "data": {
+                "user_id": "42",
+                "nickname": "群友",
+                "content": [
+                    {"type": "text", "data": {"text": "合并转发内容"}}
+                ],
+            },
+        }
+    ]
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        message_id = await client.send_forward(
+            ReplyTarget("group", 456, 789),
+            nodes,
+        )
+    finally:
+        await client.close()
+
+    assert message_id == "7788"
+    assert [path.rsplit("/", 1)[-1] for path, _ in requests] == [
+        "send_group_forward_msg",
+        "send_forward_msg",
+    ]
+    assert requests[1][1] == {
+        "message_type": "group",
+        "group_id": 789,
+        "messages": nodes,
+    }
+
+
+@pytest.mark.asyncio
+async def test_forward_single_private_message_uses_native_action() -> None:
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "retcode": 0,
+                "data": {"message_id": "forwarded"},
+            },
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        message_id = await client.forward_single_message(
+            ReplyTarget("private", 123),
+            "source-1",
+        )
+    finally:
+        await client.close()
+
+    assert message_id == "forwarded"
+    assert requests == [
+        (
+            "/forward_friend_single_msg",
+            {"user_id": 123, "message_id": "source-1"},
+        )
+    ]
+
+
 def test_extract_mentioned_user_ids_from_cq_code() -> None:
     content = extract_message_content(
         "[CQ:at,qq=20002] 戳一下",

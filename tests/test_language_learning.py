@@ -139,7 +139,7 @@ def test_language_store_can_forget_one_scene(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_learning_parses_style_and_rejects_unsafe_phrase() -> None:
+async def test_chat_learning_parses_style_and_keeps_scoped_insults() -> None:
     chat = JsonChat(
         '{"profile":{"summary":"消息短，接话快","rhythm":"一两句",'
         '"vocabulary":"口语化","avoid":"客服腔"},'
@@ -159,7 +159,11 @@ async def test_chat_learning_parses_style_and_rejects_unsafe_phrase() -> None:
         ],
     )
     assert result.profile.rhythm == "一两句"
-    assert [item.phrase for item in result.expressions] == ["有点东西"]
+    assert [item.phrase for item in result.expressions] == [
+        "有点东西",
+        "傻逼玩意",
+    ]
+    assert result.expressions[1].tone == "攻击"
 
 
 @pytest.mark.asyncio
