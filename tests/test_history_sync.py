@@ -94,10 +94,21 @@ async def test_private_history_is_imported_once_and_new_messages_are_incremental
     )
     assert first["status"] == "ok"
     assert first["imported"] == 3
-    assert memory.history("private:42", 10) == [
-        {"role": "user", "content": "older question"},
-        {"role": "assistant", "content": "older answer"},
-        {"role": "user", "content": "offline question"},
+    assert memory.history("private:42", 10) == []
+    assert {
+        item["content"]
+        for item in memory.archived_messages(limit=10)
+    } == {
+        "offline question",
+        "older answer",
+        "older question",
+    }
+    assert [
+        item["content"]
+        for item in shared.observations_since(0, limit=10)
+    ] == [
+        "older question",
+        "offline question",
     ]
     assert all(call[3] is True for call in client.history_calls)
 
@@ -115,10 +126,8 @@ async def test_private_history_is_imported_once_and_new_messages_are_incremental
         page_size=20,
     )
     assert second["imported"] == 2
-    assert memory.history("private:42", 10)[-2:] == [
-        {"role": "user", "content": "new question"},
-        {"role": "assistant", "content": "new answer"},
-    ]
+    assert memory.history("private:42", 10) == []
+    assert len(memory.archived_messages(limit=10)) == 5
     assert shared.get_state(history_cursor_key("private", 42)) == "5"
 
 
@@ -153,13 +162,9 @@ async def test_group_history_restores_threads_and_group_context(tmp_path) -> Non
     )
 
     assert result["imported"] == 3
-    assert memory.history("group:100:user:11", 10) == [
-        {"role": "user", "content": "Alice message"},
-        {"role": "assistant", "content": "Bot reply"},
-    ]
-    assert memory.history("group:100:user:22", 10) == [
-        {"role": "user", "content": "Bob message"},
-    ]
+    assert memory.history("group:100:user:11", 10) == []
+    assert memory.history("group:100:user:22", 10) == []
+    assert len(memory.archived_messages(limit=10)) == 3
     assert [item[1] for item in context] == ["user", "assistant", "user"]
 
 

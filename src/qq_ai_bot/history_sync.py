@@ -292,16 +292,6 @@ def _import_messages(
             if role == "user" and sender_id <= 0:
                 sender_id = peer_id
 
-        add_to_chat = True
-        if role == "assistant":
-            latest = memory.history(conversation_id, 1)
-            if (
-                latest
-                and latest[-1].get("role") == "assistant"
-                and latest[-1].get("content") == content
-            ):
-                add_to_chat = False
-
         external_key = (
             f"qq:{message_type}:{peer_id}:{message_id}"
         )
@@ -315,7 +305,10 @@ def _import_messages(
             role=role,
             content=content,
             event_time=int(item.get("time") or 0),
-            add_to_chat=add_to_chat,
+            # Offline messages are evidence for long-term memory, never the
+            # active reply thread. Otherwise the bot can answer an old prompt
+            # immediately after startup.
+            add_to_chat=False,
             max_rows=max_rows,
         )
         if is_new:

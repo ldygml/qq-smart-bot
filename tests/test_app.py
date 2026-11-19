@@ -872,6 +872,78 @@ async def test_active_topic_is_injected_into_conversation(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_startup_queued_message_is_memory_only(tmp_path) -> None:
+    llm = FakeChatClient()
+    sender = FakeOneBotClient()
+    memory = ChatMemory(tmp_path / "memory.db")
+    shared = SharedMemoryStore(tmp_path / "memory.db")
+    app = create_app(
+        settings=make_settings(
+            tmp_path,
+            shared_memory_enabled=True,
+        ),
+        chat_client=llm,
+        onebot_client=sender,
+        memory=memory,
+        shared_memory_store=shared,
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 889,
+                "time": int(datetime.now(timezone.utc).timestamp()) - 300,
+                "message": "offline queued message",
+            },
+        )
+        await asyncio.sleep(0.05)
+        assert sender.sent == []
+        assert memory.history("private:123", 10) == []
+        archived = memory.archived_messages(
+            conversation_id="private:123",
+            limit=10,
+        )
+        assert [item["content"] for item in archived] == [
+            "offline queued message"
+        ]
+        observations = shared.observations_since(0, limit=10)
+        assert [item["content"] for item in observations] == [
+            "offline queued message"
+        ]
+
+        await client.post(
+            "/onebot",
+            headers={"Authorization": "Bearer test-secret"},
+            json={
+                "post_type": "message",
+                "message_type": "private",
+                "self_id": 999,
+                "user_id": 123,
+                "message_id": 890,
+                "message": "live message after startup",
+            },
+        )
+        await _wait_for_condition(lambda: bool(sender.sent))
+
+    assert len(sender.sent) == 1
+    assert llm.calls[0][-1] == {
+        "role": "user",
+        "content": "live message after startup",
+    }
+
+
+@pytest.mark.asyncio
 async def test_private_message_gets_ai_reply(tmp_path) -> None:
     llm = FakeChatClient()
     sender = FakeOneBotClient()

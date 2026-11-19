@@ -314,6 +314,7 @@ def create_app(
     group_file_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     config = settings or Settings()
+    startup_epoch = int(time.time())
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -3034,6 +3035,13 @@ def create_app(
         except (ValueError, ValidationError):
             return JSONResponse({"detail": "invalid event"}, status_code=400)
 
+        event_time = int(event.time or 0)
+        is_pre_startup_event = bool(
+            event_time and event_time < startup_epoch
+        )
+        if is_pre_startup_event and event.post_type != "message":
+            return Response(status_code=204)
+
         if _is_poke_event(event):
             if event.user_id is None or event.target_id is None:
                 return Response(status_code=204)
@@ -3074,7 +3082,7 @@ def create_app(
             if not archived_content:
                 archived_content = event.raw_message.strip()
             try:
-                store.archive_message(
+                archived_new = store.archive_message(
                     external_key=(
                         f"qq:{message_type}:{peer_id}:{event.message_id}"
                     ),
@@ -3089,14 +3097,40 @@ def create_app(
                     sender_name=sender_name,
                     role="user",
                     content=archived_content,
-                    event_time=int(time.time()),
+                    event_time=event_time or int(time.time()),
                 )
                 shared_memory.set_state(
                     history_cursor_key(message_type, peer_id),
                     str(event.message_id),
                 )
+                if archived_new and is_pre_startup_event:
+                    if archived_content:
+                        shared_memory.record_person(
+                            event.user_id,
+                            sender_name,
+                        )
+                    if (
+                        archived_content
+                        and len(archived_content.strip()) >= 4
+                        and not archived_content.lstrip().startswith("/")
+                    ):
+                        shared_memory.observe_message(
+                            conversation_id=(
+                                f"group:{peer_id}:user:{event.user_id}"
+                                if message_type == "group"
+                                else f"private:{event.user_id}"
+                            ),
+                            message_type=message_type,
+                            group_id=event.group_id,
+                            speaker_user_id=event.user_id,
+                            speaker_name=sender_name,
+                            content=archived_content,
+                        )
             except Exception:
                 logger.warning("Could not archive a live QQ message", exc_info=True)
+
+        if is_pre_startup_event:
+            return Response(status_code=204)
 
         dedupe_key = (
             (

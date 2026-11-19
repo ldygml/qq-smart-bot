@@ -22,6 +22,7 @@ class OneBotEvent(BaseModel):
     group_id: int | None = None
     group_name: str = ""
     message_id: int | str | None = None
+    time: int = 0
     message: Any = None
     raw_message: str = ""
     sender: dict[str, Any] | None = None
