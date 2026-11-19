@@ -169,6 +169,9 @@ class OneBotClient:
     async def send_image(self, target: ReplyTarget, image: str) -> None:
         await self._send_segment(target, "image", {"file": image})
 
+    async def send_video(self, target: ReplyTarget, video: str) -> None:
+        await self._send_segment(target, "video", {"file": video})
+
     async def send_record(self, target: ReplyTarget, record: str) -> None:
         await self._send_segment(target, "record", {"file": record})
 

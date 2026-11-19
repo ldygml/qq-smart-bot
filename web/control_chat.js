@@ -7,6 +7,14 @@ let currentMembers = [];
 let loadingHistory = false;
 let sending = false;
 let pollTimer = null;
+let pendingAttachments = [];
+let libraryItems = [];
+let libraryFilter = "all";
+let libraryLoading = false;
+let uploadingCount = 0;
+let uploadQueueTotal = 0;
+let uploadQueueDone = 0;
+let currentFileProgress = 0;
 
 const elements = {
   instance: document.querySelector("#chat-instance"),
@@ -33,9 +41,24 @@ const elements = {
   targetRelation: document.querySelector("#qq-send-relation"),
   input: document.querySelector("#qq-message-input"),
   send: document.querySelector("#qq-send-button"),
+  attach: document.querySelector("#qq-attach-button"),
+  fileInput: document.querySelector("#qq-file-input"),
+  pending: document.querySelector("#qq-pending-attachments"),
+  uploadProgress: document.querySelector("#qq-upload-progress"),
+  uploadProgressText: document.querySelector("#qq-upload-progress-text"),
+  uploadProgressBar: document.querySelector("#qq-upload-progress-bar"),
   hint: document.querySelector("#qq-compose-hint"),
   count: document.querySelector("#qq-message-count"),
   error: document.querySelector("#qq-error"),
+  libraryDialog: document.querySelector("#qq-library-dialog"),
+  libraryClose: document.querySelector("#qq-library-close"),
+  libraryDone: document.querySelector("#qq-library-done"),
+  libraryUpload: document.querySelector("#qq-library-upload"),
+  librarySearch: document.querySelector("#qq-library-search"),
+  libraryTabs: document.querySelector("#qq-library-tabs"),
+  libraryGrid: document.querySelector("#qq-library-grid"),
+  libraryCount: document.querySelector("#qq-library-count"),
+  libraryMessage: document.querySelector("#qq-library-message"),
   adminLink: document.querySelector("#chat-admin-link"),
   userLabel: document.querySelector("#chat-user-label"),
 };
@@ -303,6 +326,13 @@ function resolveTarget(kind, id) {
 }
 
 async function selectContact(kind, id) {
+  const nextKey = `${kind}:${id}`;
+  const previousKey = currentTarget ? `${currentTarget.kind}:${currentTarget.id}` : "";
+  if (previousKey && previousKey !== nextKey && pendingAttachments.length) {
+    pendingAttachments = [];
+    renderPendingAttachments();
+    updateComposer();
+  }
   if (kind === "group") {
     const target = resolveTarget("group", id);
     if (!target) return;
@@ -342,6 +372,8 @@ async function selectContact(kind, id) {
 function clearTarget() {
   currentTarget = null;
   currentMembers = [];
+  pendingAttachments = [];
+  renderPendingAttachments();
   elements.memberSection.hidden = true;
   elements.roomTitle.textContent = "选择一个好友或群聊";
   elements.roomAvatar.textContent = "Q";
@@ -380,9 +412,11 @@ function updateComposer() {
     && currentInstanceId
     && instanceOnline()
     && !sending
+    && !uploadingCount
   );
   elements.input.disabled = !canSend;
-  elements.send.disabled = !canSend;
+  elements.attach.disabled = !canSend;
+  elements.send.disabled = !canSend || (!elements.input.value.trim() && !pendingAttachments.length);
   elements.reload.disabled = !currentTarget || currentTarget.kind === "member" && !currentTarget.can_send;
   if (!currentTarget) {
     elements.targetLabel.textContent = "尚未选择";
@@ -445,7 +479,7 @@ function attachmentsMarkup(message) {
   if (!attachments.length) return "";
   return `<div class="qq-message-attachments">${attachments.map((item) => {
     const type = String(item.type || "file");
-    const name = String(item.name || (type === "image" ? "图片" : "文件"));
+    const name = String(item.name || attachmentTypeLabel(type));
     const url = resolveQQMediaUrl(item.url);
     if ((type === "image" || type === "sticker") && url) {
       return `
@@ -453,8 +487,15 @@ function attachmentsMarkup(message) {
           <img class="qq-message-image" src="${esc(url)}" alt="${esc(name)}" loading="lazy" referrerpolicy="no-referrer">
         </a>`;
     }
-    const label = type === "audio" ? "VOICE" : type === "image" || type === "sticker" ? "IMG" : "FILE";
-    const typeText = type === "audio" ? "语音" : type === "sticker" ? "表情包" : type === "image" ? "图片" : "文件";
+    if (type === "video" && url) {
+      return `
+        <video class="qq-message-video" src="${esc(url)}" controls preload="metadata" playsinline aria-label="${esc(name)}"></video>`;
+    }
+    if (type === "audio" && url) {
+      return `<audio class="qq-message-audio" src="${esc(url)}" controls preload="metadata" aria-label="${esc(name)}"></audio>`;
+    }
+    const label = attachmentTypeIcon(type);
+    const typeText = attachmentTypeLabel(type);
     const size = formatAttachmentSize(item.size);
     const body = `
       <span class="qq-attachment-icon">${label}</span>
@@ -466,6 +507,65 @@ function attachmentsMarkup(message) {
       ? `<a class="qq-attachment-card" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${body}</a>`
       : `<div class="qq-attachment-card unavailable">${body}</div>`;
   }).join("")}</div>`;
+}
+
+function attachmentTypeLabel(type) {
+  if (type === "audio") return "语音";
+  if (type === "video") return "视频";
+  if (type === "sticker") return "表情包";
+  if (type === "image") return "图片";
+  return "文件";
+}
+
+function attachmentTypeIcon(type) {
+  if (type === "audio") return "VOICE";
+  if (type === "video") return "VIDEO";
+  if (type === "sticker") return "STK";
+  if (type === "image") return "IMG";
+  return "FILE";
+}
+
+function renderPendingAttachments() {
+  if (!elements.pending) return;
+  elements.pending.hidden = !pendingAttachments.length;
+  elements.pending.innerHTML = pendingAttachments.map((item) => {
+    const type = String(item.type || "file");
+    const url = resolveQQMediaUrl(item.url);
+    const name = String(item.name || attachmentTypeLabel(type));
+    const thumb = (type === "image" || type === "sticker") && url
+      ? `<img class="qq-pending-thumb" src="${esc(url)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+      : `<span class="qq-pending-thumb">${attachmentTypeIcon(type)}</span>`;
+    return `
+      <div class="qq-pending-item" title="${esc(name)}">
+        ${thumb}
+        <span class="qq-pending-copy">
+          <strong>${esc(name)}</strong>
+          <small>${esc(item.source_label || attachmentTypeLabel(type))}${item.size ? ` · ${esc(formatAttachmentSize(item.size))}` : ""}</small>
+        </span>
+        <button class="qq-pending-remove" type="button" data-remove-attachment="${esc(item.library_id)}" aria-label="移除 ${esc(name)}">×</button>
+      </div>`;
+  }).join("");
+  updateMessageCount();
+}
+
+function addPendingAttachment(item) {
+  if (!item?.library_id || !item?.url) return false;
+  if (pendingAttachments.some((entry) => entry.library_id === item.library_id)) return true;
+  if (pendingAttachments.length >= 10) {
+    setError("一条消息最多发送 10 个附件");
+    return false;
+  }
+  pendingAttachments.push({...item});
+  setError("");
+  renderPendingAttachments();
+  updateComposer();
+  return true;
+}
+
+function removePendingAttachment(libraryId) {
+  pendingAttachments = pendingAttachments.filter((item) => item.library_id !== libraryId);
+  renderPendingAttachments();
+  updateComposer();
 }
 
 function visibleMessageContent(content) {
@@ -548,26 +648,261 @@ async function loadHistory(showLoading = true) {
   }
 }
 
+function updateUploadProgress(text, value = 0) {
+  const visible = uploadingCount > 0;
+  elements.uploadProgress.hidden = !visible;
+  if (!visible) return;
+  elements.uploadProgressText.textContent = text;
+  elements.uploadProgressBar.value = Math.max(0, Math.min(100, value));
+}
+
+async function uploadOneFile(file) {
+  const instanceId = currentInstanceId;
+  const init = await api(`/instances/${instanceId}/api/admin/qq-web/uploads/init`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      name: file.name,
+      size: file.size,
+      mime_type: file.type || "application/octet-stream",
+    }),
+  });
+  const chunkSize = Number(init.chunk_size) || (4 * 1024 * 1024);
+  const totalChunks = Number(init.total_chunks) || 1;
+  for (let index = 0; index < totalChunks; index += 1) {
+    const start = index * chunkSize;
+    const blob = file.slice(start, Math.min(file.size, start + chunkSize));
+    await api(
+      `/instances/${instanceId}/api/admin/qq-web/uploads/${encodeURIComponent(init.upload_id)}/chunks/${index}`,
+      {
+        method: "POST",
+        headers: {"Content-Type": "application/octet-stream"},
+        body: blob,
+      }
+    );
+    currentFileProgress = totalChunks ? (index + 1) / totalChunks : 1;
+    const completedUnits = uploadQueueDone + currentFileProgress;
+    updateUploadProgress(
+      `正在上传 ${file.name} · ${uploadQueueDone + 1}/${uploadQueueTotal}`,
+      uploadQueueTotal ? (completedUnits / uploadQueueTotal) * 100 : 0,
+    );
+  }
+  const completed = await api(
+    `/instances/${instanceId}/api/admin/qq-web/uploads/${encodeURIComponent(init.upload_id)}/complete`,
+    {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: "{}",
+    }
+  );
+  return completed.item;
+}
+
+async function uploadFiles(fileList) {
+  const files = Array.from(fileList || []).filter(Boolean);
+  if (!files.length || !currentTarget?.can_send || !currentInstanceId || !instanceOnline()) {
+    if (!currentTarget?.can_send) setError("请先选择一个可以发送消息的好友或群聊");
+    return;
+  }
+  const targetKey = `${currentTarget.kind}:${currentTarget.id}`;
+  const slots = Math.max(0, 10 - pendingAttachments.length);
+  const accepted = files.slice(0, slots);
+  if (files.length > accepted.length) {
+    setError("一条消息最多发送 10 个附件，多出的文件已忽略");
+  }
+  if (!accepted.length) return;
+  uploadingCount = accepted.length;
+  uploadQueueTotal = accepted.length;
+  uploadQueueDone = 0;
+  currentFileProgress = 0;
+  updateComposer();
+  renderPendingAttachments();
+  updateUploadProgress(`准备上传 · 0/${uploadQueueTotal}`, 0);
+  try {
+    for (const file of accepted) {
+      if (`${currentTarget?.kind}:${currentTarget?.id}` !== targetKey) {
+        setError("发送对象已切换，上传完成的文件只保存在素材库，未加入当前消息");
+        break;
+      }
+      try {
+        const item = await uploadOneFile(file);
+        if (`${currentTarget?.kind}:${currentTarget?.id}` === targetKey) {
+          addPendingAttachment(item);
+        }
+        if (elements.libraryDialog.open) await loadLibrary(false);
+      } catch (error) {
+        setError(`${file.name} 上传失败：${error.message}`);
+      } finally {
+        uploadQueueDone += 1;
+        currentFileProgress = 0;
+      }
+    }
+  } finally {
+    uploadingCount = 0;
+    uploadQueueTotal = 0;
+    uploadQueueDone = 0;
+    currentFileProgress = 0;
+    updateUploadProgress("", 0);
+    elements.uploadProgress.hidden = true;
+    updateComposer();
+    renderPendingAttachments();
+  }
+}
+
+function chooseLocalFiles() {
+  if (!currentTarget?.can_send || !instanceOnline() || sending || uploadingCount) return;
+  elements.fileInput.click();
+}
+
+function libraryItemMatches(item) {
+  const query = elements.librarySearch.value.trim().toLowerCase();
+  const searchable = [
+    item.name,
+    item.category,
+    item.summary,
+    item.source_label,
+    item.type,
+    item.mime_type,
+  ].join(" ").toLowerCase();
+  if (query && !searchable.includes(query)) return false;
+  if (libraryFilter === "all") return true;
+  if (libraryFilter === "upload" || libraryFilter === "generated" || libraryFilter === "sticker") {
+    return item.source === libraryFilter;
+  }
+  if (libraryFilter === "image") return item.type === "image";
+  if (libraryFilter === "video") return item.type === "video";
+  if (libraryFilter === "file") return item.type === "file";
+  return true;
+}
+
+function libraryPreviewMarkup(item) {
+  const type = String(item.type || "file");
+  const url = resolveQQMediaUrl(item.url);
+  if ((type === "image" || type === "sticker") && url) {
+    return `<img src="${esc(url)}" alt="" loading="lazy" referrerpolicy="no-referrer">`;
+  }
+  if (type === "video" && url) {
+    return `<video src="${esc(url)}" muted preload="metadata" playsinline></video>`;
+  }
+  return `<span class="qq-library-kind">${attachmentTypeIcon(type)}</span>`;
+}
+
+function libraryCardMarkup(item) {
+  const selected = pendingAttachments.some((entry) => entry.library_id === item.library_id);
+  const name = String(item.name || attachmentTypeLabel(item.type));
+  const size = formatAttachmentSize(item.size);
+  const meta = [item.source_label || attachmentTypeLabel(item.type), size].filter(Boolean).join(" · ");
+  const deleteButton = item.source === "upload"
+    ? `<button class="qq-library-delete" type="button" data-delete-library="${esc(item.library_id)}" title="从站内素材库删除">删除</button>`
+    : "";
+  return `
+    <article class="qq-library-card ${selected ? "selected" : ""}">
+      <button class="qq-library-select" type="button" data-select-library="${esc(item.library_id)}" title="${esc(name)}">
+        <span class="qq-library-preview">${libraryPreviewMarkup(item)}</span>
+        <span class="qq-library-card-copy">
+          <strong>${esc(name)}</strong>
+          <small>${esc(meta)}</small>
+        </span>
+      </button>
+      ${deleteButton}
+    </article>`;
+}
+
+function renderLibrary() {
+  if (libraryLoading) {
+    elements.libraryGrid.innerHTML = `<div class="qq-library-empty">正在读取素材库…</div>`;
+    return;
+  }
+  const visible = libraryItems.filter(libraryItemMatches);
+  elements.libraryGrid.innerHTML = visible.length
+    ? visible.map(libraryCardMarkup).join("")
+    : `<div class="qq-library-empty">这个分类里还没有可用素材。可以上传本机文件，或先在机器人里收藏表情包。</div>`;
+  elements.libraryCount.textContent = `已选 ${pendingAttachments.length} 个 · 显示 ${visible.length}/${libraryItems.length}`;
+}
+
+async function loadLibrary(showLoading = true) {
+  if (!currentInstanceId || libraryLoading) return;
+  libraryLoading = true;
+  elements.libraryMessage.textContent = "";
+  if (showLoading) renderLibrary();
+  try {
+    const data = await api(`/instances/${currentInstanceId}/api/admin/qq-web/library?limit=500`);
+    libraryItems = Array.isArray(data.items) ? data.items : [];
+  } catch (error) {
+    libraryItems = [];
+    elements.libraryMessage.textContent = error.message || "素材库读取失败";
+  } finally {
+    libraryLoading = false;
+    renderLibrary();
+  }
+}
+
+async function openLibrary() {
+  if (!currentTarget?.can_send) {
+    setError("请先选择一个可以发送消息的好友或群聊");
+    return;
+  }
+  if (typeof elements.libraryDialog.showModal === "function") {
+    elements.libraryDialog.showModal();
+  } else {
+    elements.libraryDialog.setAttribute("open", "");
+  }
+  await loadLibrary(true);
+}
+
+function closeLibrary() {
+  if (typeof elements.libraryDialog.close === "function") elements.libraryDialog.close();
+  else elements.libraryDialog.removeAttribute("open");
+}
+
+async function deleteLibraryUpload(item) {
+  if (item?.source !== "upload") return;
+  if (!window.confirm(`从站内素材库永久删除“${item.name}”？已经发送到 QQ 的消息不受影响。`)) return;
+  try {
+    await api(`/instances/${currentInstanceId}/api/admin/qq-web/media-library/${item.id}`, {
+      method: "DELETE",
+    });
+    removePendingAttachment(item.library_id);
+    await loadLibrary(false);
+  } catch (error) {
+    elements.libraryMessage.textContent = error.message || "删除失败";
+  }
+}
+
 async function sendMessage(event) {
   event?.preventDefault();
-  if (sending || !currentTarget?.can_send) return;
+  if (sending || uploadingCount || !currentTarget?.can_send) return;
   const text = elements.input.value.trim();
-  if (!text) return;
+  const attachments = pendingAttachments.map((item) => item.library_id);
+  if (!text && !attachments.length) return;
   sending = true;
   setError("");
   updateComposer();
   elements.send.textContent = "发送中…";
   try {
-    const data = await api(`/api/instances/${currentInstanceId}/qq-web/send`, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        target_type: currentTarget.target_type,
-        target_id: currentTarget.id,
-        message: text,
-      }),
-    });
+    const data = attachments.length
+      ? await api(`/instances/${currentInstanceId}/api/admin/qq-web/send-attachments`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            target_type: currentTarget.target_type,
+            target_id: currentTarget.id,
+            message: text,
+            attachments,
+          }),
+        })
+      : await api(`/api/instances/${currentInstanceId}/qq-web/send`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            target_type: currentTarget.target_type,
+            target_id: currentTarget.id,
+            message: text,
+          }),
+        });
     elements.input.value = "";
+    pendingAttachments = [];
+    renderPendingAttachments();
     updateMessageCount();
     const divider = elements.messages.querySelector(".qq-day-divider");
     const empty = elements.messages.querySelector(".qq-empty-state");
@@ -585,6 +920,7 @@ async function sendMessage(event) {
     elements.send.textContent = "发送到 QQ";
     updateComposer();
     elements.input.focus();
+    if (elements.libraryDialog.open && libraryItems.length && !pendingAttachments.length) renderLibrary();
   }
 }
 
@@ -592,14 +928,16 @@ function autoResizeInput() {
   elements.input.style.height = "auto";
   elements.input.style.height = `${Math.min(elements.input.scrollHeight, 180)}px`;
   updateMessageCount();
+  updateComposer();
 }
 
 function updateMessageCount() {
-  elements.count.textContent = `${elements.input.value.length} / 20000`;
+  const attachmentText = pendingAttachments.length ? ` · ${pendingAttachments.length} 个附件` : "";
+  elements.count.textContent = `${elements.input.value.length} / 20000${attachmentText}`;
 }
 
 async function switchInstance(instanceId) {
-  if (sending) {
+  if (sending || uploadingCount) {
     elements.instance.value = String(currentInstanceId);
     return;
   }
@@ -618,6 +956,74 @@ document.querySelector("#qq-refresh-contacts").addEventListener("click", () => {
 });
 elements.search.addEventListener("input", renderContacts);
 elements.form.addEventListener("submit", sendMessage);
+elements.attach.addEventListener("click", () => {
+  openLibrary().catch((error) => setError(error.message));
+});
+elements.pending.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-remove-attachment]");
+  if (!button) return;
+  removePendingAttachment(button.dataset.removeAttachment);
+});
+elements.fileInput.addEventListener("change", () => {
+  const files = Array.from(elements.fileInput.files || []);
+  elements.fileInput.value = "";
+  uploadFiles(files).catch((error) => setError(error.message));
+});
+elements.form.addEventListener("dragover", (event) => {
+  if (!event.dataTransfer?.types?.includes("Files")) return;
+  event.preventDefault();
+  elements.form.classList.add("dragging");
+});
+elements.form.addEventListener("dragleave", (event) => {
+  if (!event.relatedTarget || !elements.form.contains(event.relatedTarget)) {
+    elements.form.classList.remove("dragging");
+  }
+});
+elements.form.addEventListener("drop", (event) => {
+  if (!event.dataTransfer?.files?.length) return;
+  event.preventDefault();
+  elements.form.classList.remove("dragging");
+  uploadFiles(event.dataTransfer.files).catch((error) => setError(error.message));
+});
+elements.form.addEventListener("paste", (event) => {
+  const files = Array.from(event.clipboardData?.files || []);
+  if (!files.length) return;
+  event.preventDefault();
+  uploadFiles(files).catch((error) => setError(error.message));
+});
+elements.libraryUpload.addEventListener("click", chooseLocalFiles);
+elements.libraryClose.addEventListener("click", closeLibrary);
+elements.libraryDone.addEventListener("click", closeLibrary);
+elements.libraryDialog.addEventListener("click", (event) => {
+  if (event.target === elements.libraryDialog) closeLibrary();
+});
+elements.librarySearch.addEventListener("input", renderLibrary);
+elements.libraryTabs.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-filter]");
+  if (!button) return;
+  libraryFilter = button.dataset.filter || "all";
+  for (const tab of elements.libraryTabs.querySelectorAll("button[data-filter]")) {
+    tab.classList.toggle("active", tab === button);
+  }
+  renderLibrary();
+});
+elements.libraryGrid.addEventListener("click", (event) => {
+  const deleteButton = event.target.closest("[data-delete-library]");
+  if (deleteButton) {
+    const item = libraryItems.find((entry) => entry.library_id === deleteButton.dataset.deleteLibrary);
+    deleteLibraryUpload(item).catch((error) => {
+      elements.libraryMessage.textContent = error.message;
+    });
+    return;
+  }
+  const selectButton = event.target.closest("[data-select-library]");
+  if (!selectButton) return;
+  const item = libraryItems.find((entry) => entry.library_id === selectButton.dataset.selectLibrary);
+  if (item) {
+    addPendingAttachment(item);
+    renderLibrary();
+  }
+});
 elements.reload.addEventListener("click", () => {
   loadHistory().catch((error) => setError(error.message));
 });
@@ -634,12 +1040,13 @@ document.querySelector("#chat-logout").addEventListener("click", async () => {
 });
 
 pollTimer = setInterval(() => {
-  if (document.hidden || sending || loadingHistory || !currentTarget?.can_send) return;
+  if (document.hidden || sending || uploadingCount || loadingHistory || !currentTarget?.can_send) return;
   loadHistory(false).catch(() => {});
 }, 15000);
 window.addEventListener("beforeunload", () => clearInterval(pollTimer));
 
 autoResizeInput();
+renderPendingAttachments();
 Promise.all([loadMe(), loadInstances()])
   .catch((error) => {
     elements.messages.innerHTML = "";

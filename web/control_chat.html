@@ -118,12 +118,19 @@
           <strong id="qq-send-target">尚未选择</strong>
           <span id="qq-send-relation"></span>
         </div>
+        <div id="qq-pending-attachments" class="qq-pending-attachments" hidden></div>
+        <div id="qq-upload-progress" class="qq-upload-progress" hidden>
+          <span id="qq-upload-progress-text">正在上传…</span>
+          <progress id="qq-upload-progress-bar" value="0" max="100"></progress>
+        </div>
         <div class="qq-compose-row">
+          <button id="qq-attach-button" class="qq-attach-button" type="button" title="添加表情包或文件" aria-label="添加表情包或文件" disabled>＋</button>
           <textarea id="qq-message-input" rows="2" maxlength="20000" placeholder="选择联系人后输入消息。Enter 发送，Shift+Enter 换行" disabled aria-label="QQ 消息内容"></textarea>
           <button id="qq-send-button" type="submit" disabled>发送到 QQ</button>
         </div>
+        <input id="qq-file-input" type="file" multiple hidden>
         <div class="qq-compose-foot">
-          <span id="qq-compose-hint">消息不会经过模型改写</span>
+          <span id="qq-compose-hint">消息不会经过模型改写 · 可拖入或粘贴文件</span>
           <span id="qq-message-count">0 / 20000</span>
         </div>
         <p id="qq-error" class="chat-error" role="alert"></p>
@@ -131,6 +138,41 @@
     </section>
   </main>
 
-  <script src="/portal/chat.js?v=20261119-qqconsole1"></script>
+  <dialog id="qq-library-dialog" class="qq-library-dialog" aria-labelledby="qq-library-title">
+    <div class="qq-library-shell">
+      <header class="qq-library-head">
+        <div>
+          <span>QQ 附件</span>
+          <h2 id="qq-library-title">素材库</h2>
+          <p>选择站内已有文件，或从本机上传后一起发送。</p>
+        </div>
+        <button id="qq-library-close" class="qq-library-close" type="button" aria-label="关闭素材库">×</button>
+      </header>
+      <div class="qq-library-tools">
+        <button id="qq-library-upload" type="button">上传本机文件</button>
+        <label class="qq-library-search">
+          <span>搜索</span>
+          <input id="qq-library-search" type="search" placeholder="文件名、表情含义…" autocomplete="off">
+        </label>
+      </div>
+      <nav id="qq-library-tabs" class="qq-library-tabs" aria-label="素材分类">
+        <button type="button" class="active" data-filter="all">全部</button>
+        <button type="button" data-filter="image">图片</button>
+        <button type="button" data-filter="video">视频</button>
+        <button type="button" data-filter="sticker">表情包</button>
+        <button type="button" data-filter="upload">上传文件</button>
+        <button type="button" data-filter="generated">生成文件</button>
+        <button type="button" data-filter="file">其他文件</button>
+      </nav>
+      <div id="qq-library-grid" class="qq-library-grid"></div>
+      <p id="qq-library-message" class="qq-library-message" role="status"></p>
+      <footer class="qq-library-foot">
+        <span id="qq-library-count">0 个素材</span>
+        <button id="qq-library-done" type="button">完成</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <script src="/portal/chat.js?v=20261119-qq-attachments1"></script>
 </body>
 </html>

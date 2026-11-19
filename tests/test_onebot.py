@@ -213,6 +213,35 @@ async def test_image_only_sticker_is_sent_as_image_segment() -> None:
 
 
 @pytest.mark.asyncio
+async def test_video_is_sent_as_video_segment() -> None:
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"status": "ok", "retcode": 0, "data": {"message_id": 1}},
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await client.send_video(
+            ReplyTarget("private", 123),
+            "/tmp/demo.mp4",
+        )
+    finally:
+        await client.close()
+
+    assert captured["message"] == [
+        {"type": "video", "data": {"file": "/tmp/demo.mp4"}}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_saved_sticker_uses_local_file_instead_of_expired_url(
     tmp_path,
 ) -> None:

@@ -2405,6 +2405,9 @@ async def _proxy_instance_admin_request(
     content_type = request.headers.get("content-type")
     if content_type:
         headers["Content-Type"] = content_type
+    for header_name in ("Range", "If-Range"):
+        if request.headers.get(header_name):
+            headers[header_name] = request.headers[header_name]
     body = await request.body()
     client = httpx.AsyncClient(timeout=300, trust_env=False)
     try:

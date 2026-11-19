@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     max_tts_chars: int = 800
     media_send_enabled: bool = True
     generated_media_dir: Path = Path("data/generated")
+    qq_media_dir: Path = Path("data/qq_media")
+    qq_media_chunk_bytes: int = 4 * 1024 * 1024
+    qq_media_max_upload_bytes: int = 0
+    qq_media_upload_session_hours: int = 24
     auto_sticker_enabled: bool = True
     sticker_model: str = "qwen3.8-flash"
     sticker_min_confidence: float = 0.45

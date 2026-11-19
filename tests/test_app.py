@@ -104,6 +104,7 @@ class FakeOneBotClient:
         self.poked: list[ReplyTarget] = []
         self.quoted_sender_id: int | None = 999
         self.images: list[tuple[ReplyTarget, str]] = []
+        self.videos: list[tuple[ReplyTarget, str]] = []
         self.records: list[tuple[ReplyTarget, str]] = []
         self.stickers: list[tuple[ReplyTarget, StickerSource]] = []
         self.files: list[tuple[ReplyTarget, str, str]] = []
@@ -196,6 +197,9 @@ class FakeOneBotClient:
 
     async def send_image(self, target: ReplyTarget, image: str) -> None:
         self.images.append((target, image))
+
+    async def send_video(self, target: ReplyTarget, video: str) -> None:
+        self.videos.append((target, video))
 
     async def send_record(self, target: ReplyTarget, record: str) -> None:
         self.records.append((target, record))
@@ -389,6 +393,7 @@ def make_settings(tmp_path, **overrides) -> Settings:
         "onebot_token": SecretStr("test-secret"),
         "llm_model": "fake-model",
         "database_path": tmp_path / "bot.db",
+        "qq_media_dir": tmp_path / "qq-media",
         "private_allowlist": "",
         "enable_group": False,
         "vector_memory_enabled": False,
@@ -4148,4 +4153,144 @@ async def _wait_for_condition(predicate, timeout: float = 1.0) -> None:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("condition was not met before timeout")
         await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_qq_web_uploads_and_sends_stored_media_by_type(tmp_path) -> None:
+    sender = FakeOneBotClient()
+    sender.friends = [
+        {
+            "user_id": 123,
+            "nickname": "Aloha",
+            "display_name": "Aloha",
+        }
+    ]
+    sticker_asset_store = StickerAssetStore(tmp_path / "sticker-assets")
+    sticker_store = StickerStore(
+        tmp_path / "stickers.db",
+        asset_dir=sticker_asset_store.asset_dir,
+    )
+    sticker_file = tmp_path / "sticker.png"
+    Image.new("RGB", (8, 8), (240, 80, 60)).save(sticker_file)
+    sticker_id = sticker_store.record(
+        StickerSource(summary="无语", image_source=str(sticker_file))
+    )
+    assert sticker_id is not None
+    stored_sticker = await sticker_asset_store.persist(str(sticker_file))
+    sticker_store.attach_asset(
+        sticker_id,
+        local_path=stored_sticker.path,
+        sha256=stored_sticker.sha256,
+        mime_type=stored_sticker.mime_type,
+    )
+    memory = ChatMemory(tmp_path / "memory.db")
+    app = create_app(
+        settings=make_settings(tmp_path),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=memory,
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+        sticker_store=sticker_store,
+        sticker_asset_store=sticker_asset_store,
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async def upload(client, name: str, content: bytes, mime_type: str):
+        initialized = await client.post(
+            "/api/admin/qq-web/uploads/init",
+            json={"name": name, "size": len(content), "mime_type": mime_type},
+        )
+        assert initialized.status_code == 200
+        details = initialized.json()
+        for index in range(details["total_chunks"]):
+            start = index * details["chunk_size"]
+            chunk = content[start : start + details["chunk_size"]]
+            response = await client.post(
+                (
+                    f"/api/admin/qq-web/uploads/{details['upload_id']}"
+                    f"/chunks/{index}"
+                ),
+                content=chunk,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            assert response.status_code == 200
+        completed = await client.post(
+            f"/api/admin/qq-web/uploads/{details['upload_id']}/complete"
+        )
+        assert completed.status_code == 200
+        return completed.json()["item"]
+
+    image_buffer = BytesIO()
+    Image.new("RGB", (12, 12), (30, 120, 220)).save(
+        image_buffer,
+        format="PNG",
+    )
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        image_item = await upload(
+            client,
+            "截图.png",
+            image_buffer.getvalue(),
+            "image/png",
+        )
+        video_item = await upload(
+            client,
+            "演示.mp4",
+            b"fake-mp4-video",
+            "video/mp4",
+        )
+        archive_item = await upload(
+            client,
+            "资料.zip",
+            b"PK\x03\x04fake-zip",
+            "application/zip",
+        )
+        library = await client.get("/api/admin/qq-web/library")
+        sent = await client.post(
+            "/api/admin/qq-web/send-attachments",
+            json={
+                "target_type": "private",
+                "target_id": 123,
+                "message": "这些是附件",
+                "attachments": [
+                    image_item["library_id"],
+                    video_item["library_id"],
+                    archive_item["library_id"],
+                    f"sticker:{sticker_id}",
+                ],
+            },
+        )
+        image_response = await client.get(image_item["url"])
+
+    assert library.status_code == 200
+    library_payload = library.json()
+    assert {item["source"] for item in library_payload["items"]} == {
+        "upload",
+        "sticker",
+    }
+    assert library_payload["counts"]["upload"] == 3
+    assert sent.status_code == 200
+    assert [item["type"] for item in sent.json()["message"]["attachments"]] == [
+        "image",
+        "video",
+        "file",
+        "sticker",
+    ]
+    assert sender.sent == [(ReplyTarget("private", 123), "这些是附件")]
+    assert len(sender.images) == 1
+    assert Path(sender.images[0][1]).read_bytes() == image_buffer.getvalue()
+    assert len(sender.videos) == 1
+    assert Path(sender.videos[0][1]).read_bytes() == b"fake-mp4-video"
+    assert len(sender.files) == 1
+    assert sender.files[0][2] == "资料.zip"
+    assert len(sender.stickers) == 1
+    assert image_response.status_code == 200
+    assert image_response.content == image_buffer.getvalue()
+    archived = memory.archived_messages(conversation_id="private:123")
+    assert "截图.png" in archived[-1]["content"]
+    assert "资料.zip" in archived[-1]["content"]
 

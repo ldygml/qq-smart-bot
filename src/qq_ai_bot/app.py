@@ -111,6 +111,7 @@ from .quality import (
     reply_scope_key,
 )
 from .qq_format import format_qq_text
+from .qq_media import QQMediaError, QQMediaStore, media_kind_for
 from .ratelimit import SlidingWindowRateLimiter
 from .security import request_is_authorized
 from .shared_memory import (
@@ -312,6 +313,7 @@ def create_app(
     presence_store: PresenceStore | None = None,
     trace_store: MessageTraceStore | None = None,
     generation_store: GenerationStore | None = None,
+    qq_media_store: QQMediaStore | None = None,
     group_file_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     config = settings or Settings()
@@ -336,6 +338,16 @@ def create_app(
     store = memory or ChatMemory(config.database_path)
     generation_journal = generation_store or GenerationStore(
         config.database_path
+    )
+    media_dir = config.qq_media_dir
+    if not media_dir.is_absolute():
+        media_dir = Path.cwd() / media_dir
+    qq_media = qq_media_store or QQMediaStore(
+        config.database_path,
+        media_dir,
+        chunk_bytes=config.qq_media_chunk_bytes,
+        max_upload_bytes=config.qq_media_max_upload_bytes,
+        session_hours=config.qq_media_upload_session_hours,
     )
     usage = UsageStore(config.database_path)
     quality = quality_store or QualityStore(config.database_path)
@@ -675,6 +687,7 @@ def create_app(
     app.state.memory = store
     app.state.stickers = stickers
     app.state.sticker_assets = sticker_assets
+    app.state.qq_media = qq_media
 
     @app.middleware("http")
     async def protect_admin_routes(request: Request, call_next):
@@ -1024,6 +1037,188 @@ def create_app(
         )
         return result
 
+    def _qq_web_generated_url(record: Any, *, inline: bool = False) -> str:
+        suffix = "?inline=1" if inline else ""
+        return f"/api/admin/generated/{quote(record.file_name, safe='')}{suffix}"
+
+    def _qq_web_media_library(limit: int = 300) -> dict[str, Any]:
+        safe_limit = max(1, min(1000, int(limit)))
+        items: list[dict[str, Any]] = []
+        counts = {
+            "upload": 0,
+            "sticker": 0,
+            "generated": 0,
+            "total": 0,
+        }
+
+        for media in qq_media.list_items(limit=safe_limit):
+            if qq_media.path_for(media) is None:
+                continue
+            item = media.to_dict()
+            item["url"] = (
+                f"/api/admin/qq-web/uploads/{media.id}/asset"
+            )
+            item["source_label"] = "网站上传"
+            items.append(item)
+            counts["upload"] += 1
+
+        for sticker in stickers.list_recent(limit=safe_limit):
+            if not sticker.get("has_local_asset"):
+                continue
+            items.append(
+                {
+                    "library_id": f"sticker:{int(sticker['id'])}",
+                    "source": "sticker",
+                    "source_label": "表情包",
+                    "id": int(sticker["id"]),
+                    "name": str(sticker.get("summary") or "表情包")[:240],
+                    "mime_type": str(sticker.get("mime_type") or ""),
+                    "size": 0,
+                    "type": "sticker",
+                    "url": str(sticker.get("asset_url") or ""),
+                    "category": str(sticker.get("category") or ""),
+                    "created_at": str(sticker.get("seen_at") or ""),
+                }
+            )
+            counts["sticker"] += 1
+
+        for record in generation_journal.list(limit=safe_limit):
+            if record.status != "ready":
+                continue
+            path = _generated_file_path(record.file_name)
+            if path is None:
+                continue
+            mime_type = mimetypes.guess_type(record.display_name)[0] or (
+                mimetypes.guess_type(path.name)[0]
+                or "application/octet-stream"
+            )
+            kind = media_kind_for(record.display_name, mime_type)
+            items.append(
+                {
+                    "library_id": f"generated:{record.id}",
+                    "source": "generated",
+                    "source_label": "生成文件",
+                    "id": record.id,
+                    "name": record.display_name or path.name,
+                    "mime_type": mime_type,
+                    "size": path.stat().st_size,
+                    "type": kind,
+                    "url": _qq_web_generated_url(
+                        record,
+                        inline=kind in {"image", "video", "audio"},
+                    ),
+                    "summary": record.summary,
+                    "created_at": record.completed_at or record.created_at,
+                }
+            )
+            counts["generated"] += 1
+
+        items.sort(
+            key=lambda item: (
+                str(item.get("created_at") or ""),
+                str(item.get("library_id") or ""),
+            ),
+            reverse=True,
+        )
+        counts["total"] = len(items)
+        return {
+            "ok": True,
+            "items": items,
+            "counts": counts,
+            "limits": {
+                "max_attachments_per_message": 10,
+                "chunk_bytes": config.qq_media_chunk_bytes,
+                "max_upload_bytes": config.qq_media_max_upload_bytes,
+            },
+        }
+
+    def _resolve_qq_web_library_item(library_id: str) -> dict[str, Any]:
+        match = re.fullmatch(
+            r"(upload|sticker|generated):(\d+)",
+            str(library_id or "").strip(),
+        )
+        if match is None:
+            raise QQMediaError("附件标识无效")
+        source, raw_id = match.groups()
+        item_id = int(raw_id)
+        if source == "upload":
+            media = qq_media.get(item_id)
+            path = qq_media.path_for(media) if media is not None else None
+            if media is None or path is None:
+                raise QQMediaError("网站上传的文件已被删除")
+            return {
+                "library_id": f"upload:{media.id}",
+                "source": "upload",
+                "id": media.id,
+                "path": path,
+                "name": media.original_name,
+                "mime_type": media.mime_type,
+                "type": media.kind,
+                "size": media.size,
+                "url": f"/api/admin/qq-web/uploads/{media.id}/asset",
+                "media": media,
+            }
+        if source == "sticker":
+            metadata = stickers.get_metadata(item_id)
+            path = stickers.local_asset_path(item_id)
+            if (
+                metadata is None
+                or path is None
+                or not sticker_assets.contains(path)
+            ):
+                raise QQMediaError("这个表情包没有可发送的本地图片")
+            return {
+                "library_id": f"sticker:{item_id}",
+                "source": "sticker",
+                "id": item_id,
+                "path": path,
+                "name": str(metadata.get("summary") or "表情包"),
+                "mime_type": str(metadata.get("mime_type") or ""),
+                "type": "sticker",
+                "size": path.stat().st_size,
+                "url": f"/api/admin/stickers/{item_id}/asset",
+                "metadata": metadata,
+            }
+        record = generation_journal.get(item_id)
+        path = (
+            _generated_file_path(record.file_name)
+            if record is not None and record.status == "ready"
+            else None
+        )
+        if record is None or path is None:
+            raise QQMediaError("生成文件已被删除或尚未完成")
+        mime_type = mimetypes.guess_type(record.display_name)[0] or (
+            mimetypes.guess_type(path.name)[0]
+            or "application/octet-stream"
+        )
+        kind = media_kind_for(record.display_name, mime_type)
+        return {
+            "library_id": f"generated:{record.id}",
+            "source": "generated",
+            "id": record.id,
+            "path": path,
+            "name": record.display_name or path.name,
+            "mime_type": mime_type,
+            "type": kind,
+            "size": path.stat().st_size,
+            "url": _qq_web_generated_url(
+                record,
+                inline=kind in {"image", "video", "audio"},
+            ),
+            "record": record,
+        }
+
+    def _qq_web_attachment_payload(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "library_id": str(item["library_id"]),
+            "source": str(item["source"]),
+            "type": str(item["type"]),
+            "name": str(item["name"])[:240],
+            "mime_type": str(item.get("mime_type") or ""),
+            "size": int(item.get("size") or 0),
+            "url": str(item.get("url") or ""),
+        }
+
     @app.get("/api/admin/qq-web/contacts")
     async def admin_qq_web_contacts() -> dict[str, Any]:
         await _ensure_known_group_profiles()
@@ -1059,6 +1254,106 @@ def create_app(
                 "group_member_note": "同群成员不等于好友，不能直接私聊",
             },
         }
+
+    @app.get("/api/admin/qq-web/library")
+    async def admin_qq_web_library(
+        limit: int = 300,
+    ) -> dict[str, Any]:
+        return _qq_web_media_library(limit=limit)
+
+    @app.post("/api/admin/qq-web/uploads/init")
+    async def admin_qq_web_upload_init(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        try:
+            result = qq_media.init_upload(
+                name=str(payload.get("name") or ""),
+                size=int(payload.get("size") or 0),
+                mime_type=str(payload.get("mime_type") or ""),
+            )
+        except (QQMediaError, TypeError, ValueError) as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, **result})
+
+    @app.post("/api/admin/qq-web/uploads/{upload_id}/chunks/{index}")
+    async def admin_qq_web_upload_chunk(
+        upload_id: str,
+        index: int,
+        request: Request,
+    ) -> JSONResponse:
+        try:
+            result = await qq_media.append_chunk(
+                upload_id,
+                index,
+                request.stream(),
+            )
+        except QQMediaError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        return JSONResponse(result)
+
+    @app.post("/api/admin/qq-web/uploads/{upload_id}/complete")
+    async def admin_qq_web_upload_complete(
+        upload_id: str,
+    ) -> JSONResponse:
+        try:
+            media = await asyncio.to_thread(
+                qq_media.complete_upload,
+                upload_id,
+            )
+        except QQMediaError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        item = media.to_dict()
+        item["source_label"] = "网站上传"
+        item["url"] = f"/api/admin/qq-web/uploads/{media.id}/asset"
+        return JSONResponse({"ok": True, "item": item})
+
+    @app.get("/api/admin/qq-web/uploads/{upload_id}/status")
+    async def admin_qq_web_upload_status(upload_id: str) -> JSONResponse:
+        try:
+            return JSONResponse(
+                {"ok": True, **qq_media.upload_status(upload_id)}
+            )
+        except QQMediaError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=404)
+
+    @app.delete("/api/admin/qq-web/uploads/{upload_id}")
+    async def admin_qq_web_upload_cancel(upload_id: str) -> JSONResponse:
+        removed = qq_media.cancel_upload(upload_id)
+        return JSONResponse(
+            {"ok": removed},
+            status_code=200 if removed else 404,
+        )
+
+    @app.get("/api/admin/qq-web/uploads/{media_id}/asset")
+    async def admin_qq_web_uploaded_asset(media_id: int) -> Response:
+        media = qq_media.get(media_id)
+        path = qq_media.path_for(media) if media is not None else None
+        if media is None or path is None:
+            return JSONResponse(
+                {"detail": "uploaded media not found"},
+                status_code=404,
+            )
+        inline = media.kind in {"image", "video", "audio"}
+        return FileResponse(
+            path,
+            filename=media.original_name,
+            media_type=media.mime_type,
+            content_disposition_type="inline" if inline else "attachment",
+            headers={
+                "Cache-Control": "private, max-age=3600",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @app.delete("/api/admin/qq-web/media-library/{media_id}")
+    async def admin_qq_web_delete_uploaded_media(
+        media_id: int,
+    ) -> JSONResponse:
+        removed = qq_media.delete(media_id)
+        return JSONResponse(
+            {"ok": removed},
+            status_code=200 if removed else 404,
+        )
 
     @app.get("/api/admin/qq-web/group-members")
     async def admin_qq_web_group_members(
@@ -1438,6 +1733,248 @@ def create_app(
                 "timestamp": sent_at,
             },
         }
+
+    @app.post("/api/admin/qq-web/send-attachments")
+    async def admin_qq_web_send_attachments(
+        payload: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        target_type = str(payload.get("target_type") or "").strip()
+        target_id = _optional_int(payload.get("target_id"))
+        message = str(payload.get("message") or "").strip()
+        raw_ids = payload.get("attachments")
+        if not isinstance(raw_ids, list):
+            raw_ids = []
+        attachment_ids = [
+            str(value).strip()
+            for value in raw_ids
+            if str(value).strip()
+        ]
+        deduplicated_ids = list(dict.fromkeys(attachment_ids))
+        if target_type not in {"private", "group"} or target_id is None:
+            return JSONResponse(
+                {"detail": "请选择有效的好友或群聊"},
+                status_code=400,
+            )
+        if not deduplicated_ids:
+            return JSONResponse(
+                {"detail": "请选择至少一个表情包或文件"},
+                status_code=400,
+            )
+        if len(deduplicated_ids) > 10:
+            return JSONResponse(
+                {"detail": "一条消息最多发送 10 个附件"},
+                status_code=400,
+            )
+        if len(message) > 20000:
+            return JSONResponse(
+                {"detail": "消息不能超过 20000 个字符"},
+                status_code=400,
+            )
+
+        target_name = str(target_id)
+        if target_type == "private":
+            try:
+                friends = await _qq_web_friends()
+            except OneBotError as exc:
+                return JSONResponse({"detail": str(exc)}, status_code=502)
+            friend = next(
+                (
+                    item
+                    for item in friends
+                    if int(item["user_id"]) == target_id
+                ),
+                None,
+            )
+            if friend is None:
+                return JSONResponse(
+                    {"detail": "只能私聊机器人真实好友；同群成员不算好友"},
+                    status_code=403,
+                )
+            target_name = str(friend["display_name"])
+            target = ReplyTarget("private", target_id)
+            conversation_id = f"private:{target_id}"
+        else:
+            try:
+                groups = await _qq_web_groups()
+            except OneBotError as exc:
+                return JSONResponse({"detail": str(exc)}, status_code=502)
+            group = next(
+                (
+                    item
+                    for item in groups
+                    if int(item["group_id"]) == target_id
+                ),
+                None,
+            )
+            if group is None:
+                return JSONResponse(
+                    {"detail": "群聊不存在或机器人尚未加入"},
+                    status_code=404,
+                )
+            target_name = str(group["display_name"])
+            target = ReplyTarget("group", target_id, target_id)
+            conversation_id = f"group:{target_id}"
+
+        try:
+            resolved = [
+                _resolve_qq_web_library_item(library_id)
+                for library_id in deduplicated_ids
+            ]
+        except QQMediaError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=404)
+
+        async def send_one(item: dict[str, Any]) -> str:
+            path = Path(item["path"])
+            name = str(item["name"])
+            kind = str(item["type"])
+            if kind == "sticker":
+                sticker = stickers.get_by_id(int(item["id"]))
+                if sticker is None:
+                    raise OneBotError("表情包已被删除")
+                try:
+                    await sender.send_sticker(target, sticker)
+                    return "sticker"
+                except OneBotError:
+                    try:
+                        await sender.send_image(target, str(path))
+                        return "image"
+                    except OneBotError:
+                        await sender.upload_file(
+                            target,
+                            path=str(path),
+                            name=path.name,
+                        )
+                        return "file"
+            if kind == "image":
+                try:
+                    await sender.send_image(target, str(path))
+                    return "image"
+                except OneBotError:
+                    await sender.upload_file(
+                        target,
+                        path=str(path),
+                        name=name,
+                    )
+                    return "file"
+            if kind == "video":
+                send_video = getattr(sender, "send_video", None)
+                if callable(send_video):
+                    try:
+                        await send_video(target, str(path))
+                        return "video"
+                    except OneBotError:
+                        logger.warning(
+                            "Inline QQ video failed; sending as a file",
+                            exc_info=True,
+                        )
+                await sender.upload_file(
+                    target,
+                    path=str(path),
+                    name=name,
+                )
+                return "file"
+            if kind == "audio":
+                try:
+                    await sender.send_record(target, str(path))
+                    return "audio"
+                except OneBotError:
+                    await sender.upload_file(
+                        target,
+                        path=str(path),
+                        name=name,
+                    )
+                    return "file"
+            await sender.upload_file(target, path=str(path), name=name)
+            return "file"
+
+        sent_methods: list[str] = []
+        try:
+            if message:
+                await sender.send_text(target, message)
+            for item in resolved:
+                sent_methods.append(await send_one(item))
+        except OneBotError as exc:
+            return JSONResponse(
+                {
+                    "detail": f"QQ 附件发送失败：{exc}",
+                    "sent_count": len(sent_methods),
+                },
+                status_code=502,
+            )
+
+        for item in resolved:
+            if item["source"] == "upload":
+                qq_media.mark_used(int(item["id"]))
+
+        sent_at = int(time.time())
+        login = await _qq_web_login_info()
+        rendered = [_qq_web_attachment_payload(item) for item in resolved]
+        labels: list[str] = []
+        for item, sent_as in zip(resolved, sent_methods, strict=True):
+            name = str(item["name"])[:160]
+            if sent_as == "sticker":
+                labels.append(f"[表情包:{name}]")
+            elif sent_as == "image":
+                labels.append(f"[图片:{name}]")
+            elif sent_as == "video":
+                labels.append(f"[视频:{name}]")
+            elif sent_as == "audio":
+                labels.append(f"[语音:{name}]")
+            else:
+                labels.append(f"[文件:{name}]")
+        archive_content = "\n".join(part for part in [message, *labels] if part)
+        try:
+            store.archive_message(
+                external_key=(
+                    f"web:{target_type}:{target_id}:{time.time_ns()}:files"
+                ),
+                conversation_id=conversation_id,
+                message_type=target_type,
+                group_id=target_id if target_type == "group" else None,
+                sender_user_id=int(login.get("user_id") or 0),
+                sender_name=str(login.get("nickname") or config.bot_name),
+                role="assistant",
+                content=archive_content,
+                event_time=sent_at,
+                add_to_chat=True,
+                max_rows=config.max_history_rows_per_chat,
+            )
+            if target_type == "group":
+                group_histories.setdefault(
+                    target_id,
+                    deque(maxlen=24),
+                ).append(
+                    GroupMessage(
+                        role="assistant",
+                        sender=config.bot_name,
+                        content=archive_content,
+                    )
+                )
+        except Exception:
+            logger.warning(
+                "Could not archive a web-console attachment message",
+                exc_info=True,
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "target": {
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "display_name": target_name,
+                },
+                "message": {
+                    "role": "assistant",
+                    "content": message,
+                    "sender_name": str(
+                        login.get("nickname") or config.bot_name
+                    ),
+                    "timestamp": sent_at,
+                    "attachments": rendered,
+                },
+                "sent_count": len(rendered),
+            }
+        )
 
     @app.get("/api/admin/people")
     async def admin_people() -> dict[str, Any]:
@@ -8961,6 +9498,16 @@ async def _qq_web_history_attachments(
                 attachment["url"] = url
                 attachment["mime_type"] = mime_type
             attachments.append(attachment)
+        elif segment_type == "video":
+            attachments.append(
+                {
+                    "type": "video",
+                    "name": "视频",
+                    "url": "",
+                    "mime_type": "video/mp4",
+                    "size": 0,
+                }
+            )
         elif segment_type == "file":
             try:
                 size = int(data.get("file_size") or data.get("size") or 0)
