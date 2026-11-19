@@ -393,6 +393,17 @@ class ControlStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_events_created
                 ON audit_events (created_at DESC, id DESC);
+                CREATE TABLE IF NOT EXISTS web_chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    instance_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_web_chat_messages_conversation
+                ON web_chat_messages (user_id, instance_id, id DESC);
                 """
             )
 
@@ -665,6 +676,85 @@ class ControlStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def web_chat_messages(
+        self,
+        user_id: int,
+        instance_id: int,
+        *,
+        limit: int = 120,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM (
+                    SELECT id, role, content, model, created_at
+                    FROM web_chat_messages
+                    WHERE user_id = ? AND instance_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (user_id, instance_id, safe_limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def append_web_chat_message(
+        self,
+        *,
+        user_id: int,
+        instance_id: int,
+        role: str,
+        content: str,
+        model: str = "",
+    ) -> dict[str, Any]:
+        if role not in {"user", "assistant"}:
+            raise ValueError("Invalid web chat role")
+        text = content.strip()
+        if not text:
+            raise ValueError("Web chat message cannot be empty")
+        created_at = _utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO web_chat_messages
+                    (user_id, instance_id, role, content, model, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    instance_id,
+                    role,
+                    text,
+                    model.strip(),
+                    created_at,
+                ),
+            )
+            message_id = int(cursor.lastrowid)
+        return {
+            "id": message_id,
+            "role": role,
+            "content": text,
+            "model": model.strip(),
+            "created_at": created_at,
+        }
+
+    def clear_web_chat_messages(
+        self,
+        user_id: int,
+        instance_id: int,
+    ) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM web_chat_messages
+                WHERE user_id = ? AND instance_id = ?
+                """,
+                (user_id, instance_id),
+            )
+        return int(cursor.rowcount)
+
     def instance(self, instance_id: int, user_id: int) -> sqlite3.Row | None:
         with self._connect() as connection:
             return connection.execute(
@@ -894,6 +984,10 @@ class AuthPayload(BaseModel):
     password: str = Field(min_length=8, max_length=200)
 
 
+class WebChatMessagePayload(BaseModel):
+    message: str = Field(min_length=1, max_length=20000)
+
+
 class BackupPayload(BaseModel):
     passphrase: str = Field(min_length=8, max_length=200)
 
@@ -931,6 +1025,12 @@ def _require_csrf(request: Request, user: sqlite3.Row) -> None:
         str(user["csrf_token"]),
     ):
         raise HTTPException(status_code=403, detail="invalid csrf token")
+
+
+def _web_chat_identity(user: sqlite3.Row) -> tuple[int, str]:
+    user_id = 9_000_000_000 + int(user["id"])
+    display_name = f"{str(user['username'])[:32]}（网页）"
+    return user_id, display_name
 
 
 def _request_is_https(request: Request | None) -> bool:
@@ -1705,6 +1805,17 @@ async def portal_page(request: Request) -> Response:
     )
 
 
+@app.get("/portal/chat")
+async def web_chat_page(request: Request) -> Response:
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if not token or not store.get_session(token):
+        return RedirectResponse("/login")
+    return FileResponse(
+        WEB_ROOT / "control_chat.html",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
 @app.get("/portal/control.css")
 async def control_css() -> FileResponse:
     return FileResponse(
@@ -1717,6 +1828,22 @@ async def control_css() -> FileResponse:
 async def control_js() -> FileResponse:
     return FileResponse(
         WEB_ROOT / "control.js",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@app.get("/portal/chat.css")
+async def chat_css() -> FileResponse:
+    return FileResponse(
+        WEB_ROOT / "control_chat.css",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@app.get("/portal/chat.js")
+async def chat_js() -> FileResponse:
+    return FileResponse(
+        WEB_ROOT / "control_chat.js",
         headers={"Cache-Control": "no-store, max-age=0"},
     )
 
@@ -1845,6 +1972,114 @@ async def instances(request: Request) -> dict[str, Any]:
             for item in store.instances(int(user["id"]))
         ]
     }
+
+
+@app.get("/api/web-chat/{instance_id}")
+async def web_chat_history(
+    instance_id: int,
+    request: Request,
+) -> dict[str, Any]:
+    user = _request_user(request)
+    user_id = int(user["id"])
+    instance = store.instance(instance_id, user_id)
+    if instance is None:
+        raise HTTPException(status_code=404, detail="instance not found")
+    identity_id, identity_name = _web_chat_identity(user)
+    return {
+        "instance": _instance_public(dict(instance)),
+        "messages": store.web_chat_messages(
+            user_id,
+            instance_id,
+            limit=160,
+        ),
+        "identity": {
+            "user_id": identity_id,
+            "display_name": identity_name,
+        },
+    }
+
+
+@app.post("/api/web-chat/{instance_id}")
+async def web_chat_send(
+    instance_id: int,
+    payload: WebChatMessagePayload,
+    request: Request,
+) -> dict[str, Any]:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    user_id = int(user["id"])
+    instance = store.instance(instance_id, user_id)
+    if instance is None:
+        raise HTTPException(status_code=404, detail="instance not found")
+    text = payload.message.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="消息不能为空")
+
+    previous = store.web_chat_messages(user_id, instance_id, limit=40)
+    history = [
+        {"role": str(item["role"]), "content": str(item["content"])}
+        for item in previous
+        if item["role"] in {"user", "assistant"}
+    ][-24:]
+    user_message = store.append_web_chat_message(
+        user_id=user_id,
+        instance_id=instance_id,
+        role="user",
+        content=text,
+    )
+    identity_id, identity_name = _web_chat_identity(user)
+    data = await _instance_admin_json(
+        instance_id,
+        user_id,
+        "/api/admin/conversation-test",
+        method="POST",
+        json_body={
+            "message_type": "private",
+            "user_id": identity_id,
+            "display_name": identity_name,
+            "mentioned": True,
+            "use_memory": True,
+            "remember_exchange": True,
+            "ignore_presence": True,
+            "message": text,
+            "history": history,
+        },
+        timeout=300,
+    )
+    reply_text = str(data.get("reply") or "").strip()
+    assistant_message = None
+    if reply_text:
+        assistant_message = store.append_web_chat_message(
+            user_id=user_id,
+            instance_id=instance_id,
+            role="assistant",
+            content=reply_text,
+            model=str(data.get("model") or ""),
+        )
+    return {
+        "ok": True,
+        "status": str(data.get("status") or "replied"),
+        "reason": str(data.get("reason") or ""),
+        "user_message": user_message,
+        "message": assistant_message,
+        "model": str(data.get("model") or ""),
+        "sources": data.get("sources") or [],
+        "latency_ms": data.get("latency_ms"),
+    }
+
+
+@app.delete("/api/web-chat/{instance_id}")
+async def web_chat_clear(
+    instance_id: int,
+    request: Request,
+) -> dict[str, Any]:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    user_id = int(user["id"])
+    if store.instance(instance_id, user_id) is None:
+        raise HTTPException(status_code=404, detail="instance not found")
+    deleted = store.clear_web_chat_messages(user_id, instance_id)
+    return {"ok": True, "deleted": deleted}
 
 
 @app.post("/api/import-current")
@@ -1982,6 +2217,7 @@ async def _instance_admin_json(
     *,
     method: str = "GET",
     json_body: Any = None,
+    timeout: float = 15,
 ) -> Any:
     instance = store.instance(instance_id, user_id)
     if not instance:
@@ -1991,7 +2227,10 @@ async def _instance_admin_json(
         str(instance["onebot_token_encrypted"])
     )
     try:
-        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+        async with httpx.AsyncClient(
+            timeout=max(1.0, float(timeout)),
+            trust_env=False,
+        ) as client:
             response = await client.request(
                 method,
                 url,

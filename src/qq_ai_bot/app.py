@@ -1716,9 +1716,35 @@ def create_app(
             payload.get("display_name") or "测试用户"
         ).strip()[:40]
         mentioned = bool(payload.get("mentioned", False))
+        remember_exchange = bool(payload.get("remember_exchange", False))
+
+        def schedule_web_memory(reply_text: str) -> None:
+            if not remember_exchange or not reply_text.strip():
+                return
+            event = OneBotEvent(
+                post_type="message",
+                message_type="private",
+                user_id=user_id,
+                time=int(time.time()),
+            )
+            target = ReplyTarget("private", user_id)
+            task = asyncio.create_task(
+                _remember_exchange(
+                    event=event,
+                    target=target,
+                    display_name=display_name,
+                    user_text=text,
+                    assistant_text=reply_text,
+                    extract_memories=True,
+                )
+            )
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+
         if (
             config.presence_enabled
             and presence.is_quiet("global", config.timezone)
+            and not bool(payload.get("ignore_presence", False))
         ):
             return {
                 "ok": True,
@@ -1771,6 +1797,7 @@ def create_app(
                     }
         social_reply = _social_only_reply(text)
         if social_reply is not None:
+            schedule_web_memory(social_reply)
             return {
                 "ok": True,
                 "status": "replied",
@@ -1903,6 +1930,7 @@ def create_app(
             except LLMError as exc:
                 return JSONResponse({"detail": str(exc)}, status_code=502)
             reply = _format_grounded_reply(grounded)
+            schedule_web_memory(reply)
             return {
                 "ok": True,
                 "status": "replied" if grounded.verified else "unverified",
@@ -1950,6 +1978,7 @@ def create_app(
             history=history,
             evidence=memory_context,
         )
+        schedule_web_memory(reply)
         return {
             "ok": True,
             "status": "replied",

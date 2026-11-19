@@ -451,6 +451,120 @@ async def test_control_plane_proxies_evolution_endpoints(
     assert calls[3][2] == "/api/admin/topics?scope_key=user%3A123"
 
 
+@pytest.mark.asyncio
+async def test_web_chat_page_persists_messages_and_uses_history(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = ControlStore(tmp_path / "control.db")
+    user_id = store.create_user("owner", "secure-password")
+    provider_id = store.save_provider(
+        user_id=user_id,
+        provider_id=None,
+        name="provider",
+        provider_type="custom",
+        base_url="https://api.example.com/v1",
+        model="chat",
+        api_key_encrypted="encrypted",
+    )
+    instance_id = store.save_instance(
+        user_id=user_id,
+        instance_id=None,
+        name="网页实例",
+        port=18083,
+        onebot_api_base="http://127.0.0.1:13000",
+        onebot_token_encrypted="encrypted",
+        provider_id=provider_id,
+        database_path="data/test-web-chat.db",
+    )
+    monkeypatch.setattr(control_plane, "store", store)
+    monkeypatch.setattr(control_plane, "secrets_box", SecretBox())
+    monkeypatch.setattr(control_plane, "_instance_status", lambda port: "online")
+    calls = []
+
+    async def fake_instance_admin_json(
+        requested_instance_id,
+        requested_user_id,
+        path,
+        *,
+        method="GET",
+        json_body=None,
+        timeout=15,
+    ):
+        calls.append(
+            (
+                requested_instance_id,
+                requested_user_id,
+                path,
+                method,
+                json_body,
+                timeout,
+            )
+        )
+        return {
+            "ok": True,
+            "status": "replied",
+            "reply": "我在，直接说。",
+            "model": "test-chat",
+            "latency_ms": 42,
+        }
+
+    monkeypatch.setattr(
+        control_plane,
+        "_instance_admin_json",
+        fake_instance_admin_json,
+    )
+    transport = httpx.ASGITransport(app=control_plane.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1:8090",
+    ) as client:
+        login = await client.post(
+            "/api/auth/login",
+            json={"username": "owner", "password": "secure-password"},
+        )
+        csrf = login.json()["csrf_token"]
+        page = await client.get("/portal/chat")
+        assert page.status_code == 200
+        assert "网页聊天" in page.text
+
+        first = await client.post(
+            f"/api/web-chat/{instance_id}",
+            headers={"X-CSRF-Token": csrf},
+            json={"message": "在吗"},
+        )
+        assert first.status_code == 200
+        assert first.json()["message"]["role"] == "assistant"
+        second = await client.post(
+            f"/api/web-chat/{instance_id}",
+            headers={"X-CSRF-Token": csrf},
+            json={"message": "继续"},
+        )
+        assert second.status_code == 200
+        history = await client.get(f"/api/web-chat/{instance_id}")
+        messages = history.json()["messages"]
+        assert [item["role"] for item in messages] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert calls[1][4]["history"] == [
+            {"role": "user", "content": "在吗"},
+            {"role": "assistant", "content": "我在，直接说。"},
+        ]
+        assert calls[0][4]["ignore_presence"] is True
+        assert calls[0][5] == 300
+
+        cleared = await client.delete(
+            f"/api/web-chat/{instance_id}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["deleted"] == 4
+        assert store.web_chat_messages(user_id, instance_id) == []
+
+
 def test_stop_instance_handles_stored_pid_and_listening_port(
     tmp_path,
     monkeypatch,
