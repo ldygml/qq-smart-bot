@@ -123,7 +123,7 @@ class LanguageLearningStore:
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_language_observations_pending
-                ON language_observations (processed, attempts, id ASC)
+                ON language_observations (processed, attempts, id ASC);
                 """
             )
             connection.execute(
@@ -183,8 +183,16 @@ class LanguageLearningStore:
                 )
                 """
             )
+            connection.execute(
+                'DELETE FROM language_profiles WHERE evidence_count < 3'
+            )
+            connection.execute(
+                'CREATE TABLE IF NOT EXISTS language_observation_sources '
+                '(source_key TEXT PRIMARY KEY, observation_id INTEGER NOT NULL)'
+            )
             defaults = {
                 **self._initial_settings,
+                'history_backfilled_at': '',
                 "auto_profile": "true",
                 "last_chat_learned_at": "",
                 "last_web_learned_at": "",
@@ -215,6 +223,7 @@ class LanguageLearningStore:
 
     def set_setting(self, key: str, value: object) -> None:
         allowed = {
+            'history_backfilled_at',
             "enabled",
             "web_learning_enabled",
             "meme_usage_rate",
@@ -242,7 +251,17 @@ class LanguageLearningStore:
         speaker_user_id: int,
         speaker_name: str,
         content: str,
+        source_key: str = '',
     ) -> int | None:
+        clean_source_key = _clean_text(source_key, 200)
+        if clean_source_key:
+            with self._lock, self._connect() as connection:
+                existing = connection.execute(
+                    'SELECT 1 FROM language_observation_sources WHERE source_key = ?',
+                    (clean_source_key,),
+                ).fetchone()
+            if existing is not None:
+                return None
         if scope_type not in {"contact", "group"}:
             return None
         value = _clean_text(content, 2000)
@@ -270,7 +289,13 @@ class LanguageLearningStore:
                     _utc_now(),
                 ),
             )
-            return int(cursor.lastrowid)
+            observation_id = int(cursor.lastrowid)
+            if clean_source_key:
+                connection.execute(
+                    'INSERT OR IGNORE INTO language_observation_sources (source_key, observation_id) VALUES (?, ?)',
+                    (clean_source_key, observation_id),
+                )
+            return observation_id
 
     def expressions(
         self,
@@ -802,12 +827,18 @@ async def extract_trending_expressions(
         phrase = _safe_meme_phrase(item.get("phrase"))
         if not phrase or phrase not in research:
             continue
+        extracted_meaning = _clean_text(item.get('meaning'), 500)
+        extracted_usage = _clean_text(item.get('usage'), 500)
+        if len(extracted_meaning) < 2 or len(extracted_usage) < 2:
+            continue
         try:
             confidence = float(item.get("confidence", 0.5))
             source_index = int(item.get("source_index", 1)) - 1
         except (TypeError, ValueError):
             confidence = 0.5
             source_index = 0
+        if confidence < 0.55:
+            continue
         if not sources:
             continue
         source = sources[min(max(source_index, 0), len(sources) - 1)]

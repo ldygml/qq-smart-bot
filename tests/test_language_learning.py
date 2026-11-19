@@ -24,6 +24,31 @@ class JsonChat:
         return None
 
 
+def test_historical_observation_source_is_deduplicated(tmp_path) -> None:
+    store = LanguageLearningStore(tmp_path / 'language.db')
+    first = store.observe(
+        scope_type='group',
+        scope_id=321,
+        scope_name='历史群',
+        speaker_user_id=7,
+        speaker_name='阿七',
+        content='这句是历史消息，只应该学习一次',
+        source_key='qq-history:group:321:10001',
+    )
+    second = store.observe(
+        scope_type='group',
+        scope_id=321,
+        scope_name='历史群',
+        speaker_user_id=7,
+        speaker_name='阿七',
+        content='这句是历史消息，只应该学习一次',
+        source_key='qq-history:group:321:10001',
+    )
+    assert first is not None
+    assert second is None
+    assert store.stats()['pending'] == 1
+
+
 def test_language_store_learns_scoped_style_and_deduplicates_phrases(tmp_path) -> None:
     store = LanguageLearningStore(tmp_path / "language.db")
     observation_id = store.observe(

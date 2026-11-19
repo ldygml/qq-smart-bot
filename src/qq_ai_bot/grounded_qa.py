@@ -229,6 +229,47 @@ async def grounded_lookup(
     return GroundedAnswer("", reason=reason)
 
 
+async def search_web_sources(
+    question: str,
+    *,
+    trust_env: bool = False,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> list[GroundedSource]:
+    """Return real search-result pages without asking a model to answer."""
+    if '热梗' not in question and '流行语' not in question:
+        return await _search_web_pages(
+            question,
+            trust_env=trust_env,
+            transport=transport,
+        )
+    year = datetime.now().year
+    queries = (
+        f'{year}年 网络热梗 盘点 含义 用法',
+        f'{year} 网络热梗 解释 新梗',
+        f'网络流行语 {year} 盘点 解释',
+    )
+    pages: list[GroundedSource] = []
+    seen: set[str] = set()
+    markers = ('热梗', '流行语', '网络用语')
+    for search_query in queries:
+        batch = await _search_web_pages(
+            search_query,
+            trust_env=trust_env,
+            transport=transport,
+        )
+        for item in batch:
+            title = item.title.lower()
+            if not any(marker in title for marker in markers):
+                continue
+            if item.url in seen:
+                continue
+            seen.add(item.url)
+            pages.append(item)
+            if len(pages) >= 8:
+                return pages
+    return pages
+
+
 async def sports_schedule_lookup(
     question: str,
     *,

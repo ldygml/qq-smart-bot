@@ -658,7 +658,7 @@ $("#learn-web-language").addEventListener("click", async () => {
   $("#language-status").textContent = "正在联网核对近期热梗…";
   try {
     const result = await jsonRequest("/api/admin/language/learn", "POST", {chat:false, web:true});
-    $("#language-status").textContent = "联网更新完成，新增或刷新 " + result.web_expressions + " 条表达。";
+    $("#language-status").textContent = "联网更新完成，读取 " + (result.web_sources || 0) + " 个来源，新增或刷新 " + result.web_expressions + " 条表达。";
     await loadLanguage();
   } catch (error) { $("#language-status").textContent = "联网学习失败：" + error.message; }
   finally { button.disabled = false; }

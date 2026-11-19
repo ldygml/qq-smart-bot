@@ -68,6 +68,7 @@ from .grounded_qa import (
     GroundedAnswer,
     grounded_lookup,
     is_explicit_search_request,
+    search_web_sources,
 )
 from .generation_store import GenerationStore
 from .history_sync import (
@@ -5256,11 +5257,65 @@ def create_app(
                 max(60.0, config.quality_review_interval_seconds)
             )
 
+    def _backfill_language_history() -> int:
+        rows = store.learning_messages(limit=3000)
+        per_scope: dict[tuple[str, int], int] = {}
+        inserted = 0
+        for item in rows:
+            message_type = str(item.get('message_type') or '')
+            conversation_id = str(item.get('conversation_id') or '')
+            if message_type == 'group':
+                try:
+                    scope_id = int(item.get('group_id') or 0)
+                except (TypeError, ValueError):
+                    continue
+                scope_type = 'group'
+                policy = group_profiles.get(scope_id) if scope_id > 0 else None
+                scope_name = (
+                    policy.name if policy is not None else ''
+                ) or group_name_cache.get(scope_id, '')
+            elif message_type == 'private':
+                peer = conversation_id.removeprefix('private:')
+                if not peer.isdigit():
+                    continue
+                scope_type = 'contact'
+                scope_id = int(peer)
+                scope_name = str(item.get('sender_name') or scope_id)
+            else:
+                continue
+            key = (scope_type, scope_id)
+            count = per_scope.get(key, 0)
+            if count >= 40:
+                continue
+            observation_id = language_learning.observe(
+                scope_type=scope_type,
+                scope_id=scope_id,
+                scope_name=scope_name,
+                speaker_user_id=int(item.get('sender_user_id') or 0),
+                speaker_name=str(item.get('sender_name') or scope_id),
+                content=str(item.get('content') or ''),
+                source_key='qq-history:' + str(item.get('external_key') or ''),
+            )
+            per_scope[key] = count + 1
+            if observation_id is not None:
+                inserted += 1
+        language_learning.set_setting(
+            'history_backfilled_at',
+            datetime.now(timezone.utc).isoformat(),
+        )
+        return inserted
+
     async def _run_language_learning(
         *,
         force_chat: bool = False,
         force_web: bool = False,
     ) -> dict[str, Any]:
+        backfilled = 0
+        if language_learning.setting_bool('enabled', True) and (
+            force_chat
+            or not language_learning.setting('history_backfilled_at', '')
+        ):
+            backfilled = _backfill_language_history()
         if not language_learning.setting_bool("enabled", True):
             return {
                 "skipped": "语言学习已关闭",
@@ -5268,11 +5323,14 @@ def create_app(
                 "profiles": 0,
                 "expressions": 0,
                 "web_expressions": 0,
+                "web_sources": 0,
                 "failed": 0,
             }
 
         pending = language_learning.pending_observations(
-            limit=max(20, config.language_learning_batch_size)
+            limit=600 if force_chat else max(
+                20, config.language_learning_batch_size
+            )
         )
         batches: dict[tuple[str, int], list[dict[str, Any]]] = {}
         for item in pending:
@@ -5284,13 +5342,12 @@ def create_app(
         learned_expressions = 0
         failed_batches = 0
         for (scope_type, scope_id), observations in batches.items():
-            if (
-                not force_chat
-                and len(observations) < max(
-                    3,
-                    config.language_min_new_messages,
-                )
-            ):
+            ids = [int(item['id']) for item in observations]
+            minimum = 3 if force_chat else max(
+                3, config.language_min_new_messages
+            )
+            if len(observations) < minimum:
+                language_learning.mark_processed(ids)
                 continue
             scope_name = str(observations[-1].get("scope_name") or "")
             scope_label = (
@@ -5343,6 +5400,7 @@ def create_app(
             learned_observations += len(ids)
 
         web_expressions = 0
+        web_sources = 0
         last_web = language_learning.setting("last_web_learned_at", "")
         web_due = not last_web
         if last_web:
@@ -5367,22 +5425,24 @@ def create_app(
         ):
             today = datetime.now(ZoneInfo(config.timezone)).date().isoformat()
             try:
-                grounded = await grounded_lookup(
-                    client_for("chat"),
-                    model=config.llm_model,
-                    question=f"近期中文网络热梗、流行说法、含义和用法 {today}",
+                pages = await search_web_sources(
+                    f"近期中文网络热梗 流行语 含义 用法 盘点 {today}",
                     trust_env=config.llm_trust_env,
-                    force_web_fetch=True,
-                    current_date=today,
                 )
-                if grounded.verified and grounded.sources:
+                web_sources = len(pages)
+                if pages:
+                    research = "\n\n".join(
+                        f"标题：{item.title}\n网址：{item.url}\n"
+                        f"正文：{item.page_text[:5000]}"
+                        for item in pages[:6]
+                    )
                     candidates = await extract_trending_expressions(
                         client_for("reflection"),
                         model=config.memory_model,
-                        research=grounded.answer,
+                        research=research,
                         sources=[
                             {"title": item.title, "url": item.url}
-                            for item in grounded.sources
+                            for item in pages
                         ],
                         current_date=today,
                     )
@@ -5413,6 +5473,7 @@ def create_app(
             "profiles": learned_profiles,
             "expressions": learned_expressions,
             "web_expressions": web_expressions,
+            "web_sources": web_sources,
             "failed": failed_batches,
         }
 

@@ -277,6 +277,22 @@ class ChatMemory:
             ).fetchone()
         return row is not None
 
+    def learning_messages(self, limit: int = 3000) -> list[dict[str, Any]]:
+        safe_limit = min(8000, max(1, int(limit)))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                '''
+                SELECT external_key, conversation_id, message_type, group_id,
+                       sender_user_id, sender_name, content, event_time
+                FROM external_messages
+                WHERE role = 'user' AND COALESCE(deleted, 0) = 0
+                ORDER BY event_time DESC, archived_at DESC
+                LIMIT ?
+                ''',
+                (safe_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def archived_messages(
         self,
         *,
