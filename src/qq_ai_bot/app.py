@@ -8934,13 +8934,7 @@ async def _qq_web_history_attachments(
                 "size": 0,
             }
             if sticker is not None:
-                metadata = stickers.find_metadata(sticker) or {}
-                if metadata.get("has_local_asset") and metadata.get("asset_url"):
-                    attachment["url"] = str(metadata["asset_url"])
-                    attachment["mime_type"] = str(
-                        metadata.get("mime_type") or ""
-                    )
-                elif sticker.image_source:
+                if sticker.image_source:
                     url, mime_type = await _qq_history_media_url(
                         sticker.image_source,
                         sticker_assets=sticker_assets,
@@ -8948,6 +8942,15 @@ async def _qq_web_history_attachments(
                     )
                     attachment["url"] = url
                     attachment["mime_type"] = mime_type
+                if not attachment["url"]:
+                    metadata = stickers.find_metadata(sticker) or {}
+                    if metadata.get("has_local_asset") and metadata.get(
+                        "asset_url"
+                    ):
+                        attachment["url"] = str(metadata["asset_url"])
+                        attachment["mime_type"] = str(
+                            metadata.get("mime_type") or ""
+                        )
             else:
                 source = str(data.get("url") or data.get("file") or "")
                 url, mime_type = await _qq_history_media_url(

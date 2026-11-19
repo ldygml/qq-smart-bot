@@ -3448,6 +3448,38 @@ async def test_qq_web_history_returns_cached_images_and_stickers(
                 }
             ],
         },
+        {
+            "post_type": "message",
+            "message_id": "sticker-2",
+            "time": 1_700_000_030,
+            "sender": {"user_id": 123, "nickname": "Aloha"},
+            "message": [
+                {
+                    "type": "image",
+                    "data": {
+                        "summary": "[动画表情]",
+                        "sub_type": 1,
+                        "file": str(image_path),
+                    },
+                }
+            ],
+        },
+        {
+            "post_type": "message_sent",
+            "message_id": "sticker-3",
+            "time": 1_700_000_040,
+            "sender": {"user_id": 999, "nickname": "测试机器人"},
+            "message": [
+                {
+                    "type": "image",
+                    "data": {
+                        "summary": "[动画表情]",
+                        "sub_type": 1,
+                        "file": str(sticker_path),
+                    },
+                }
+            ],
+        },
     ]
     app = create_app(
         settings=make_settings(tmp_path),
@@ -3472,7 +3504,14 @@ async def test_qq_web_history_returns_cached_images_and_stickers(
         payload = history.json()
         image_url = payload["messages"][0]["attachments"][0]["url"]
         sticker_url = payload["messages"][1]["attachments"][0]["url"]
+        source_sticker_urls = [
+            payload["messages"][2]["attachments"][0]["url"],
+            payload["messages"][3]["attachments"][0]["url"],
+        ]
         image_preview = await client.get(image_url)
+        source_sticker_previews = [
+            await client.get(url) for url in source_sticker_urls
+        ]
 
     assert payload["messages"][0]["attachments"] == [
         {
@@ -3486,6 +3525,15 @@ async def test_qq_web_history_returns_cached_images_and_stickers(
     assert payload["messages"][1]["attachments"][0]["type"] == "sticker"
     assert payload["messages"][1]["attachments"][0]["name"] == "无语"
     assert sticker_url == f"/api/admin/stickers/{sticker_id}/asset"
+    assert source_sticker_urls[0] != source_sticker_urls[1]
+    assert all(
+        url.startswith("/api/admin/qq-web/media/")
+        for url in source_sticker_urls
+    )
+    assert [preview.content for preview in source_sticker_previews] == [
+        image_path.read_bytes(),
+        sticker_path.read_bytes(),
+    ]
     assert str(tmp_path) not in history.text
     assert image_preview.status_code == 200
     assert image_preview.content == image_path.read_bytes()

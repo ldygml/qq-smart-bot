@@ -103,3 +103,51 @@ def test_sticker_catalog_merges_same_saved_image(tmp_path) -> None:
     metadata = store.get_metadata(second_canonical or 0) or {}
     assert metadata["classification_source"] == "manual"
     assert metadata["category"] == "无语"
+
+
+def test_sticker_metadata_matches_image_source_before_generic_summary(
+    tmp_path,
+) -> None:
+    store = StickerStore(tmp_path / "stickers.db")
+    first_id = store.record(
+        StickerSource(
+            summary="[动画表情]",
+            image_source="https://cdn.example/one.gif",
+        )
+    )
+    second_id = store.record(
+        StickerSource(
+            summary="[动画表情]",
+            image_source="https://cdn.example/two.gif",
+        )
+    )
+    assert first_id is not None
+    assert second_id is not None
+    store.update_classification(
+        first_id,
+        category="开心",
+        usage_hint="庆祝时使用",
+        source="manual",
+    )
+    store.update_classification(
+        second_id,
+        category="无语",
+        usage_hint="吐槽时使用",
+        source="manual",
+    )
+
+    first = store.find_metadata(
+        StickerSource(
+            summary="[动画表情]",
+            image_source="https://cdn.example/one.gif",
+        )
+    )
+    second = store.find_metadata(
+        StickerSource(
+            summary="[动画表情]",
+            image_source="https://cdn.example/two.gif",
+        )
+    )
+
+    assert first is not None and first["category"] == "开心"
+    assert second is not None and second["category"] == "无语"

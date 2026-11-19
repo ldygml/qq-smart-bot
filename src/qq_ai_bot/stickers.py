@@ -711,6 +711,22 @@ class StickerStore:
 
     def find_metadata(self, sticker: StickerSource) -> dict[str, object] | None:
         """Find catalog metadata for a sticker segment without changing usage."""
+        if sticker.image_source:
+            fingerprint = "url-" + hashlib.sha256(
+                sticker.image_source.encode("utf-8")
+            ).hexdigest()[:24]
+            with self._lock, self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT id FROM sticker_catalog
+                    WHERE sticker_key = ?
+                    ORDER BY use_count DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (fingerprint,),
+                ).fetchone()
+            if row:
+                return self.get_metadata(int(row["id"]))
         summary = sticker.summary.strip() or "表情包"
         clauses = ["summary = ?"]
         values: list[object] = [summary]
