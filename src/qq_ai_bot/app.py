@@ -76,6 +76,12 @@ from .history_sync import (
     sync_recent_history,
 )
 from .images import ImageLoader, ImageLoaderProtocol, ImageLoadError
+from .language_learning import (
+    ExpressionCandidate,
+    LanguageLearningStore,
+    extract_trending_expressions,
+    learn_language_batch,
+)
 from .llm import ChatClient, CompatibleChatClient, LLMError
 from .memory import ChatMemory
 from .model_router import (
@@ -394,6 +400,12 @@ def create_app(
         timeout_seconds=config.audio_timeout_seconds
     )
     shared_memory = shared_memory_store or SharedMemoryStore(config.database_path)
+    language_learning = LanguageLearningStore(
+        config.database_path,
+        enabled=config.language_learning_enabled,
+        web_enabled=config.web_search_enabled,
+        meme_usage_rate=config.language_meme_usage_rate,
+    )
     _apply_saved_group_settings(config, shared_memory)
     if embedding_client is not None:
         embeddings = embedding_client
@@ -665,6 +677,7 @@ def create_app(
         reminder_task = asyncio.create_task(_reminder_loop())
         reflection_task = asyncio.create_task(_reflection_loop())
         quality_task = asyncio.create_task(_quality_review_loop())
+        language_task = asyncio.create_task(_language_learning_loop())
         group_digest_task = asyncio.create_task(_group_digest_loop())
         history_sync_task = (
             asyncio.create_task(_run_history_sync())
@@ -677,6 +690,7 @@ def create_app(
             reminder_task.cancel()
             reflection_task.cancel()
             quality_task.cancel()
+            language_task.cancel()
             group_digest_task.cancel()
             if history_sync_task is not None:
                 history_sync_task.cancel()
@@ -685,6 +699,7 @@ def create_app(
                 reminder_task,
                 reflection_task,
                 quality_task,
+                language_task,
                 group_digest_task,
             ]
             if history_sync_task is not None:
@@ -718,6 +733,7 @@ def create_app(
     app.state.stickers = stickers
     app.state.sticker_assets = sticker_assets
     app.state.qq_media = qq_media
+    app.state.language_learning = language_learning
 
     @app.middleware("http")
     async def protect_admin_routes(request: Request, call_next):
@@ -782,6 +798,7 @@ def create_app(
     def _purge_person_memory(user_id: int) -> dict[str, Any]:
         result = shared_memory.purge_person(user_id)
         result["messages"] = store.delete_for_user(user_id)
+        result["language"] = language_learning.delete_scope("contact", user_id)
         result["vectors"] = 0
         if vectors is not None:
             result["vectors"] += vectors.delete_by_metadata_user(
@@ -848,6 +865,10 @@ def create_app(
             "reflection_model": config.reflection_model,
             "reflection_interval_seconds": config.reflection_interval_seconds,
             "reflection_min_new_memories": config.reflection_min_new_memories,
+            "language_learning_enabled": language_learning.setting_bool(
+                "enabled", True
+            ),
+            "language_learning_stats": language_learning.stats(),
             "group_enabled": config.enable_group,
             "group_allowlist": sorted(config.group_ids),
             "group_require_mention": config.group_require_mention,
@@ -2870,6 +2891,154 @@ def create_app(
             return JSONResponse({"detail": str(exc)}, status_code=502)
         return JSONResponse({"ok": True, **result})
 
+    @app.get("/api/admin/language")
+    async def admin_language() -> dict[str, Any]:
+        return {
+            "stats": language_learning.stats(),
+            "settings": {
+                "enabled": language_learning.setting_bool("enabled", True),
+                "web_learning_enabled": language_learning.setting_bool(
+                    "web_learning_enabled", True
+                ),
+                "auto_profile": language_learning.setting_bool(
+                    "auto_profile", True
+                ),
+                "meme_usage_rate": language_learning.setting_float(
+                    "meme_usage_rate", config.language_meme_usage_rate
+                ),
+                "last_chat_learned_at": language_learning.setting(
+                    "last_chat_learned_at", ""
+                ),
+                "last_web_learned_at": language_learning.setting(
+                    "last_web_learned_at", ""
+                ),
+            },
+            "profiles": language_learning.list_profiles(limit=100),
+            "expressions": language_learning.expressions(limit=200),
+        }
+
+    @app.post("/api/admin/language/learn")
+    async def admin_learn_language(
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        options = payload or {}
+        result = await _run_language_learning(
+            force_chat=bool(options.get("chat", True)),
+            force_web=bool(options.get("web", False)),
+        )
+        return {"ok": True, **result}
+
+    @app.patch("/api/admin/language/settings")
+    async def admin_language_settings(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        if "enabled" in payload:
+            language_learning.set_setting(
+                "enabled", "true" if bool(payload["enabled"]) else "false"
+            )
+        if "web_learning_enabled" in payload:
+            language_learning.set_setting(
+                "web_learning_enabled",
+                "true" if bool(payload["web_learning_enabled"]) else "false",
+            )
+        if "auto_profile" in payload:
+            language_learning.set_setting(
+                "auto_profile",
+                "true" if bool(payload["auto_profile"]) else "false",
+            )
+        if "meme_usage_rate" in payload:
+            rate = min(1.0, max(0.0, _safe_price(payload["meme_usage_rate"])))
+            language_learning.set_setting("meme_usage_rate", str(rate))
+        return {
+            "ok": True,
+            "enabled": language_learning.setting_bool("enabled", True),
+            "web_learning_enabled": language_learning.setting_bool(
+                "web_learning_enabled", True
+            ),
+            "auto_profile": language_learning.setting_bool(
+                "auto_profile", True
+            ),
+            "meme_usage_rate": language_learning.setting_float(
+                "meme_usage_rate", config.language_meme_usage_rate
+            ),
+        }
+
+    @app.post("/api/admin/language/expressions")
+    async def admin_add_language_expression(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        scope_type = str(payload.get("scope_type") or "global")
+        scope_id = int(payload.get("scope_id") or 0)
+        if scope_type not in {"global", "contact", "group"}:
+            return JSONResponse(
+                {"detail": "invalid language scope"},
+                status_code=400,
+            )
+        expression_id = language_learning.upsert_expression(
+            scope_type=scope_type,
+            scope_id=scope_id,
+            scope_name=str(payload.get("scope_name") or "手动添加"),
+            kind=str(payload.get("kind") or "slang"),
+            candidate=ExpressionCandidate(
+                phrase=str(payload.get("phrase") or ""),
+                meaning=str(payload.get("meaning") or ""),
+                usage=str(payload.get("usage") or ""),
+                tone=str(payload.get("tone") or ""),
+                confidence=0.9,
+                source_kind="manual",
+            ),
+            ttl_days=max(1, config.language_expression_ttl_days),
+        )
+        if expression_id is None:
+            return JSONResponse(
+                {"detail": "短语为空或不符合安全规则"},
+                status_code=400,
+            )
+        return {"ok": True, "id": expression_id}
+
+    @app.patch("/api/admin/language/expressions/{expression_id}")
+    async def admin_update_language_expression(
+        expression_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        updated = language_learning.update_expression(
+            expression_id,
+            meaning=str(payload["meaning"]) if "meaning" in payload else None,
+            usage=str(payload["usage"]) if "usage" in payload else None,
+            status=str(payload["status"]) if "status" in payload else None,
+        )
+        if not updated:
+            return JSONResponse(
+                {"detail": "expression not found"},
+                status_code=404,
+            )
+        return {"ok": True}
+
+    @app.delete("/api/admin/language/expressions/{expression_id}")
+    async def admin_delete_language_expression(
+        expression_id: int,
+    ) -> dict[str, Any]:
+        if not language_learning.delete_expression(expression_id):
+            return JSONResponse(
+                {"detail": "expression not found"},
+                status_code=404,
+            )
+        return {"ok": True}
+
+    @app.delete("/api/admin/language/scopes/{scope_type}/{scope_id}")
+    async def admin_delete_language_scope(
+        scope_type: str,
+        scope_id: int,
+    ) -> dict[str, Any]:
+        try:
+            deleted = language_learning.delete_scope(scope_type, scope_id)
+        except ValueError:
+            return JSONResponse(
+                {"detail": "invalid language scope"},
+                status_code=400,
+            )
+        return {"ok": True, "deleted": deleted}
+
     @app.get("/api/admin/stickers")
     async def admin_stickers() -> dict[str, Any]:
         return {
@@ -3848,6 +4017,7 @@ def create_app(
         )
         if reset_behavior:
             group_behavior.reset(group_id)
+            language_learning.delete_scope("group", group_id)
         return JSONResponse(
             {
                 "ok": True,
@@ -5086,6 +5256,181 @@ def create_app(
                 max(60.0, config.quality_review_interval_seconds)
             )
 
+    async def _run_language_learning(
+        *,
+        force_chat: bool = False,
+        force_web: bool = False,
+    ) -> dict[str, Any]:
+        if not language_learning.setting_bool("enabled", True):
+            return {
+                "skipped": "语言学习已关闭",
+                "observations": 0,
+                "profiles": 0,
+                "expressions": 0,
+                "web_expressions": 0,
+                "failed": 0,
+            }
+
+        pending = language_learning.pending_observations(
+            limit=max(20, config.language_learning_batch_size)
+        )
+        batches: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for item in pending:
+            key = (str(item["scope_type"]), int(item["scope_id"]))
+            batches.setdefault(key, []).append(item)
+
+        learned_observations = 0
+        learned_profiles = 0
+        learned_expressions = 0
+        failed_batches = 0
+        for (scope_type, scope_id), observations in batches.items():
+            if (
+                not force_chat
+                and len(observations) < max(
+                    3,
+                    config.language_min_new_messages,
+                )
+            ):
+                continue
+            scope_name = str(observations[-1].get("scope_name") or "")
+            scope_label = (
+                f"群聊 {scope_name or scope_id}"
+                if scope_type == "group"
+                else f"私聊对象 {scope_name or scope_id}"
+            )
+            ids = [int(item["id"]) for item in observations]
+            try:
+                result = await learn_language_batch(
+                    client_for("reflection"),
+                    model=config.memory_model,
+                    scope_label=scope_label,
+                    observations=observations,
+                    current_profile=language_learning.profile(
+                        scope_type,
+                        scope_id,
+                    ),
+                )
+            except (LLMError, Exception):
+                language_learning.mark_failed(ids)
+                failed_batches += 1
+                logger.warning(
+                    "Language learning batch failed for %s:%s",
+                    scope_type,
+                    scope_id,
+                    exc_info=True,
+                )
+                continue
+            if language_learning.setting_bool("auto_profile", True):
+                language_learning.upsert_profile(
+                    scope_type=scope_type,
+                    scope_id=scope_id,
+                    scope_name=scope_name,
+                    profile=result.profile,
+                    evidence_count=len(observations),
+                )
+                learned_profiles += 1
+            for candidate in result.expressions:
+                if language_learning.upsert_expression(
+                    scope_type=scope_type,
+                    scope_id=scope_id,
+                    scope_name=scope_name,
+                    kind="slang",
+                    candidate=candidate,
+                    ttl_days=config.language_expression_ttl_days,
+                ):
+                    learned_expressions += 1
+            language_learning.mark_processed(ids)
+            learned_observations += len(ids)
+
+        web_expressions = 0
+        last_web = language_learning.setting("last_web_learned_at", "")
+        web_due = not last_web
+        if last_web:
+            try:
+                elapsed_hours = (
+                    datetime.now(timezone.utc)
+                    - datetime.fromisoformat(last_web)
+                ).total_seconds() / 3600
+                web_due = elapsed_hours >= max(
+                    1.0,
+                    config.language_web_refresh_hours,
+                )
+            except ValueError:
+                web_due = True
+        if (
+            (force_web or web_due)
+            and language_learning.setting_bool(
+                "web_learning_enabled",
+                True,
+            )
+            and config.web_search_enabled
+        ):
+            today = datetime.now(ZoneInfo(config.timezone)).date().isoformat()
+            try:
+                grounded = await grounded_lookup(
+                    client_for("chat"),
+                    model=config.llm_model,
+                    question=f"近期中文网络热梗、流行说法、含义和用法 {today}",
+                    trust_env=config.llm_trust_env,
+                    force_web_fetch=True,
+                    current_date=today,
+                )
+                if grounded.verified and grounded.sources:
+                    candidates = await extract_trending_expressions(
+                        client_for("reflection"),
+                        model=config.memory_model,
+                        research=grounded.answer,
+                        sources=[
+                            {"title": item.title, "url": item.url}
+                            for item in grounded.sources
+                        ],
+                        current_date=today,
+                    )
+                    for candidate in candidates:
+                        if language_learning.upsert_expression(
+                            scope_type="global",
+                            scope_id=0,
+                            scope_name="全网近期表达",
+                            kind="slang",
+                            candidate=candidate,
+                            ttl_days=config.language_expression_ttl_days,
+                        ):
+                            web_expressions += 1
+                    language_learning.set_setting(
+                        "last_web_learned_at",
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+            except Exception:
+                logger.warning("Trending-language refresh failed", exc_info=True)
+
+        if learned_observations:
+            language_learning.set_setting(
+                "last_chat_learned_at",
+                datetime.now(timezone.utc).isoformat(),
+            )
+        return {
+            "observations": learned_observations,
+            "profiles": learned_profiles,
+            "expressions": learned_expressions,
+            "web_expressions": web_expressions,
+            "failed": failed_batches,
+        }
+
+    async def _language_learning_loop() -> None:
+        if not config.language_learning_enabled:
+            return
+        await asyncio.sleep(30)
+        while True:
+            try:
+                await _run_language_learning()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Periodic language learning failed", exc_info=True)
+            await asyncio.sleep(
+                max(120.0, config.language_learning_interval_seconds)
+            )
+
     async def _group_digest_loop() -> None:
         await asyncio.sleep(20)
         while True:
@@ -5918,6 +6263,28 @@ def create_app(
             "",
             content.text,
         ).strip()
+        if language_learning.setting_bool("enabled", True):
+            language_scope_type = (
+                "group" if target.message_type == "group" else "contact"
+            )
+            language_scope_id = (
+                int(target.group_id)
+                if target.group_id is not None
+                else int(event.user_id)
+            )
+            language_scope_name = (
+                group_name_cache.get(language_scope_id, display_name)
+                if language_scope_type == "group"
+                else display_name
+            )
+            language_learning.observe(
+                scope_type=language_scope_type,
+                scope_id=language_scope_id,
+                scope_name=language_scope_name,
+                speaker_user_id=event.user_id,
+                speaker_name=display_name,
+                content=raw_user_text or content.text,
+            )
         if await _handle_presence_command(
             target,
             event.user_id,
@@ -6616,6 +6983,32 @@ def create_app(
                     "\n当前关系定位（不要机械复述）："
                     f"{str(person['relationship_note'])[:300]}"
                 )
+            language_scope_type = (
+                "group" if target.group_id is not None else "contact"
+            )
+            language_scope_id = (
+                int(target.group_id)
+                if target.group_id is not None
+                else int(event.user_id)
+            )
+            meme_rate = min(
+                1.0,
+                max(
+                    0.0,
+                    language_learning.setting_float(
+                        "meme_usage_rate",
+                        config.language_meme_usage_rate,
+                    ),
+                ),
+            )
+            language_context = language_learning.context_for(
+                scope_type=language_scope_type,
+                scope_id=language_scope_id,
+                query=text,
+                include_slang=random.random() < meme_rate,
+            )
+            if language_context:
+                system_prompt += "\n\n" + language_context
             social_tone = _social_tone_hint(text)
             if social_tone:
                 system_prompt += "\n\n" + social_tone

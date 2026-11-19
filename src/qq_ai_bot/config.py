@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     reflection_model: str = "qwen-plus"
     reflection_interval_seconds: float = 1200.0
     reflection_min_new_memories: int = 1
+    language_learning_enabled: bool = True
+    language_learning_interval_seconds: float = 1800.0
+    language_learning_batch_size: int = 120
+    language_min_new_messages: int = 8
+    language_web_refresh_hours: float = 12.0
+    language_expression_ttl_days: int = 45
+    language_meme_usage_rate: float = 0.22
 
     bot_name: str = "给她爱"
     persona_prompt_path: Path = Path("prompts/gexiai.md")

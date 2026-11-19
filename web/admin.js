@@ -80,6 +80,7 @@ document.querySelectorAll("nav button").forEach((button) => {
       people: loadPeople,
       timeline: loadTimeline,
       growth: loadGrowth,
+      language: loadLanguage,
       stickers: loadStickers,
       knowledge: loadKnowledge,
       operations: loadOperations,
@@ -537,6 +538,147 @@ function bindGrowthEditors() {
     };
   });
 }
+
+function languageScopeLabel(item) {
+  if (item.scope_type === "global") return "全网";
+  if (item.scope_type === "group") {
+    return "群聊 · " + (item.scope_name || item.scope_id);
+  }
+  return "联系人 · " + (item.scope_name || item.scope_id);
+}
+
+async function loadLanguage() {
+  const data = await api("/api/admin/language");
+  const cards = [
+    [data.stats.pending || 0, "待学习消息"],
+    [data.stats.profiles || 0, "场景说话画像"],
+    [data.stats.expressions || 0, "有效口语表达"],
+    [data.stats.learned || 0, "已处理样本"],
+  ];
+  $("#language-cards").innerHTML = cards.map(([value, label]) =>
+    "<div class=\"card\"><strong>" + esc(value) + "</strong><span>" + esc(label) + "</span></div>"
+  ).join("");
+  $("#language-enabled").checked = Boolean(data.settings.enabled);
+  $("#language-web-enabled").checked = Boolean(data.settings.web_learning_enabled);
+  $("#language-auto-profile").checked = Boolean(data.settings.auto_profile);
+  $("#language-meme-rate").value = Number(data.settings.meme_usage_rate || 0);
+  $("#language-status").textContent = "聊天学习：" + (data.settings.last_chat_learned_at ? dateText(data.settings.last_chat_learned_at) : "尚未运行") + " · 热梗更新：" + (data.settings.last_web_learned_at ? dateText(data.settings.last_web_learned_at) : "尚未运行");
+
+  $("#language-profiles").innerHTML = data.profiles.length
+    ? data.profiles.map((item) => [
+      "<article class=\"edit-card\">",
+      "<div class=\"row-meta\">", esc(languageScopeLabel(item)), " · 证据 ", esc(item.evidence_count), " 条 · ", dateText(item.updated_at), "</div>",
+      "<textarea rows=\"2\" readonly>", esc(item.summary || ""), "</textarea>",
+      "<div class=\"row-meta\">节奏：", esc(item.rhythm || "暂无"), " · 口语倾向：", esc(item.vocabulary || "暂无"), " · 避开：", esc(item.avoid || "暂无"), "</div>",
+      "<div class=\"item-actions\"><button class=\"danger\" data-delete-language-scope=\"", esc(item.scope_type), "\" data-scope-id=\"", esc(item.scope_id), "\">删除该场景学习结果</button></div>",
+      "</article>",
+    ].join("")).join("")
+    : "<div class=\"empty\">还没有足够聊天样本。群聊里正常说话，机器人会定期自己整理。</div>";
+
+  const expressionMarkup = data.expressions.map((item) => [
+    "<article class=\"edit-card\">",
+    "<div class=\"row-meta\">", esc(languageScopeLabel(item)), " · ", esc(item.source_kind === "web" ? "联网学习" : item.source_kind === "manual" ? "手动添加" : "聊天观察"), " · 看过 ", esc(item.seen_count), " 次 · 置信度 ", esc(item.confidence), "</div>",
+    "<strong>", esc(item.phrase), "</strong>",
+    "<input data-language-meaning=\"", item.id, "\" value=\"", esc(item.meaning || ""), "\" placeholder=\"含义\">",
+    "<input data-language-usage=\"", item.id, "\" value=\"", esc(item.usage || ""), "\" placeholder=\"自然使用场景\">",
+    "<div class=\"field-row\">",
+    "<input value=\"", esc(item.tone || ""), "\" readonly placeholder=\"语气\">",
+    "<select data-language-status=\"", item.id, "\">",
+    "<option value=\"active\"", item.status === "active" ? " selected" : "", ">启用</option>",
+    "<option value=\"blocked\"", item.status === "blocked" ? " selected" : "", ">禁用</option>",
+    "</select>",
+    item.source_url ? "<a class=\"button-link\" href=\"" + esc(item.source_url) + "\" target=\"_blank\" rel=\"noreferrer\">来源</a>" : "",
+    "<button data-save-language-expression=\"", item.id, "\">保存</button>",
+    "<button class=\"danger\" data-delete-language-expression=\"", item.id, "\">删除</button>",
+    "</div></article>",
+  ].join("")).join("");
+  $("#language-expressions").innerHTML = data.expressions.length
+    ? expressionMarkup
+    : "<div class=\"empty\">还没有可用的热梗或口语表达。</div>";
+
+  document.querySelectorAll("[data-save-language-expression]").forEach((button) => {
+    button.onclick = async () => {
+      const id = Number(button.dataset.saveLanguageExpression);
+      try {
+        await jsonRequest("/api/admin/language/expressions/" + id, "PATCH", {
+          meaning: document.querySelector("[data-language-meaning=\"" + id + "\"]").value,
+          usage: document.querySelector("[data-language-usage=\"" + id + "\"]").value,
+          status: document.querySelector("[data-language-status=\"" + id + "\"]").value,
+        });
+        await loadLanguage();
+      } catch (error) { alert(error.message); }
+    };
+  });
+  document.querySelectorAll("[data-delete-language-expression]").forEach((button) => {
+    button.onclick = async () => {
+      if (!confirm("删除这条语言学习记录？")) return;
+      try {
+        await api("/api/admin/language/expressions/" + button.dataset.deleteLanguageExpression, {method:"DELETE"});
+        await loadLanguage();
+      } catch (error) { alert(error.message); }
+    };
+  });
+  document.querySelectorAll("[data-delete-language-scope]").forEach((button) => {
+    button.onclick = async () => {
+      if (!confirm("删除这个场景的说话画像、观察样本和专属热梗？")) return;
+      try {
+        await api("/api/admin/language/scopes/" + button.dataset.deleteLanguageScope + "/" + button.dataset.scopeId, {method:"DELETE"});
+        await loadLanguage();
+      } catch (error) { alert(error.message); }
+    };
+  });
+}
+
+$("#refresh-language").addEventListener("click", () => loadLanguage().catch((error) => alert(error.message)));
+$("#save-language-settings").addEventListener("click", async () => {
+  try {
+    await jsonRequest("/api/admin/language/settings", "PATCH", {
+      enabled: $("#language-enabled").checked,
+      web_learning_enabled: $("#language-web-enabled").checked,
+      auto_profile: $("#language-auto-profile").checked,
+      meme_usage_rate: Number($("#language-meme-rate").value || 0),
+    });
+    $("#language-status").textContent = "学习设置已保存。";
+  } catch (error) { alert(error.message); }
+});
+$("#learn-chat-language").addEventListener("click", async () => {
+  const button = $("#learn-chat-language");
+  button.disabled = true;
+  $("#language-status").textContent = "正在整理近期聊天表达…";
+  try {
+    const result = await jsonRequest("/api/admin/language/learn", "POST", {chat:true, web:false});
+    $("#language-status").textContent = "已处理 " + result.observations + " 条消息，更新 " + result.profiles + " 个画像，学到 " + result.expressions + " 条表达。";
+    await loadLanguage();
+  } catch (error) { $("#language-status").textContent = "学习失败：" + error.message; }
+  finally { button.disabled = false; }
+});
+$("#learn-web-language").addEventListener("click", async () => {
+  const button = $("#learn-web-language");
+  button.disabled = true;
+  $("#language-status").textContent = "正在联网核对近期热梗…";
+  try {
+    const result = await jsonRequest("/api/admin/language/learn", "POST", {chat:false, web:true});
+    $("#language-status").textContent = "联网更新完成，新增或刷新 " + result.web_expressions + " 条表达。";
+    await loadLanguage();
+  } catch (error) { $("#language-status").textContent = "联网学习失败：" + error.message; }
+  finally { button.disabled = false; }
+});
+$("#add-language-expression").addEventListener("click", async () => {
+  try {
+    const scopeType = $("#manual-language-scope").value;
+    await jsonRequest("/api/admin/language/expressions", "POST", {
+      scope_type: scopeType,
+      scope_id: scopeType === "global" ? 0 : Number($("#manual-language-scope-id").value || 0),
+      phrase: $("#manual-language-phrase").value,
+      meaning: $("#manual-language-meaning").value,
+      usage: $("#manual-language-usage").value,
+    });
+    $("#manual-language-phrase").value = "";
+    $("#manual-language-meaning").value = "";
+    $("#manual-language-usage").value = "";
+    await loadLanguage();
+  } catch (error) { alert(error.message); }
+});
 
 $("#reflect-now").addEventListener("click", async () => {
   const button = $("#reflect-now");

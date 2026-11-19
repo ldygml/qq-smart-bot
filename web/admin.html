@@ -20,6 +20,7 @@
     <button data-tab="people">联系人</button>
     <button data-tab="timeline">记忆时间线</button>
     <button data-tab="growth">反思与成长</button>
+    <button data-tab="language">语言学习</button>
     <button data-tab="stickers">表情包</button>
     <button data-tab="knowledge">知识来源</button>
     <button data-tab="operations">群聊与成本</button>
@@ -110,6 +111,49 @@
           <div><p class="eyebrow">GROWTH</p><h2>成长笔记</h2></div>
         </div>
         <div id="growth-list" class="edit-list"></div>
+      </article>
+    </section>
+
+    <section id="language" class="tab">
+      <article class="panel">
+        <div class="detail-head">
+          <div><p class="eyebrow">LANGUAGE LEARNING</p><h2>聊天语言学习</h2></div>
+          <div class="toolbar">
+            <button id="refresh-language">刷新</button>
+            <button id="learn-chat-language" class="primary">立即学习聊天</button>
+            <button id="learn-web-language">联网更新热梗</button>
+          </div>
+        </div>
+        <p class="muted">机器人会从群聊和私聊中学习回复节奏、口语倾向和可复用表达，也会定时联网核对近期热梗。学习结果只影响语气，不会复制个人原话，也不会把所有烂梗塞进回复。</p>
+        <div id="language-cards" class="cards compact"></div>
+        <div class="field-row settings-row">
+          <label class="check"><input id="language-enabled" type="checkbox"> 启用聊天语言学习</label>
+          <label class="check"><input id="language-web-enabled" type="checkbox"> 定时联网更新热梗</label>
+          <label class="check"><input id="language-auto-profile" type="checkbox"> 自动更新场景说话画像</label>
+          <label>梗的自然使用概率<input id="language-meme-rate" type="number" min="0" max="1" step="0.01"></label>
+          <button id="save-language-settings" class="primary">保存学习设置</button>
+        </div>
+        <p id="language-status" class="muted"></p>
+      </article>
+      <article class="panel">
+        <div class="detail-head">
+          <div><p class="eyebrow">SCENE PROFILES</p><h2>自动学到的说话方式</h2></div>
+        </div>
+        <div id="language-profiles" class="source-list"></div>
+      </article>
+      <article class="panel">
+        <div class="detail-head">
+          <div><p class="eyebrow">EXPRESSION BANK</p><h2>热梗与口语库</h2></div>
+        </div>
+        <div class="field-row">
+          <select id="manual-language-scope"><option value="global">全网</option><option value="group">指定群</option><option value="contact">指定联系人</option></select>
+          <input id="manual-language-scope-id" inputmode="numeric" placeholder="群号或 QQ；全网留空">
+          <input id="manual-language-phrase" placeholder="短语，2 到 20 字">
+          <input id="manual-language-meaning" placeholder="含义">
+          <input id="manual-language-usage" placeholder="适合什么语境">
+          <button id="add-language-expression">手动添加</button>
+        </div>
+        <div id="language-expressions" class="source-list"></div>
       </article>
     </section>
 
