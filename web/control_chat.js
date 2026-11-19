@@ -27,6 +27,7 @@ let activeUploadId = "";
 let uploadAbortController = null;
 let currentMessages = [];
 let pendingMentions = [];
+let renderedHistoryTarget = "";
 
 const elements = {
   instance: document.querySelector("#chat-instance"),
@@ -408,6 +409,7 @@ function clearTarget() {
   currentTarget = null;
   currentMembers = [];
   currentMessages = [];
+  renderedHistoryTarget = "";
   clearQuote();
   clearMentions();
   pendingAttachments = [];
@@ -701,6 +703,11 @@ async function loadHistory(showLoading = true) {
   loadingHistory = true;
   setError("");
   const targetSnapshot = `${currentTarget.kind}:${currentTarget.id}`;
+  const sameRenderedTarget = renderedHistoryTarget === targetSnapshot && currentMessages.length > 0;
+  const previousScrollTop = elements.messages.scrollTop;
+  const wasNearBottom = (
+    elements.messages.scrollHeight - elements.messages.scrollTop - elements.messages.clientHeight
+  ) < 80;
   if (showLoading) {
     elements.messages.innerHTML = `<div class="qq-empty-state"><p>正在读取 QQ 消息记录…</p></div>`;
   }
@@ -713,6 +720,7 @@ async function loadHistory(showLoading = true) {
     if (`${currentTarget?.kind}:${currentTarget?.id}` !== targetSnapshot) return;
     const messages = data.messages || [];
     currentMessages = messages;
+    renderedHistoryTarget = targetSnapshot;
     if (!messages.length) {
       elements.messages.innerHTML = `
         <div class="qq-empty-state">
@@ -726,8 +734,14 @@ async function loadHistory(showLoading = true) {
     elements.messages.innerHTML = `
       <div class="qq-day-divider">${esc(formatDay(firstTimestamp))}</div>
       ${messages.map(messageMarkup).join("")}`;
-    elements.messages.scrollTop = elements.messages.scrollHeight;
+    if (!sameRenderedTarget || wasNearBottom) {
+      elements.messages.scrollTop = elements.messages.scrollHeight;
+    } else {
+      const maxScrollTop = Math.max(0, elements.messages.scrollHeight - elements.messages.clientHeight);
+      elements.messages.scrollTop = Math.min(previousScrollTop, maxScrollTop);
+    }
   } catch (error) {
+    renderedHistoryTarget = "";
     setError(error.message);
     elements.messages.innerHTML = `
       <div class="qq-empty-state">
