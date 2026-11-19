@@ -50,6 +50,18 @@ class ProfileChat:
         )
 
 
+class CapturingProfileChat:
+    def __init__(self) -> None:
+        self.messages = []
+
+    async def chat(self, messages, *, model=None, extra_payload=None) -> str:
+        self.messages.append(messages)
+        return (
+            '{"style_profile":"表达特征：短句、少标点、先接话再给结论；'
+            '回复时保持同等节奏。","relationship_note":"普通朋友。"}'
+        )
+
+
 def test_shared_context_respects_visibility(tmp_path) -> None:
     store = SharedMemoryStore(tmp_path / "memory.db")
     store.record_person(222, "小明")
@@ -374,6 +386,55 @@ async def test_person_profile_is_stored_and_used_in_context(tmp_path) -> None:
     )
     assert "当前联系人互动画像" in context
     assert "熟悉的普通朋友" in context
+
+
+@pytest.mark.asyncio
+async def test_person_profile_learns_actual_speaking_habits(tmp_path) -> None:
+    store = SharedMemoryStore(tmp_path / "memory.db")
+    store.record_person(222, "小明")
+    observation_ids = [
+        store.observe_message(
+            conversation_id="private:222",
+            message_type="private",
+            group_id=None,
+            speaker_user_id=222,
+            speaker_name="小明",
+            content=content,
+        )
+        for content in (
+            "行 那我不去了",
+            "你别说 还真有点离谱",
+            "先这样 晚点再说",
+            "不是 你这结论也太快了",
+            "嗯 我看看",
+        )
+    ]
+    samples = store.style_observations_for_speaker(
+        222,
+        after_id=0,
+        limit=20,
+    )
+    assert [int(item["id"]) for item in samples] == observation_ids
+    chat = CapturingProfileChat()
+    profile = await extract_person_profile(
+        chat,
+        model="test-model",
+        display_name="小明",
+        current_profile="",
+        current_relationship_note="",
+        samples=[
+            {
+                "user_content": item["content"],
+                "assistant_content": "",
+            }
+            for item in samples
+        ],
+    )
+    prompt = chat.messages[0][1]["content"]
+    assert "句子长短" in prompt
+    assert "标点密度" in prompt
+    assert "如实模仿" not in prompt
+    assert profile.style_profile.startswith("表达特征")
 
 
 @pytest.mark.asyncio

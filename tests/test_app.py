@@ -107,6 +107,14 @@ class FakeOneBotClient:
         self.stickers: list[tuple[ReplyTarget, StickerSource]] = []
         self.files: list[tuple[ReplyTarget, str, str]] = []
         self.groups: list[dict[str, object]] = []
+        self.friends: list[dict[str, object]] = []
+        self.login_info: dict[str, object] = {
+            "user_id": 999,
+            "nickname": "测试机器人",
+        }
+        self.group_members: list[dict[str, object]] = []
+        self.private_history: list[dict[str, object]] = []
+        self.group_history: list[dict[str, object]] = []
         self.group_files: dict[str, list[dict[str, object]]] = {
             "folders": [],
             "files": [],
@@ -130,6 +138,38 @@ class FakeOneBotClient:
 
     async def get_group_list(self) -> list[dict[str, object]]:
         return list(self.groups)
+
+    async def get_friend_list(self) -> list[dict[str, object]]:
+        return list(self.friends)
+
+    async def get_login_info(self) -> dict[str, object]:
+        return dict(self.login_info)
+
+    async def get_group_member_list(
+        self,
+        group_id: int,
+    ) -> list[dict[str, object]]:
+        return list(self.group_members)
+
+    async def get_friend_msg_history(
+        self,
+        user_id: int,
+        *,
+        message_seq: int | str = 0,
+        count: int = 50,
+        reverse_order: bool = True,
+    ) -> list[dict[str, object]]:
+        return list(self.private_history)
+
+    async def get_group_msg_history(
+        self,
+        group_id: int,
+        *,
+        message_seq: int | str = 0,
+        count: int = 50,
+        reverse_order: bool = True,
+    ) -> list[dict[str, object]]:
+        return list(self.group_history)
 
     async def get_group_files(
         self,
@@ -3161,6 +3201,141 @@ async def test_admin_page_and_api(tmp_path) -> None:
     assert detail.json()["person"]["style_profile"] == "直接、简短"
     assert deleted.status_code == 200
     assert shared.list_memories(123) == []
+
+
+@pytest.mark.asyncio
+async def test_qq_web_console_distinguishes_friends_and_group_members(
+    tmp_path,
+) -> None:
+    sender = FakeOneBotClient()
+    sender.friends = [
+        {
+            "user_id": 123,
+            "nickname": "Aloha",
+            "remark": "阿洛哈",
+            "display_name": "阿洛哈",
+        }
+    ]
+    sender.groups = [{"group_id": 456, "group_name": "测试群"}]
+    sender.group_members = [
+        {
+            "user_id": 123,
+            "nickname": "Aloha",
+            "card": "阿洛哈",
+            "display_name": "阿洛哈",
+            "role": "member",
+        },
+        {
+            "user_id": 789,
+            "nickname": "路人",
+            "card": "群友",
+            "display_name": "群友",
+            "role": "member",
+        },
+    ]
+    sender.private_history = [
+        {
+            "post_type": "message",
+            "message_id": "p2",
+            "time": 1_700_000_020,
+            "sender": {"user_id": 999, "nickname": "测试机器人"},
+            "message": [{"type": "text", "data": {"text": "收到。"}}],
+        },
+        {
+            "post_type": "message",
+            "message_id": "p1",
+            "time": 1_700_000_010,
+            "sender": {"user_id": 123, "nickname": "Aloha"},
+            "message": [{"type": "text", "data": {"text": "在吗"}}],
+        },
+    ]
+    sender.group_history = [
+        {
+            "post_type": "message",
+            "message_id": "g1",
+            "time": 1_700_000_030,
+            "sender": {"user_id": 789, "card": "群友"},
+            "message": [{"type": "text", "data": {"text": "群消息"}}],
+        }
+    ]
+    chat_memory = ChatMemory(tmp_path / "memory.db")
+    app = create_app(
+        settings=make_settings(tmp_path, enable_group=True),
+        chat_client=FakeChatClient(),
+        onebot_client=sender,
+        memory=chat_memory,
+        image_loader=FakeImageLoader(),
+        document_loader=FakeDocumentLoader(),
+        productivity_store=ProductivityStore(tmp_path / "tools.db"),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+    ) as client:
+        contacts = await client.get("/api/admin/qq-web/contacts")
+        members = await client.get(
+            "/api/admin/qq-web/group-members",
+            params={"group_id": 456},
+        )
+        private_history = await client.get(
+            "/api/admin/qq-web/history",
+            params={"target_type": "private", "target_id": 123},
+        )
+        group_history = await client.get(
+            "/api/admin/qq-web/history",
+            params={"target_type": "group", "target_id": 456},
+        )
+        sent_private = await client.post(
+            "/api/admin/qq-web/send",
+            json={
+                "target_type": "private",
+                "target_id": 123,
+                "message": "网页私聊消息",
+            },
+        )
+        rejected_member = await client.post(
+            "/api/admin/qq-web/send",
+            json={
+                "target_type": "private",
+                "target_id": 789,
+                "message": "不应该发出去",
+            },
+        )
+        sent_group = await client.post(
+            "/api/admin/qq-web/send",
+            json={
+                "target_type": "group",
+                "target_id": 456,
+                "message": "网页群消息",
+            },
+        )
+
+    assert contacts.status_code == 200
+    assert contacts.json()["friends"][0]["can_private_chat"] is True
+    assert contacts.json()["groups"][0]["display_name"] == "测试群"
+    member_by_id = {
+        int(item["user_id"]): item for item in members.json()["members"]
+    }
+    assert member_by_id[123]["can_private_chat"] is True
+    assert member_by_id[789]["can_private_chat"] is False
+    assert member_by_id[789]["relationship"] == "group_member"
+    assert [item["role"] for item in private_history.json()["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    assert group_history.json()["messages"][0]["sender_name"] == "群友"
+    assert sent_private.status_code == 200
+    assert rejected_member.status_code == 403
+    assert sent_group.status_code == 200
+    assert sender.sent == [
+        (ReplyTarget("private", 123), "网页私聊消息"),
+        (ReplyTarget("group", 456, 456), "网页群消息"),
+    ]
+    assert chat_memory.history("private:123", 3)[-1] == {
+        "role": "assistant",
+        "content": "网页私聊消息",
+    }
 
 
 @pytest.mark.asyncio

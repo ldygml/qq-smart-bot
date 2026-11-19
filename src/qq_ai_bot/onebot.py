@@ -458,6 +458,78 @@ class OneBotClient:
                 )
         return result
 
+    async def get_friend_list(self) -> list[dict[str, Any]]:
+        response = await self._client.post(
+            "get_friend_list",
+            json={},
+            timeout=30.0,
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                "OneBot get_friend_list returned non-JSON data"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            raise OneBotError("OneBot get_friend_list failed")
+        friends = data.get("data")
+        if isinstance(friends, dict):
+            friends = friends.get("friends") or friends.get("list") or []
+        if not isinstance(friends, list):
+            raise OneBotError("OneBot get_friend_list returned no list")
+        result: list[dict[str, Any]] = []
+        for item in friends:
+            if not isinstance(item, dict):
+                continue
+            user_id = item.get("user_id") or item.get("uin")
+            try:
+                normalized_id = int(user_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized_id <= 0:
+                continue
+            nickname = str(item.get("nickname") or "").strip()
+            remark = str(item.get("remark") or "").strip()
+            result.append(
+                {
+                    "user_id": normalized_id,
+                    "nickname": nickname[:120],
+                    "remark": remark[:120],
+                    "display_name": (remark or nickname or str(normalized_id))[
+                        :120
+                    ],
+                }
+            )
+        return result
+
+    async def get_login_info(self) -> dict[str, Any]:
+        response = await self._client.post(
+            "get_login_info",
+            json={},
+            timeout=15.0,
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                "OneBot get_login_info returned non-JSON data"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            raise OneBotError("OneBot get_login_info failed")
+        result = data.get("data")
+        if not isinstance(result, dict):
+            raise OneBotError("OneBot get_login_info returned no data")
+        try:
+            user_id = int(result.get("user_id") or result.get("uin"))
+        except (TypeError, ValueError) as exc:
+            raise OneBotError(
+                "OneBot get_login_info returned no user id"
+            ) from exc
+        return {
+            "user_id": user_id,
+            "nickname": str(result.get("nickname") or "").strip()[:120],
+        }
+
     async def get_recent_contact(
         self,
         *,
@@ -708,6 +780,60 @@ class OneBotClient:
             or member.get("nickname")
             or ""
         ).strip()[:80]
+
+    async def get_group_member_list(
+        self,
+        group_id: int,
+    ) -> list[dict[str, Any]]:
+        response = await self._client.post(
+            "get_group_member_list",
+            json={"group_id": group_id},
+            timeout=30.0,
+        )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OneBotError(
+                "OneBot get_group_member_list returned non-JSON data"
+            ) from exc
+        if response.is_error or data.get("status") != "ok":
+            retcode = data.get("retcode")
+            raise OneBotError(
+                "OneBot get_group_member_list failed "
+                f"(HTTP {response.status_code}, retcode={retcode})"
+            )
+        members = data.get("data")
+        if isinstance(members, dict):
+            members = members.get("members") or members.get("list") or []
+        if not isinstance(members, list):
+            raise OneBotError(
+                "OneBot get_group_member_list returned no list"
+            )
+        result: list[dict[str, Any]] = []
+        for item in members:
+            if not isinstance(item, dict):
+                continue
+            user_id = item.get("user_id") or item.get("uin")
+            try:
+                normalized_id = int(user_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized_id <= 0:
+                continue
+            nickname = str(item.get("nickname") or "").strip()
+            card = str(item.get("card") or "").strip()
+            result.append(
+                {
+                    "user_id": normalized_id,
+                    "nickname": nickname[:120],
+                    "card": card[:120],
+                    "display_name": (card or nickname or str(normalized_id))[
+                        :120
+                    ],
+                    "role": str(item.get("role") or "member").strip()[:20],
+                }
+            )
+        return result
 
     async def close(self) -> None:
         await self._client.aclose()

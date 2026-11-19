@@ -138,7 +138,7 @@ async function loadInstances() {
       <div class="item-meta">127.0.0.1:${item.port} · ${esc(item.provider_name || "未知供应商")}<br>${esc(item.onebot_api_base)}</div>
       <div class="item-actions">
         ${item.status === "online" ? `<button data-stop="${item.id}">停止</button><button data-restart="${item.id}">重启</button><button data-memory="${item.id}">记忆维护</button><button data-unified="${item.id}">内容管理</button><button data-group-settings="${item.id}">群聊设置</button><button data-evolution="${item.id}">自适应与状态</button><button data-chat-test="${item.id}">对话测试</button><button data-traces="${item.id}">消息追踪</button><button data-model-routes="${item.id}">模型路由</button>` : `<button data-start="${item.id}">启动</button>`}
-        <a href="/portal/chat?instance=${item.id}">网页聊天</a>
+        <a href="/portal/chat?instance=${item.id}">QQ 消息</a>
         <a href="/api/instances/${item.id}/open-admin" target="_blank">打开完整后台</a>
         <button data-edit-instance="${item.id}">编辑</button><button data-delete-instance="${item.id}">删除</button>
       </div>

@@ -4,13 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0e120e">
-  <title>给她爱 · 网页聊天</title>
+  <title>给她爱 · QQ 消息</title>
   <link rel="stylesheet" href="/portal/control.css">
   <link rel="stylesheet" href="/portal/chat.css">
 </head>
 <body class="chat-page">
   <header class="topbar chat-topbar">
-    <a class="brand" href="/portal"><span class="logo small">G</span><span><b>给她爱 · 网页聊天</b><small>WEB CONVERSATION</small></span></a>
+    <a class="brand" href="/portal">
+      <span class="logo small">G</span>
+      <span><b>给她爱 · QQ 消息</b><small>MESSAGE CONSOLE</small></span>
+    </a>
     <div class="top-actions">
       <a href="/portal">控制台</a>
       <a id="chat-admin-link" target="_blank" rel="noreferrer" hidden>完整后台</a>
@@ -19,12 +22,14 @@
     </div>
   </header>
 
-  <main class="web-chat-layout">
-    <aside class="chat-sidebar">
-      <div>
-        <p class="eyebrow">PRIVATE WEB CHAT</p>
-        <h1>直接聊。</h1>
-        <p class="chat-sidebar-copy">这里不是在模拟 QQ 消息，而是直接使用机器人当前的人格、模型、长期记忆和联网能力。聊天记录按实例保存在控制台，重启后仍然存在。</p>
+  <main class="qq-console">
+    <aside class="qq-sidebar" aria-label="QQ 联系人">
+      <div class="qq-sidebar-head">
+        <div>
+          <p class="eyebrow">QQ DIRECT CONSOLE</p>
+          <h1>真实收发。</h1>
+          <p>这里发送的内容会通过当前机器人账号真正发到 QQ，不是机器人沙盒聊天。</p>
+        </div>
       </div>
 
       <label class="chat-select-label">机器人实例
@@ -32,44 +37,100 @@
       </label>
       <div id="chat-instance-state" class="chat-instance-state">正在读取实例…</div>
 
-      <div class="chat-sidebar-actions">
-        <button id="chat-reload" type="button">刷新记录</button>
-        <button id="chat-clear" class="danger" type="button">清空网页记录</button>
+      <div class="qq-account-card">
+        <span class="qq-account-avatar">Q</span>
+        <div>
+          <strong id="qq-account-name">正在读取 QQ…</strong>
+          <small id="qq-account-id">—</small>
+        </div>
+        <button id="qq-refresh-contacts" type="button" title="刷新好友和群聊">刷新</button>
       </div>
 
-      <div class="chat-privacy-note">
-        <b>独立会话</b>
-        <span>每个机器人实例各有一份网页聊天记录；不会把消息发到 QQ，也不会冒充 QQ 联系人。</span>
+      <p id="qq-contact-warning" class="qq-contact-warning" role="status"></p>
+      <input id="qq-contact-search" class="qq-contact-search" type="search" autocomplete="off" placeholder="搜索好友、群聊或群成员">
+
+      <div class="qq-contact-scroll">
+        <section class="qq-contact-section">
+          <div class="qq-section-title">
+            <span>好友</span>
+            <small id="qq-friend-count">—</small>
+          </div>
+          <p class="qq-section-note">列表来自 QQ 好友接口，只有这里的人能直接私聊。</p>
+          <div id="qq-friends" class="qq-contact-list">
+            <div class="qq-list-loading">正在读取好友…</div>
+          </div>
+        </section>
+
+        <section class="qq-contact-section">
+          <div class="qq-section-title">
+            <span>群聊</span>
+            <small id="qq-group-count">—</small>
+          </div>
+          <p class="qq-section-note">选择群后可以直接向群发送消息，并查看群成员关系。</p>
+          <div id="qq-groups" class="qq-contact-list">
+            <div class="qq-list-loading">正在读取群聊…</div>
+          </div>
+        </section>
+
+        <section class="qq-contact-section" id="qq-member-section" hidden>
+          <div class="qq-section-title">
+            <span>当前群成员</span>
+            <small id="qq-member-count">—</small>
+          </div>
+          <p class="qq-section-note">“仅同群”表示对方不是机器人好友，不能从这里直接私聊。</p>
+          <div id="qq-members" class="qq-contact-list"></div>
+        </section>
+      </div>
+
+      <div class="qq-relation-legend">
+        <span><i class="legend-dot friend"></i>好友 · 可私聊</span>
+        <span><i class="legend-dot member"></i>仅同群 · 不可私聊</span>
+        <span><i class="legend-dot group"></i>QQ 群聊</span>
       </div>
     </aside>
 
-    <section class="chat-workspace" aria-label="网页聊天">
-      <header class="chat-room-head">
-        <div>
-          <span class="chat-online-dot" id="chat-online-dot"></span>
-          <strong id="chat-room-title">正在连接机器人</strong>
+    <section class="qq-workspace" aria-label="QQ 消息窗口">
+      <header class="qq-room-head">
+        <div class="qq-room-identity">
+          <span id="qq-room-avatar" class="qq-room-avatar">Q</span>
+          <div>
+            <div class="qq-room-title-row">
+              <strong id="qq-room-title">选择一个好友或群聊</strong>
+              <span id="qq-room-badge" class="qq-relation-badge" hidden></span>
+            </div>
+            <span id="qq-room-meta">消息会通过机器人账号直接发送到 QQ</span>
+          </div>
         </div>
-        <span id="chat-room-meta">本地安全连接</span>
+        <button id="qq-reload-history" type="button" disabled>刷新消息</button>
       </header>
 
-      <div id="chat-messages" class="chat-messages" role="log" aria-live="polite">
-        <div class="chat-loading">正在读取聊天记录…</div>
+      <div id="qq-messages" class="qq-messages" role="log" aria-live="polite">
+        <div class="qq-empty-state">
+          <span class="qq-empty-mark">QQ</span>
+          <h2>这里是真实消息控制台</h2>
+          <p>先从左侧选择好友或群聊。好友可以直接私聊；群成员若只标为“仅同群”，说明当前机器人账号并不是对方好友。</p>
+        </div>
       </div>
 
-      <form id="chat-form" class="chat-composer">
-        <div class="chat-compose-row">
-          <textarea id="chat-input" rows="1" maxlength="20000" placeholder="说点什么…  Enter 发送，Shift+Enter 换行" aria-label="聊天消息"></textarea>
-          <button id="chat-send" class="chat-send" type="submit">发送</button>
+      <form id="qq-send-form" class="qq-composer">
+        <div class="qq-send-target">
+          <span>发送给</span>
+          <strong id="qq-send-target">尚未选择</strong>
+          <span id="qq-send-relation"></span>
         </div>
-        <div class="chat-compose-foot">
-          <span id="chat-hint">连接后会直接回复，不写入 QQ 聊天。</span>
-          <span id="chat-count">0 / 20000</span>
+        <div class="qq-compose-row">
+          <textarea id="qq-message-input" rows="2" maxlength="20000" placeholder="选择联系人后输入消息。Enter 发送，Shift+Enter 换行" disabled aria-label="QQ 消息内容"></textarea>
+          <button id="qq-send-button" type="submit" disabled>发送到 QQ</button>
         </div>
-        <p id="chat-error" class="chat-error" role="alert"></p>
+        <div class="qq-compose-foot">
+          <span id="qq-compose-hint">消息不会经过模型改写</span>
+          <span id="qq-message-count">0 / 20000</span>
+        </div>
+        <p id="qq-error" class="chat-error" role="alert"></p>
       </form>
     </section>
   </main>
 
-  <script src="/portal/chat.js?v=20261119-webchat1"></script>
+  <script src="/portal/chat.js?v=20261119-qqconsole1"></script>
 </body>
 </html>

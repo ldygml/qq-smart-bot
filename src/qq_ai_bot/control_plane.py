@@ -988,6 +988,12 @@ class WebChatMessagePayload(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
 
 
+class QQWebSendPayload(BaseModel):
+    target_type: str = Field(pattern="^(private|group)$")
+    target_id: int = Field(gt=0)
+    message: str = Field(min_length=1, max_length=20000)
+
+
 class BackupPayload(BaseModel):
     passphrase: str = Field(min_length=8, max_length=200)
 
@@ -2080,6 +2086,81 @@ async def web_chat_clear(
         raise HTTPException(status_code=404, detail="instance not found")
     deleted = store.clear_web_chat_messages(user_id, instance_id)
     return {"ok": True, "deleted": deleted}
+
+
+@app.get("/api/instances/{instance_id}/qq-web/contacts")
+async def instance_qq_web_contacts(
+    instance_id: int,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/qq-web/contacts",
+        timeout=60,
+    )
+
+
+@app.get("/api/instances/{instance_id}/qq-web/group-members")
+async def instance_qq_web_group_members(
+    instance_id: int,
+    request: Request,
+    group_id: int,
+) -> Any:
+    user = _request_user(request)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        f"/api/admin/qq-web/group-members?group_id={int(group_id)}",
+        timeout=60,
+    )
+
+
+@app.get("/api/instances/{instance_id}/qq-web/history")
+async def instance_qq_web_history(
+    instance_id: int,
+    request: Request,
+    target_type: str,
+    target_id: int,
+    count: int = 60,
+) -> Any:
+    user = _request_user(request)
+    if target_type not in {"private", "group"} or target_id <= 0:
+        raise HTTPException(status_code=400, detail="invalid QQ target")
+    safe_count = max(1, min(100, int(count)))
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        (
+            "/api/admin/qq-web/history"
+            f"?target_type={target_type}&target_id={target_id}"
+            f"&count={safe_count}"
+        ),
+        timeout=60,
+    )
+
+
+@app.post("/api/instances/{instance_id}/qq-web/send")
+async def instance_qq_web_send(
+    instance_id: int,
+    payload: QQWebSendPayload,
+    request: Request,
+) -> Any:
+    user = _request_user(request)
+    _require_csrf(request, user)
+    return await _instance_admin_json(
+        instance_id,
+        int(user["id"]),
+        "/api/admin/qq-web/send",
+        method="POST",
+        json_body={
+            "target_type": payload.target_type,
+            "target_id": payload.target_id,
+            "message": payload.message,
+        },
+        timeout=60,
+    )
 
 
 @app.post("/api/import-current")

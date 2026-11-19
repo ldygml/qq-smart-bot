@@ -660,6 +660,28 @@ class SharedMemoryStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def style_observations_for_speaker(
+        self,
+        user_id: int,
+        *,
+        after_id: int = 0,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, content, created_at
+                FROM shared_observations
+                WHERE speaker_user_id = ?
+                  AND id > ?
+                  AND LENGTH(TRIM(content)) >= 4
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (user_id, after_id, max(1, limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def context_for(
         self,
         *,
@@ -2269,16 +2291,20 @@ async def extract_person_profile(
 ) -> PersonProfileCandidate:
     sample_lines = [
         (
-            f"- 用户：{str(item.get('user_content', ''))[:400]}\n"
+            f"- 用户原话：{str(item.get('user_content', ''))[:500]}\n"
             f"  当时回复：{str(item.get('assistant_content', ''))[:300]}"
         )
-        for item in samples[-12:]
+        for item in samples[-30:]
     ]
     prompt = (
-        "根据这个联系人的真实聊天样本，总结稳定的互动画像。不要做心理诊断，"
-        "不要推断敏感身份。style_profile 说明对方偏好的回复长度、语气、"
-        "直接程度、是否爱开玩笑和适合的沟通方式；relationship_note 说明"
-        "当前关系更像陌生人、普通朋友、熟人还是工作关系。"
+        "根据这个联系人的真实聊天原话，维护可供机器人自然模仿的互动画像。"
+        "只学习表达方式，不冒充对方身份、不编造共同经历、不复制隐私内容。"
+        "重点观察稳定出现的：句子长短、分段习惯、标点密度、语气词和口头语、"
+        "是否爱用反问或接梗、正式还是随意、回复节奏、emoji/表情使用，"
+        "以及对方希望机器人怎样回应。不要做心理诊断，不要推断敏感身份。"
+        "style_profile 写成可直接用于生成回复的简短指令，例如"
+        "“表达特征：短句、少标点、常先接一句再给结论；回复时保持同等节奏”。"
+        "relationship_note 说明当前关系更像陌生人、普通朋友、熟人还是工作关系。"
         "只总结有多次证据支持的稳定倾向，最多各两句话。"
         "若证据不足，保留已有内容或返回空字符串。\n"
         '只返回 JSON：{"style_profile":"...","relationship_note":"..."}\n\n'

@@ -545,6 +545,7 @@ def create_app(
     limiter = SlidingWindowRateLimiter(config.rate_limit_per_minute, 60.0)
     semaphore = asyncio.Semaphore(max(1, config.max_concurrent_requests))
     conversation_locks: dict[str, asyncio.Lock] = {}
+    profile_refresh_locks: dict[int, asyncio.Lock] = {}
     background_tasks: set[asyncio.Task[Any]] = set()
     sticker_asset_inflight: set[int] = set()
     sticker_organize_inflight: set[int] = set()
@@ -927,6 +928,506 @@ def create_app(
                 conversation_id=conversation_id,
                 limit=limit,
             )
+        }
+
+    async def _qq_web_login_info() -> dict[str, Any]:
+        getter = getattr(sender, "get_login_info", None)
+        if not callable(getter):
+            return {"user_id": 0, "nickname": config.bot_name}
+        try:
+            value = await getter()
+        except OneBotError:
+            return {"user_id": 0, "nickname": config.bot_name}
+        if not isinstance(value, dict):
+            return {"user_id": 0, "nickname": config.bot_name}
+        user_id = _optional_int(value.get("user_id")) or 0
+        return {
+            "user_id": user_id,
+            "nickname": str(value.get("nickname") or config.bot_name)[:120],
+        }
+
+    async def _qq_web_friends() -> list[dict[str, Any]]:
+        getter = getattr(sender, "get_friend_list", None)
+        if not callable(getter):
+            raise OneBotError("当前 OneBot 客户端不支持读取好友列表")
+        friends = await getter()
+        result: list[dict[str, Any]] = []
+        for item in friends:
+            if not isinstance(item, dict):
+                continue
+            user_id = _optional_int(item.get("user_id"))
+            if user_id is None:
+                continue
+            nickname = str(item.get("nickname") or "").strip()[:120]
+            remark = str(item.get("remark") or "").strip()[:120]
+            display_name = str(
+                item.get("display_name")
+                or remark
+                or nickname
+                or user_id
+            ).strip()[:120]
+            result.append(
+                {
+                    "user_id": user_id,
+                    "nickname": nickname,
+                    "remark": remark,
+                    "display_name": display_name,
+                    "relationship": "friend",
+                    "relationship_label": "好友 · 可直接私聊",
+                    "can_private_chat": True,
+                }
+            )
+        result.sort(key=lambda item: (item["display_name"], item["user_id"]))
+        return result
+
+    async def _qq_web_groups() -> list[dict[str, Any]]:
+        getter = getattr(sender, "get_group_list", None)
+        groups = await getter() if callable(getter) else []
+        profile_names = {
+            int(item["group_id"]): str(item.get("name") or "").strip()
+            for item in group_profiles.list_all()
+            if _optional_int(item.get("group_id")) is not None
+        }
+        merged: dict[int, dict[str, Any]] = {}
+        for item in groups:
+            if not isinstance(item, dict):
+                continue
+            group_id = _optional_int(item.get("group_id"))
+            if group_id is None:
+                continue
+            native_name = str(item.get("group_name") or "").strip()[:120]
+            display_name = profile_names.get(group_id) or native_name or str(
+                group_id
+            )
+            merged[group_id] = {
+                "group_id": group_id,
+                "group_name": native_name,
+                "display_name": display_name[:120],
+                "relationship": "group",
+                "relationship_label": "QQ 群聊",
+                "can_private_chat": False,
+            }
+        for group_id, custom_name in profile_names.items():
+            if group_id not in merged:
+                merged[group_id] = {
+                    "group_id": group_id,
+                    "group_name": "",
+                    "display_name": (custom_name or str(group_id))[:120],
+                    "relationship": "group",
+                    "relationship_label": "QQ 群聊",
+                    "can_private_chat": False,
+                }
+        result = sorted(
+            merged.values(),
+            key=lambda item: (item["display_name"], item["group_id"]),
+        )
+        return result
+
+    @app.get("/api/admin/qq-web/contacts")
+    async def admin_qq_web_contacts() -> dict[str, Any]:
+        await _ensure_known_group_profiles()
+        login = await _qq_web_login_info()
+        warning = ""
+        try:
+            friends = await _qq_web_friends()
+            friends_available = True
+        except Exception as exc:
+            logger.warning("Could not load QQ friend list", exc_info=True)
+            friends = []
+            friends_available = False
+            warning = f"好友列表读取失败：{exc}"
+        try:
+            groups = await _qq_web_groups()
+        except Exception as exc:
+            logger.warning("Could not load QQ group list", exc_info=True)
+            groups = []
+            warning = "；".join(
+                part for part in (warning, f"群列表读取失败：{exc}") if part
+            )
+        return {
+            "ok": True,
+            "login": login,
+            "friends": friends,
+            "groups": groups,
+            "friends_available": friends_available,
+            "warning": warning,
+            "summary": {
+                "friend_count": len(friends),
+                "group_count": len(groups),
+                "private_chat_note": "只有真实好友可直接私聊",
+                "group_member_note": "同群成员不等于好友，不能直接私聊",
+            },
+        }
+
+    @app.get("/api/admin/qq-web/group-members")
+    async def admin_qq_web_group_members(
+        group_id: int,
+    ) -> dict[str, Any]:
+        if group_id <= 0:
+            return JSONResponse(
+                {"detail": "群号无效"},
+                status_code=400,
+            )
+        try:
+            friends = await _qq_web_friends()
+            friend_map = {int(item["user_id"]): item for item in friends}
+            friend_warning = ""
+        except Exception as exc:
+            friend_map = {}
+            friend_warning = f"好友关系读取失败：{exc}"
+        login = await _qq_web_login_info()
+        self_id = int(login.get("user_id") or 0)
+        source = "member_list"
+        raw_members: list[dict[str, Any]] = []
+        getter = getattr(sender, "get_group_member_list", None)
+        try:
+            if not callable(getter):
+                raise OneBotError("当前 OneBot 客户端不支持读取群成员列表")
+            raw_members = await getter(group_id)
+        except Exception as first_error:
+            source = "recent_history"
+            getter = getattr(sender, "get_group_msg_history", None)
+            if not callable(getter):
+                return JSONResponse(
+                    {"detail": str(first_error)},
+                    status_code=502,
+                )
+            try:
+                history = await getter(
+                    group_id,
+                    count=100,
+                    reverse_order=True,
+                )
+            except OneBotError as exc:
+                return JSONResponse(
+                    {"detail": str(exc)},
+                    status_code=502,
+                )
+            seen: dict[int, dict[str, Any]] = {}
+            for item in history:
+                sender_info = item.get("sender")
+                sender_info = (
+                    sender_info if isinstance(sender_info, dict) else {}
+                )
+                user_id = _optional_int(
+                    sender_info.get("user_id") or item.get("user_id")
+                )
+                if user_id is None or user_id == self_id:
+                    continue
+                name = str(
+                    sender_info.get("card")
+                    or sender_info.get("nickname")
+                    or user_id
+                ).strip()[:120]
+                seen[user_id] = {
+                    "user_id": user_id,
+                    "nickname": str(
+                        sender_info.get("nickname") or ""
+                    ).strip()[:120],
+                    "card": str(sender_info.get("card") or "").strip()[:120],
+                    "display_name": name,
+                    "role": str(sender_info.get("role") or "member")[:20],
+                }
+            raw_members = list(seen.values())
+        members: list[dict[str, Any]] = []
+        for item in raw_members:
+            if not isinstance(item, dict):
+                continue
+            user_id = _optional_int(item.get("user_id"))
+            if user_id is None or user_id == self_id:
+                continue
+            friend = friend_map.get(user_id)
+            display_name = str(
+                item.get("display_name")
+                or item.get("card")
+                or item.get("nickname")
+                or user_id
+            ).strip()[:120]
+            members.append(
+                {
+                    "user_id": user_id,
+                    "nickname": str(item.get("nickname") or "").strip()[:120],
+                    "card": str(item.get("card") or "").strip()[:120],
+                    "display_name": display_name,
+                    "role": str(item.get("role") or "member")[:20],
+                    "is_friend": friend is not None,
+                    "can_private_chat": friend is not None,
+                    "relationship": "friend" if friend else "group_member",
+                    "relationship_label": (
+                        "好友 · 可直接私聊"
+                        if friend
+                        else "仅同群 · 不能直接私聊"
+                    ),
+                }
+            )
+        members.sort(
+            key=lambda item: (
+                not item["can_private_chat"],
+                item["display_name"],
+                item["user_id"],
+            )
+        )
+        return {
+            "ok": True,
+            "group_id": group_id,
+            "members": members,
+            "source": source,
+            "warning": friend_warning,
+            "summary": {
+                "member_count": len(members),
+                "friend_count": sum(
+                    1 for item in members if item["can_private_chat"]
+                ),
+            },
+        }
+
+    @app.get("/api/admin/qq-web/history")
+    async def admin_qq_web_history(
+        target_type: str,
+        target_id: int,
+        count: int = 60,
+    ) -> dict[str, Any]:
+        if target_type not in {"private", "group"} or target_id <= 0:
+            return JSONResponse(
+                {"detail": "请选择有效的好友或群聊"},
+                status_code=400,
+            )
+        login = await _qq_web_login_info()
+        self_id = int(login.get("user_id") or 0)
+        target_name = str(target_id)
+        if target_type == "private":
+            try:
+                friends = await _qq_web_friends()
+            except OneBotError as exc:
+                return JSONResponse(
+                    {"detail": str(exc)},
+                    status_code=502,
+                )
+            friend = next(
+                (
+                    item
+                    for item in friends
+                    if int(item["user_id"]) == target_id
+                ),
+                None,
+            )
+            if friend is None:
+                return JSONResponse(
+                    {"detail": "该 QQ 不是机器人好友，不能打开或发送私聊"},
+                    status_code=403,
+                )
+            target_name = str(friend["display_name"])
+            getter = getattr(sender, "get_friend_msg_history", None)
+        else:
+            try:
+                groups = await _qq_web_groups()
+            except OneBotError as exc:
+                return JSONResponse(
+                    {"detail": str(exc)},
+                    status_code=502,
+                )
+            group = next(
+                (
+                    item
+                    for item in groups
+                    if int(item["group_id"]) == target_id
+                ),
+                None,
+            )
+            if group is None:
+                return JSONResponse(
+                    {"detail": "群聊不存在或机器人尚未加入"},
+                    status_code=404,
+                )
+            target_name = str(group["display_name"])
+            getter = getattr(sender, "get_group_msg_history", None)
+        if not callable(getter):
+            return JSONResponse(
+                {"detail": "当前 OneBot 客户端不支持读取 QQ 历史消息"},
+                status_code=501,
+            )
+        try:
+            raw_messages = await getter(
+                target_id,
+                count=max(1, min(100, int(count))),
+                reverse_order=True,
+            )
+        except OneBotError as exc:
+            return JSONResponse(
+                {"detail": str(exc)},
+                status_code=502,
+            )
+        messages: list[dict[str, Any]] = []
+        for item in raw_messages:
+            sender_info = item.get("sender")
+            sender_info = sender_info if isinstance(sender_info, dict) else {}
+            sender_id = _optional_int(sender_info.get("user_id")) or 0
+            post_type = str(item.get("post_type") or "")
+            role = (
+                "assistant"
+                if sender_id == self_id or post_type == "message_sent"
+                else "user"
+            )
+            content = extract_message_content(
+                item.get("message"),
+                self_id=self_id,
+                raw_message=str(item.get("raw_message") or ""),
+            ).text.strip()
+            messages.append(
+                {
+                    "message_id": str(
+                        item.get("message_id") or item.get("id") or ""
+                    ),
+                    "role": role,
+                    "sender_id": sender_id,
+                    "sender_name": str(
+                        sender_info.get("card")
+                        or sender_info.get("nickname")
+                        or (config.bot_name if role == "assistant" else sender_id)
+                    ).strip()[:120],
+                    "content": content or "[暂不支持预览的消息]",
+                    "timestamp": int(item.get("time") or 0),
+                }
+            )
+        messages.sort(
+            key=lambda item: (item["timestamp"], item["message_id"])
+        )
+        return {
+            "ok": True,
+            "target": {
+                "target_type": target_type,
+                "target_id": target_id,
+                "display_name": target_name,
+            },
+            "messages": messages,
+        }
+
+    @app.post("/api/admin/qq-web/send")
+    async def admin_qq_web_send(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        target_type = str(payload.get("target_type") or "").strip()
+        target_id = _optional_int(payload.get("target_id"))
+        message = str(payload.get("message") or "").strip()
+        if target_type not in {"private", "group"} or target_id is None:
+            return JSONResponse(
+                {"detail": "请选择有效的好友或群聊"},
+                status_code=400,
+            )
+        if not message:
+            return JSONResponse(
+                {"detail": "消息不能为空"},
+                status_code=400,
+            )
+        if len(message) > 20000:
+            return JSONResponse(
+                {"detail": "消息不能超过 20000 个字符"},
+                status_code=400,
+            )
+        target_name = str(target_id)
+        if target_type == "private":
+            try:
+                friends = await _qq_web_friends()
+            except OneBotError as exc:
+                return JSONResponse(
+                    {"detail": str(exc)},
+                    status_code=502,
+                )
+            friend = next(
+                (
+                    item
+                    for item in friends
+                    if int(item["user_id"]) == target_id
+                ),
+                None,
+            )
+            if friend is None:
+                return JSONResponse(
+                    {"detail": "只能私聊机器人真实好友；同群成员不算好友"},
+                    status_code=403,
+                )
+            target_name = str(friend["display_name"])
+            target = ReplyTarget("private", target_id)
+            conversation_id = f"private:{target_id}"
+        else:
+            try:
+                groups = await _qq_web_groups()
+            except OneBotError as exc:
+                return JSONResponse(
+                    {"detail": str(exc)},
+                    status_code=502,
+                )
+            group = next(
+                (
+                    item
+                    for item in groups
+                    if int(item["group_id"]) == target_id
+                ),
+                None,
+            )
+            if group is None:
+                return JSONResponse(
+                    {"detail": "群聊不存在或机器人尚未加入"},
+                    status_code=404,
+                )
+            target_name = str(group["display_name"])
+            login = await _qq_web_login_info()
+            target = ReplyTarget("group", target_id, target_id)
+            conversation_id = f"group:{target_id}"
+        try:
+            await sender.send_text(target, message)
+        except OneBotError as exc:
+            return JSONResponse(
+                {"detail": f"QQ 消息发送失败：{exc}"},
+                status_code=502,
+            )
+        sent_at = int(time.time())
+        login = await _qq_web_login_info()
+        try:
+            store.archive_message(
+                external_key=(
+                    f"web:{target_type}:{target_id}:{time.time_ns()}"
+                ),
+                conversation_id=conversation_id,
+                message_type=target_type,
+                group_id=target_id if target_type == "group" else None,
+                sender_user_id=int(login.get("user_id") or 0),
+                sender_name=str(login.get("nickname") or config.bot_name),
+                role="assistant",
+                content=message,
+                event_time=sent_at,
+                add_to_chat=True,
+                max_rows=config.max_history_rows_per_chat,
+            )
+            if target_type == "group":
+                group_histories.setdefault(
+                    target_id,
+                    deque(maxlen=24),
+                ).append(
+                    GroupMessage(
+                        role="assistant",
+                        sender=config.bot_name,
+                        content=message,
+                    )
+                )
+        except Exception:
+            logger.warning(
+                "Could not store a message sent from the web console",
+                exc_info=True,
+            )
+        return {
+            "ok": True,
+            "target": {
+                "target_type": target_type,
+                "target_id": target_id,
+                "display_name": target_name,
+            },
+            "message": {
+                "role": "assistant",
+                "content": message,
+                "sender_name": str(login.get("nickname") or config.bot_name),
+                "timestamp": sent_at,
+            },
         }
 
     @app.get("/api/admin/people")
@@ -4462,6 +4963,15 @@ def create_app(
                 speaker_name=display_name,
                 content=text,
             )
+        if observation_id is not None and config.profile_learning_enabled:
+            profile_task = asyncio.create_task(
+                _refresh_person_profile(
+                    user_id=event.user_id,
+                    display_name=display_name,
+                )
+            )
+            background_tasks.add(profile_task)
+            profile_task.add_done_callback(background_tasks.discard)
         quote_enabled = (
             group_profile.quote_replies
             if group_profile is not None
@@ -5111,7 +5621,9 @@ def create_app(
                 system_prompt += (
                     "\n\n你可以像熟人一样记得不同联系人过去分享过的信息。"
                     "仅在话题相关时自然使用；不要把 private 记忆告诉别人，"
-                    "也不要机械复述共享记忆。\n"
+                    "也不要机械复述共享记忆。联系人画像里的句长、标点、"
+                    "口头语和接话节奏只用来微调你的表达，不要冒充对方，"
+                    "不要复制对方原话，也不要为了像人而故意制造错别字。\n"
                     f"{memory_context}"
                 )
                 due_followups = shared_memory.due_followups(
@@ -5890,45 +6402,64 @@ def create_app(
         user_id: int,
         display_name: str,
     ) -> None:
-        state_key = f"profile_episode_cursor:{user_id}"
-        try:
-            cursor = int(shared_memory.get_state(state_key, "0"))
-        except ValueError:
-            cursor = 0
-        samples = shared_memory.episodes_for_speaker(
-            user_id,
-            after_id=cursor,
-            limit=20,
-        )
-        if len(samples) < max(1, config.profile_update_after_messages):
-            return
-        current = shared_memory.get_person(user_id) or {}
-        profile = await extract_person_profile(
-            llm,
-            model=config.memory_model,
-            display_name=display_name,
-            current_profile=str(current.get("style_profile", "")),
-            current_relationship_note=str(
-                current.get("relationship_note", "")
-            ),
-            samples=samples,
-        )
-        if profile.style_profile or profile.relationship_note:
-            shared_memory.update_person_profile(
+        state_key = f"style_observation_cursor:{user_id}"
+        lock = profile_refresh_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            try:
+                cursor = int(shared_memory.get_state(state_key, "0"))
+            except ValueError:
+                cursor = 0
+            raw_samples = shared_memory.style_observations_for_speaker(
                 user_id,
-                style_profile=(
-                    profile.style_profile
-                    or str(current.get("style_profile", ""))
-                ),
-                relationship_note=(
-                    profile.relationship_note
-                    or str(current.get("relationship_note", ""))
-                ),
+                after_id=cursor,
+                limit=30,
             )
-        shared_memory.set_state(
-            state_key,
-            str(max(int(item["id"]) for item in samples)),
-        )
+            if len(raw_samples) < max(
+                1,
+                config.profile_update_after_messages,
+            ):
+                return
+            samples = [
+                {
+                    "user_content": str(item["content"]),
+                    "assistant_content": "",
+                }
+                for item in raw_samples[-30:]
+            ]
+            current = shared_memory.get_person(user_id) or {}
+            try:
+                profile = await extract_person_profile(
+                    llm,
+                    model=config.memory_model,
+                    display_name=display_name,
+                    current_profile=str(current.get("style_profile", "")),
+                    current_relationship_note=str(
+                        current.get("relationship_note", "")
+                    ),
+                    samples=samples,
+                )
+            except LLMError:
+                logger.warning(
+                    "Could not refresh a contact speaking-style profile",
+                    exc_info=True,
+                )
+                return
+            if profile.style_profile or profile.relationship_note:
+                shared_memory.update_person_profile(
+                    user_id,
+                    style_profile=(
+                        profile.style_profile
+                        or str(current.get("style_profile", ""))
+                    ),
+                    relationship_note=(
+                        profile.relationship_note
+                        or str(current.get("relationship_note", ""))
+                    ),
+                )
+            shared_memory.set_state(
+                state_key,
+                str(max(int(item["id"]) for item in raw_samples)),
+            )
 
     async def _handle_media_command(
         event: OneBotEvent,

@@ -322,6 +322,96 @@ async def test_get_group_list_returns_group_names() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_friend_list_and_login_info() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/get_friend_list"):
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": [
+                        {
+                            "user_id": 200,
+                            "nickname": "昵称",
+                            "remark": "备注名",
+                        }
+                    ],
+                },
+            )
+        assert request.url.path.endswith("/get_login_info")
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "retcode": 0,
+                "data": {"user_id": 999, "nickname": "机器人"},
+            },
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        friends = await client.get_friend_list()
+        login = await client.get_login_info()
+    finally:
+        await client.close()
+    assert friends == [
+        {
+            "user_id": 200,
+            "nickname": "昵称",
+            "remark": "备注名",
+            "display_name": "备注名",
+        }
+    ]
+    assert login == {"user_id": 999, "nickname": "机器人"}
+
+
+@pytest.mark.asyncio
+async def test_get_group_member_list_normalizes_members() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/get_group_member_list")
+        assert json.loads(request.content) == {"group_id": 100}
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "retcode": 0,
+                "data": [
+                    {
+                        "user_id": "200",
+                        "nickname": "昵称",
+                        "card": "群名片",
+                        "role": "admin",
+                    }
+                ],
+            },
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        members = await client.get_group_member_list(100)
+    finally:
+        await client.close()
+    assert members == [
+        {
+            "user_id": 200,
+            "nickname": "昵称",
+            "card": "群名片",
+            "display_name": "群名片",
+            "role": "admin",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_get_group_member_name_uses_card_or_nickname() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)

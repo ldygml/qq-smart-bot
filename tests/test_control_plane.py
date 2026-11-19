@@ -526,7 +526,7 @@ async def test_web_chat_page_persists_messages_and_uses_history(
         csrf = login.json()["csrf_token"]
         page = await client.get("/portal/chat")
         assert page.status_code == 200
-        assert "网页聊天" in page.text
+        assert "QQ 消息" in page.text
 
         first = await client.post(
             f"/api/web-chat/{instance_id}",
@@ -563,6 +563,135 @@ async def test_web_chat_page_persists_messages_and_uses_history(
         assert cleared.status_code == 200
         assert cleared.json()["deleted"] == 4
         assert store.web_chat_messages(user_id, instance_id) == []
+
+
+@pytest.mark.asyncio
+async def test_qq_console_proxy_uses_real_qq_targets(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = ControlStore(tmp_path / "control.db")
+    user_id = store.create_user("owner", "secure-password")
+    provider_id = store.save_provider(
+        user_id=user_id,
+        provider_id=None,
+        name="provider",
+        provider_type="custom",
+        base_url="https://api.example.com/v1",
+        model="chat",
+        api_key_encrypted="encrypted",
+    )
+    instance_id = store.save_instance(
+        user_id=user_id,
+        instance_id=None,
+        name="QQ 实例",
+        port=18084,
+        onebot_api_base="http://127.0.0.1:13000",
+        onebot_token_encrypted="encrypted",
+        provider_id=provider_id,
+        database_path="data/test-qq-console.db",
+    )
+    monkeypatch.setattr(control_plane, "store", store)
+    monkeypatch.setattr(control_plane, "secrets_box", SecretBox())
+    monkeypatch.setattr(control_plane, "_instance_status", lambda port: "online")
+    calls = []
+
+    async def fake_instance_admin_json(
+        requested_instance_id,
+        requested_user_id,
+        path,
+        *,
+        method="GET",
+        json_body=None,
+        timeout=15,
+    ):
+        calls.append(
+            (requested_instance_id, requested_user_id, path, method, json_body)
+        )
+        if path.endswith("/contacts"):
+            return {
+                "ok": True,
+                "friends": [{"user_id": 123, "can_private_chat": True}],
+                "groups": [{"group_id": 456}],
+            }
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        control_plane,
+        "_instance_admin_json",
+        fake_instance_admin_json,
+    )
+    transport = httpx.ASGITransport(app=control_plane.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1:8090",
+    ) as client:
+        login = await client.post(
+            "/api/auth/login",
+            json={"username": "owner", "password": "secure-password"},
+        )
+        csrf = login.json()["csrf_token"]
+        contacts = await client.get(
+            f"/api/instances/{instance_id}/qq-web/contacts"
+        )
+        members = await client.get(
+            f"/api/instances/{instance_id}/qq-web/group-members",
+            params={"group_id": 456},
+        )
+        history = await client.get(
+            f"/api/instances/{instance_id}/qq-web/history",
+            params={"target_type": "private", "target_id": 123},
+        )
+        sent = await client.post(
+            f"/api/instances/{instance_id}/qq-web/send",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "target_type": "private",
+                "target_id": 123,
+                "message": "真实发送",
+            },
+        )
+    assert contacts.status_code == 200
+    assert members.status_code == 200
+    assert history.status_code == 200
+    assert sent.status_code == 200
+    assert calls == [
+        (
+            instance_id,
+            user_id,
+            "/api/admin/qq-web/contacts",
+            "GET",
+            None,
+        ),
+        (
+            instance_id,
+            user_id,
+            "/api/admin/qq-web/group-members?group_id=456",
+            "GET",
+            None,
+        ),
+        (
+            instance_id,
+            user_id,
+            (
+                "/api/admin/qq-web/history?target_type=private"
+                "&target_id=123&count=60"
+            ),
+            "GET",
+            None,
+        ),
+        (
+            instance_id,
+            user_id,
+            "/api/admin/qq-web/send",
+            "POST",
+            {
+                "target_type": "private",
+                "target_id": 123,
+                "message": "真实发送",
+            },
+        ),
+    ]
 
 
 def test_stop_instance_handles_stored_pid_and_listening_port(
